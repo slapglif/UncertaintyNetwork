@@ -120,6 +120,12 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
 
         self.init_weights()
 
+    def get_input_embeddings(self):
+        return self.transformer.embedding
+
+    def set_input_embeddings(self, value):
+        self.transformer.embedding = value
+
     def get_output_embeddings(self):
         return self.lm_head
 

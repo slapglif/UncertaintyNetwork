@@ -34,7 +34,34 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         self.perplexity = Perplexity(ignore_index=hparams["pad_token_id"])
         self.rouge_scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
 
-    # Rest of the code remains the same
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        return self.model(input_ids, attention_mask=attention_mask, labels=labels)
+
+    def training_step(self, batch, batch_idx):
+        input_ids, labels = batch
+        attention_mask = (input_ids != self.hparams["pad_token_id"]).long()
+        outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        input_ids, labels = batch
+        attention_mask = (input_ids != self.hparams["pad_token_id"]).long()
+        outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams["learning_rate"])
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2)
+        return [optimizer], [scheduler]
+
+    def train_dataloader(self):
+        return self.data_module.train_dataloader()
+
+    def val_dataloader(self):
+        return self.data_module.val_dataloader()
 
 
 def main():
@@ -52,7 +79,7 @@ def main():
         "max_length": 1024,
         "subset_size": 0.1,
         "accumulate_grad_batches": 1,
-        "precision": 16,
+        "precision": "16-mixed",
         "auto_lr_find": True,
         "auto_scale_batch_size": "binsearch",
         "gradient_clip_val": 1.0,
