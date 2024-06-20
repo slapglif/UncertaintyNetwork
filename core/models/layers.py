@@ -1,11 +1,8 @@
-import math
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-
+from typing import Optional
 
 class ScaledDotProductAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
@@ -13,34 +10,20 @@ class ScaledDotProductAttention(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
-        self.scale = math.sqrt(self.d_k)
+        self.scale = self.d_k ** -0.5
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ):
-        batch_size, seq_len, _ = q.shape
-
-        q = rearrange(q, "b s (h d) -> b h s d", h=self.n_heads)
-        k = rearrange(k, "b s (h d) -> b h d s", h=self.n_heads)
-        v = rearrange(v, "b s (h d) -> b h s d", h=self.n_heads)
-
-        attn = torch.matmul(q, k) / self.scale
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         if mask is not None:
             attn = attn.masked_fill(mask == 0, float("-inf"))
 
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
-        out = torch.matmul(attn, v)
-        out = rearrange(out, "b h s d -> b s (h d)")
-
-        return out
+        output = torch.matmul(attn, v)
+        return output
 
 
 class MultiHeadAttention(nn.Module):
@@ -55,21 +38,26 @@ class MultiHeadAttention(nn.Module):
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
 
-        self.attention = ScaledDotProductAttention(self.d_k, n_heads, dropout)
+        self.attention = ScaledDotProductAttention(d_model, n_heads, dropout)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        batch_size, seq_len, _ = q.shape
+
         q = self.W_q(q)
         k = self.W_k(k)
         v = self.W_v(v)
 
+        q = rearrange(q, "b s (h d) -> b h s d", h=self.n_heads)
+        k = rearrange(k, "b s (h d) -> b h s d", h=self.n_heads)
+        v = rearrange(v, "b s (h d) -> b h s d", h=self.n_heads)
+
+        if mask is not None:
+            mask = mask.unsqueeze(1)  # Add head dimension
+
         attn_output = self.attention(q, k, v, mask)
+        attn_output = rearrange(attn_output, "b h s d -> b s (h d)")
+
         out = self.W_o(attn_output)
         out = self.dropout(out)
 
@@ -101,9 +89,7 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(
-        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         attn_output = self.self_attn(x, x, x, mask)
         x = x + self.dropout1(attn_output)
         x = self.norm1(x)
