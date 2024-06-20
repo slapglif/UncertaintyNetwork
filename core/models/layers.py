@@ -48,7 +48,8 @@ class MultiHeadAttention(nn.Module):
         v = self.W_v(v).view(bs, -1, self.n_heads, self.d_k).transpose(1, 2)
 
         if mask is not None:
-            mask = mask.unsqueeze(1).repeat(1, self.n_heads, 1, 1)
+            # Adjust mask shape for multi-head attention
+            mask = mask.unsqueeze(1)
 
         attn_output = self.attention(q, k, v, mask)
         attn_output = attn_output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)

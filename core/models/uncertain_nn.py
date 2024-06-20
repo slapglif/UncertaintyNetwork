@@ -79,9 +79,8 @@ class UncertainTransformer(PreTrainedModel):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        # Convert attention mask to float and change 0s to -inf, 1s to 0
+        extended_attention_mask = (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -10000.0
 
         embedding_output = self.embedding(input_ids)
         hidden_states = self.pos_encoding(embedding_output)
@@ -96,6 +95,7 @@ class UncertainTransformer(PreTrainedModel):
 
         output = self.norm(hidden_states)
         return output
+
 
 class UncertainTransformerLMHeadModel(PreTrainedModel):
     config_class = UncertainTransformerConfig
