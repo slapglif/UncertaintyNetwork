@@ -1,9 +1,9 @@
+# core/models/uncertain_nn.py
 import math
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel
-from transformers import PretrainedConfig
+from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
 from core.models.layers import MultiHeadAttention, PositionwiseFeedForward
@@ -34,14 +34,14 @@ class UncertainTransformerConfig(PretrainedConfig):
 
 
 class UncertainTransformerEncoderLayer(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
+    def __init__(self, config: UncertainTransformerConfig):
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, n_heads, dropout)
-        self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
+        self.self_attn = MultiHeadAttention(config.d_model, config.n_heads, config.dropout)
+        self.feed_forward = PositionwiseFeedForward(config.d_model, config.d_ff, config.dropout)
+        self.norm1 = nn.LayerNorm(config.d_model)
+        self.norm2 = nn.LayerNorm(config.d_model)
+        self.dropout1 = nn.Dropout(config.dropout)
+        self.dropout2 = nn.Dropout(config.dropout)
 
     def forward(self, src: torch.Tensor, src_mask: torch.Tensor = None) -> torch.Tensor:
         attn_output = self.self_attn(src, src, src, src_mask)
@@ -56,22 +56,15 @@ class UncertainTransformerEncoderLayer(nn.Module):
 
 
 class UncertainTransformer(PreTrainedModel):
-    def __init__(self, config):
+    config_class = UncertainTransformerConfig
+
+    def __init__(self, config: UncertainTransformerConfig):
         super().__init__(config)
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos_encoding = PositionalEncoding(config.d_model, config.dropout)
+        self.pos_encoding = PositionalEncoding(config.d_model, config.dropout, config.max_position_embeddings)
         self.encoder_layers = nn.ModuleList(
-            [UncertainTransformerEncoderLayer(config.d_model, config.n_heads, config.d_ff, config.dropout) for _ in
-             range(config.n_layers)]
+            [UncertainTransformerEncoderLayer(config) for _ in range(config.n_layers)]
         )
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.init_weights()
-
-    def get_input_embeddings(self):
-        return self.embedding
-
-    def set_input_embeddings(self, value):
-        self.embedding = value
 
     def forward(
             self,
@@ -80,7 +73,6 @@ class UncertainTransformer(PreTrainedModel):
             position_ids=None,
             head_mask=None,
             inputs_embeds=None,
-            labels=None,
             output_attentions=None,
             output_hidden_states=None,
             return_dict=None,
@@ -115,55 +107,16 @@ class UncertainTransformer(PreTrainedModel):
         for encoder_layer in self.encoder_layers:
             hidden_states = encoder_layer(hidden_states, attention_mask)
 
-        lm_logits = self.lm_head(hidden_states)
-
-        loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
-
-        if not return_dict:
-            output = (lm_logits,)
-            return ((loss,) + output) if loss is not None else output
-
-        return CausalLMOutputWithCrossAttentions(
-            loss=loss,
-            logits=lm_logits,
-            past_key_values=None,
-            hidden_states=None,
-            attentions=None,
-            cross_attentions=None,
-        )
-
-    def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, **model_kwargs):
-        input_shape = input_ids.shape
-        # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
-        if attention_mask is None:
-            attention_mask = input_ids.new_ones(input_shape)
-
-        # cut decoder_input_ids if past is used
-        if past is not None:
-            input_ids = input_ids[:, -1:]
-
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "past_key_values": past}
-
-    def _reorder_cache(self, past, beam_idx):
-        reordered_past = ()
-        for layer_past in past:
-            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
-        return reordered_past
+        return hidden_states
 
 
 class UncertainTransformerLMHeadModel(PreTrainedModel):
-    def __init__(self, config):
+    config_class = UncertainTransformerConfig
+
+    def __init__(self, config: UncertainTransformerConfig):
         super().__init__(config)
-        self.transformer = UncertainTransformer(
-        )
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.transformer = UncertainTransformer(config)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         self.init_weights()
 
@@ -194,19 +147,20 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             output_hidden_states=None,
             return_dict=None,
     ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
         transformer_outputs = self.transformer(
             input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
 
-        hidden_states = transformer_outputs[0]
+        hidden_states = transformer_outputs
 
         lm_logits = self.lm_head(hidden_states)
 
@@ -217,7 +171,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]
@@ -226,10 +180,10 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
+            past_key_values=None,
+            hidden_states=None,
+            attentions=None,
+            cross_attentions=None,
         )
 
 
