@@ -26,6 +26,7 @@ class UncertainTransformerLightningModule(pl.LightningModule):
             n_layers=hparams["n_layers"],
             dropout=hparams["dropout"],
             max_position_embeddings=hparams["max_length"],
+            pad_token_id=hparams["pad_token_id"],
         )
         self.model = UncertainTransformerLMHeadModel(config)
 

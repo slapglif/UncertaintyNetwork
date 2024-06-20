@@ -94,7 +94,8 @@ class UncertainTransformer(PreTrainedModel):
         hidden_states = self.pos_encoding(embedding_output)
 
         if self.config.use_rotary_embeddings:
-            cos, sin = self.rotary_emb(input_ids, seq_len=input_ids.size(1))
+            seq_len = input_ids.size(1)
+            cos, sin = self.rotary_emb(input_ids, seq_len=seq_len)
             hidden_states = apply_rotary_pos_emb(hidden_states, hidden_states, cos, sin)
 
         for layer in self.layers:

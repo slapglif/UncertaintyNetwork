@@ -13,6 +13,7 @@ class SlimPajamaDataset(IterableDataset):
         self.max_length = max_length
 
         self.tokenizer = tokenizer if tokenizer else GPT2Tokenizer.from_pretrained("gpt2")
+        self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.dataset = load_dataset("cerebras/SlimPajama-627B", split=split, streaming=True)
 
