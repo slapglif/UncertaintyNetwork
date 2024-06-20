@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 from typing import Optional
 
 class ScaledDotProductAttention(nn.Module):
@@ -25,7 +24,6 @@ class ScaledDotProductAttention(nn.Module):
         output = torch.matmul(attn, v)
         return output
 
-
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
@@ -42,27 +40,23 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        batch_size, seq_len, _ = q.shape
+        bs = q.size(0)
 
-        q = self.W_q(q)
-        k = self.W_k(k)
-        v = self.W_v(v)
-
-        q = rearrange(q, "b s (h d) -> b h s d", h=self.n_heads)
-        k = rearrange(k, "b s (h d) -> b h s d", h=self.n_heads)
-        v = rearrange(v, "b s (h d) -> b h s d", h=self.n_heads)
+        # Perform linear projections
+        q = self.W_q(q).view(bs, -1, self.n_heads, self.d_k).transpose(1, 2)
+        k = self.W_k(k).view(bs, -1, self.n_heads, self.d_k).transpose(1, 2)
+        v = self.W_v(v).view(bs, -1, self.n_heads, self.d_k).transpose(1, 2)
 
         if mask is not None:
-            mask = mask.unsqueeze(1)  # Add head dimension
+            mask = mask.unsqueeze(1).repeat(1, self.n_heads, 1, 1)
 
         attn_output = self.attention(q, k, v, mask)
-        attn_output = rearrange(attn_output, "b h s d -> b s (h d)")
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
 
         out = self.W_o(attn_output)
         out = self.dropout(out)
 
         return out
-
 
 class PositionwiseFeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
@@ -77,7 +71,6 @@ class PositionwiseFeedForward(nn.Module):
         x = self.dropout(x)
         x = self.fc2(x)
         return x
-
 
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
