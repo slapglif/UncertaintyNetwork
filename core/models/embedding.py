@@ -6,7 +6,7 @@ import torch.nn as nn
 
 class MatryoshkaEmbedding(nn.Module):
     def __init__(
-        self, vocab_size: int, d_model: int, max_len: int = 5000, n_layers: int = 3
+            self, vocab_size: int, d_model: int, max_len: int = 5000, n_layers: int = 3
     ):
         super().__init__()
         self.d_model = d_model
@@ -54,53 +54,37 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq)
 
         self.max_seq_len_cached = max_position_embeddings
-        t = torch.arange(
-            self.max_seq_len_cached,
-            device=self.inv_freq.device,
-            dtype=self.inv_freq.dtype,
-        )
+        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer(
-            "cos_cached", emb.cos()[None, :, None, :], persistent=False
-        )
-        self.register_buffer(
-            "sin_cached", emb.sin()[None, :, None, :], persistent=False
-        )
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
 
     def forward(self, x, seq_len=None):
         if seq_len > self.max_seq_len_cached:
             self.max_seq_len_cached = seq_len
-            t = torch.arange(
-                self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype
-            )
+            t = torch.arange(self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
             freqs = torch.einsum("i,j->ij", t, self.inv_freq)
             emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-            self.register_buffer(
-                "cos_cached", emb.cos()[None, :, None, :], persistent=False
-            )
-            self.register_buffer(
-                "sin_cached", emb.sin()[None, :, None, :], persistent=False
-            )
+            self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+            self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
         return (
-            self.cos_cached[:, :seq_len, ...].to(dtype=x.dtype),
-            self.sin_cached[:, :seq_len, ...].to(dtype=x.dtype),
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
 
 
-def rotate_half(x):
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 def apply_rotary_pos_emb(q, k, cos, sin, offset=0):
-    q_seq_len = q.shape[1]
-    k_seq_len = k.shape[1]
-    cos = cos[:, :q_seq_len, :]
-    sin = sin[:, :q_seq_len, :]
+    cos = cos[:, :, offset: q.shape[1] + offset, :]
+    sin = sin[:, :, offset: q.shape[1] + offset, :]
     q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos[:, :k_seq_len, :]) + (rotate_half(k) * sin[:, :k_seq_len, :])
+    k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
 
 
 class PositionalEncoding(nn.Module):
