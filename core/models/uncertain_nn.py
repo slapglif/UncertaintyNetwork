@@ -1,12 +1,10 @@
-# core/models/uncertain_nn.py
-import math
-
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-from core.models.layers import MultiHeadAttention, PositionwiseFeedForward
+from core.models.embedding import PositionalEncoding, RotaryEmbedding, apply_rotary_pos_emb
+from core.models.layers import TransformerEncoderLayer
 
 
 class UncertainTransformerConfig(PretrainedConfig):
@@ -15,15 +13,24 @@ class UncertainTransformerConfig(PretrainedConfig):
     def __init__(
             self,
             vocab_size=50257,
-            d_model=512,
-            n_heads=8,
-            d_ff=2048,
-            n_layers=6,
+            d_model=768,
+            n_heads=12,
+            d_ff=3072,
+            n_layers=12,
             dropout=0.1,
             max_position_embeddings=1024,
+            layer_norm_epsilon=1e-5,
+            initializer_range=0.02,
+            use_cache=True,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+            tie_word_embeddings=True,
+            use_rotary_embeddings=True,
+            rotary_dim=32,
             **kwargs
     ):
-        super().__init__(pad_token_id=0, **kwargs)
+        super().__init__(pad_token_id=pad_token_id, bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_heads = n_heads
@@ -31,28 +38,12 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.n_layers = n_layers
         self.dropout = dropout
         self.max_position_embeddings = max_position_embeddings
-
-
-class UncertainTransformerEncoderLayer(nn.Module):
-    def __init__(self, config: UncertainTransformerConfig):
-        super().__init__()
-        self.self_attn = MultiHeadAttention(config.d_model, config.n_heads, config.dropout)
-        self.feed_forward = PositionwiseFeedForward(config.d_model, config.d_ff, config.dropout)
-        self.norm1 = nn.LayerNorm(config.d_model)
-        self.norm2 = nn.LayerNorm(config.d_model)
-        self.dropout1 = nn.Dropout(config.dropout)
-        self.dropout2 = nn.Dropout(config.dropout)
-
-    def forward(self, src: torch.Tensor, src_mask: torch.Tensor = None) -> torch.Tensor:
-        attn_output = self.self_attn(src, src, src, src_mask)
-        src = src + self.dropout1(attn_output)
-        src = self.norm1(src)
-
-        ff_output = self.feed_forward(src)
-        src = src + self.dropout2(ff_output)
-        src = self.norm2(src)
-
-        return src
+        self.layer_norm_epsilon = layer_norm_epsilon
+        self.initializer_range = initializer_range
+        self.use_cache = use_cache
+        self.tie_word_embeddings = tie_word_embeddings
+        self.use_rotary_embeddings = use_rotary_embeddings
+        self.rotary_dim = rotary_dim
 
 
 class UncertainTransformer(PreTrainedModel):
@@ -60,151 +51,95 @@ class UncertainTransformer(PreTrainedModel):
 
     def __init__(self, config: UncertainTransformerConfig):
         super().__init__(config)
+        self.config = config
+
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.pos_encoding = PositionalEncoding(config.d_model, config.dropout, config.max_position_embeddings)
-        self.encoder_layers = nn.ModuleList(
-            [UncertainTransformerEncoderLayer(config) for _ in range(config.n_layers)]
-        )
 
-    def forward(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            position_ids=None,
-            head_mask=None,
-            inputs_embeds=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
-    ):
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        if config.use_rotary_embeddings:
+            self.rotary_emb = RotaryEmbedding(config.rotary_dim, config.max_position_embeddings)
 
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        elif input_ids is not None:
-            input_shape = input_ids.size()
-            batch_size, seq_length = input_shape
-        elif inputs_embeds is not None:
-            input_shape = inputs_embeds.size()[:-1]
-            batch_size, seq_length = input_shape
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(config.d_model, config.n_heads, config.d_ff, config.dropout)
+            for _ in range(config.n_layers)
+        ])
 
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        self.norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
 
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
+    def forward(self, input_ids, attention_mask=None):
         if attention_mask is None:
-            attention_mask = torch.ones(((batch_size, seq_length)), device=device)
+            attention_mask = torch.ones_like(input_ids)
 
-        if position_ids is None:
-            position_ids = torch.arange(seq_length, dtype=torch.long, device=device)
-            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embedding(input_ids)
-        position_embeds = self.pos_encoding(position_ids)
-        hidden_states = inputs_embeds + position_embeds
+        embedding_output = self.embedding(input_ids)
+        hidden_states = self.pos_encoding(embedding_output)
 
-        for encoder_layer in self.encoder_layers:
-            hidden_states = encoder_layer(hidden_states, attention_mask)
+        if self.config.use_rotary_embeddings:
+            cos, sin = self.rotary_emb(input_ids, seq_len=input_ids.size(1))
+            hidden_states = apply_rotary_pos_emb(hidden_states, hidden_states, cos, sin)
 
-        return hidden_states
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, extended_attention_mask)
+
+        output = self.norm(hidden_states)
+        return output
 
 
 class UncertainTransformerLMHeadModel(PreTrainedModel):
     config_class = UncertainTransformerConfig
+    base_model_prefix = "transformer"
 
     def __init__(self, config: UncertainTransformerConfig):
         super().__init__(config)
         self.transformer = UncertainTransformer(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        self.init_weights()
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.transformer.embedding.weight
 
-    def get_input_embeddings(self):
-        return self.transformer.embedding
+        self.apply(self._init_weights)
 
-    def set_input_embeddings(self, value):
-        self.transformer.embedding = value
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
 
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
-        # Only last token for inputs_ids if past is defined in kwargs
-        if past is not None:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-
-        return {
-            "input_ids": input_ids,
-            "past_key_values": past,
-            "use_cache": kwargs.get("use_cache"),
-        }
-
-    def forward(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            position_ids=None,
-            head_mask=None,
-            inputs_embeds=None,
-            labels=None,
-            use_cache=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
-    ):
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        transformer_outputs = self.transformer(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        transformer_outputs = self.transformer(input_ids, attention_mask=attention_mask)
         hidden_states = transformer_outputs
-
         lm_logits = self.lm_head(hidden_states)
 
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
-
-        if not return_dict:
-            output = (lm_logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
-            past_key_values=None,
-            hidden_states=None,
+            hidden_states=hidden_states,
             attentions=None,
-            cross_attentions=None,
         )
 
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x: torch.Tensor):
-        x = x + self.pe[: x.size(0), :]
-        return self.dropout(x)
+    def generate(self, input_ids, max_length, **kwargs):
+        return self.generate(input_ids, max_length=max_length, **kwargs)

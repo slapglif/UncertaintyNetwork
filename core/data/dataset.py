@@ -7,29 +7,31 @@ from transformers import GPT2Tokenizer
 
 
 class SlimPajamaDataset(IterableDataset):
-    def __init__(self, split: str, subset_size: float = 0.1, max_length: int = 1024):
+    def __init__(self, split: str, subset_size: float = 0.1, max_length: int = 1024, tokenizer: GPT2Tokenizer = None):
         self.split = split
         self.subset_size = subset_size
         self.max_length = max_length
 
-        self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        self.tokenizer = tokenizer if tokenizer else GPT2Tokenizer.from_pretrained("gpt2")
 
-        self.dataset = load_dataset("cerebras/SlimPajama-627B", split=split, cache_dir="F:\\.cache", streaming=True)
+        self.dataset = load_dataset("cerebras/SlimPajama-627B", split=split, streaming=True)
 
         self.total_examples = 1000000  # Adjust this value based on the estimated total examples in the dataset
         self.subset_examples = math.ceil(self.total_examples * self.subset_size)
 
     def __len__(self):
-        return self.total_examples
+        return self.subset_examples
 
     def __iter__(self):
         for idx, example in enumerate(self.dataset):
             if idx >= self.subset_examples:
                 break
 
-            tokenized_text = self.tokenizer(example["text"])["input_ids"]
-            for i in range(0, len(tokenized_text), self.max_length):
-                chunk = tokenized_text[i:i + self.max_length]
+            tokenized_text = self.tokenizer(example["text"], max_length=self.max_length, truncation=True)
+            input_ids = tokenized_text["input_ids"]
+
+            for i in range(0, len(input_ids) - 1, self.max_length):
+                chunk = input_ids[i:i + self.max_length]
                 if len(chunk) < 2:
                     continue
                 x = torch.tensor(chunk[:-1])

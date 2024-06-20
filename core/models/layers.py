@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-
 class ScaledDotProductAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
@@ -73,7 +72,29 @@ class PositionwiseFeedForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.fc1(x)
-        x = F.relu(x)
+        x = F.gelu(x)
         x = self.dropout(x)
         x = self.fc2(x)
+        return x
+
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, n_heads, dropout)
+        self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        attn_output = self.self_attn(x, x, x, mask)
+        x = x + self.dropout1(attn_output)
+        x = self.norm1(x)
+
+        ff_output = self.feed_forward(x)
+        x = x + self.dropout2(ff_output)
+        x = self.norm2(x)
+
         return x

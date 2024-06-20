@@ -1,4 +1,3 @@
-# core/scripts/train.py
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
@@ -52,10 +51,30 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         loss = outputs.loss
         self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True)
 
+        # Calculate perplexity
+        perplexity = self.perplexity(outputs.logits.view(-1, outputs.logits.size(-1)), labels.view(-1))
+        self.log("val_perplexity", perplexity, on_epoch=True, prog_bar=True, logger=True)
+
+        # Calculate ROUGE-L score
+        pred_texts = self.model.generate(input_ids, max_length=self.hparams["max_length"])
+        pred_texts = [self.data_module.tokenizer.decode(text, skip_special_tokens=True) for text in pred_texts]
+        target_texts = [self.data_module.tokenizer.decode(text, skip_special_tokens=True) for text in labels]
+        rouge_scores = [self.rouge_scorer.score(pred, target)['rougeL'].fmeasure for pred, target in
+                        zip(pred_texts, target_texts)]
+        self.log("val_rouge_l", sum(rouge_scores) / len(rouge_scores), on_epoch=True, prog_bar=True, logger=True)
+
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams["learning_rate"])
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2)
-        return [optimizer], [scheduler]
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.hparams["max_epochs"])
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1
+            }
+        }
 
     def train_dataloader(self):
         return self.data_module.train_dataloader()
@@ -67,10 +86,10 @@ class UncertainTransformerLightningModule(pl.LightningModule):
 def main():
     hparams = {
         "vocab_size": 50257,
-        "d_model": 512,
-        "n_heads": 8,
-        "d_ff": 2048,
-        "n_layers": 6,
+        "d_model": 768,
+        "n_heads": 12,
+        "d_ff": 3072,
+        "n_layers": 12,
         "dropout": 0.1,
         "batch_size": 32,
         "learning_rate": 1e-4,
@@ -80,8 +99,6 @@ def main():
         "subset_size": 0.1,
         "accumulate_grad_batches": 1,
         "precision": "16-mixed",
-        "auto_lr_find": True,
-        "auto_scale_batch_size": "binsearch",
         "gradient_clip_val": 1.0,
         "val_check_interval": 0.25,
     }
