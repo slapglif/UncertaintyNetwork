@@ -75,15 +75,11 @@ class SlimPajamaDataModule(LightningDataModule):
         labels = [item[1] for item in batch]
 
         input_ids = self.tokenizer.pad(
-            {"input_ids": input_ids},
-            padding="longest",
-            return_tensors="pt"
+            {"input_ids": input_ids}, padding="longest", return_tensors="pt"
         )["input_ids"]
 
         labels = self.tokenizer.pad(
-            {"input_ids": labels},
-            padding="longest",
-            return_tensors="pt"
+            {"input_ids": labels}, padding="longest", return_tensors="pt"
         )["input_ids"]
 
         return input_ids, labels

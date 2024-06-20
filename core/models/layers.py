@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+
 class ScaledDotProductAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
@@ -16,7 +17,13 @@ class ScaledDotProductAttention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ):
         batch_size, seq_len, _ = q.shape
 
         q = rearrange(q, "b s (h d) -> b h s d", h=self.n_heads)
@@ -51,7 +58,13 @@ class MultiHeadAttention(nn.Module):
         self.attention = ScaledDotProductAttention(self.d_k, n_heads, dropout)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ):
         q = self.W_q(q)
         k = self.W_k(k)
         v = self.W_v(v)
@@ -88,7 +101,9 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         attn_output = self.self_attn(x, x, x, mask)
         x = x + self.dropout1(attn_output)
         x = self.norm1(x)

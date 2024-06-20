@@ -1,15 +1,22 @@
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from pytorch_lightning.callbacks import (
+    ModelCheckpoint,
+    EarlyStopping,
+    LearningRateMonitor,
+)
 from pytorch_lightning.loggers import TensorBoardLogger
 from rouge_score import rouge_scorer
 from torch import nn
 from torchmetrics.text import Perplexity
 
 from core.data.datamodule import SlimPajamaDataModule
-from core.models.uncertain_nn import UncertainTransformerLMHeadModel, UncertainTransformerConfig
+from core.models.uncertain_nn import (
+    UncertainTransformerLMHeadModel,
+    UncertainTransformerConfig,
+)
 
-torch.set_float32_matmul_precision('medium')
+torch.set_float32_matmul_precision("medium")
 
 
 class UncertainTransformerLightningModule(pl.LightningModule):
@@ -42,7 +49,9 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         attention_mask = (input_ids != self.hparams["pad_token_id"]).long()
         outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
         loss = outputs.loss
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log(
+            "train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
+        )
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -53,28 +62,52 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True)
 
         # Calculate perplexity
-        perplexity = self.perplexity(outputs.logits.view(-1, outputs.logits.size(-1)), labels.view(-1))
-        self.log("val_perplexity", perplexity, on_epoch=True, prog_bar=True, logger=True)
+        perplexity = self.perplexity(
+            outputs.logits.view(-1, outputs.logits.size(-1)), labels.view(-1)
+        )
+        self.log(
+            "val_perplexity", perplexity, on_epoch=True, prog_bar=True, logger=True
+        )
 
         # Calculate ROUGE-L score
-        pred_texts = self.model.generate(input_ids, max_length=self.hparams["max_length"])
-        pred_texts = [self.data_module.tokenizer.decode(text, skip_special_tokens=True) for text in pred_texts]
-        target_texts = [self.data_module.tokenizer.decode(text, skip_special_tokens=True) for text in labels]
-        rouge_scores = [self.rouge_scorer.score(pred, target)['rougeL'].fmeasure for pred, target in
-                        zip(pred_texts, target_texts)]
-        self.log("val_rouge_l", sum(rouge_scores) / len(rouge_scores), on_epoch=True, prog_bar=True, logger=True)
+        pred_texts = self.model.generate(
+            input_ids, max_length=self.hparams["max_length"]
+        )
+        pred_texts = [
+            self.data_module.tokenizer.decode(text, skip_special_tokens=True)
+            for text in pred_texts
+        ]
+        target_texts = [
+            self.data_module.tokenizer.decode(text, skip_special_tokens=True)
+            for text in labels
+        ]
+        rouge_scores = [
+            self.rouge_scorer.score(pred, target)["rougeL"].fmeasure
+            for pred, target in zip(pred_texts, target_texts)
+        ]
+        self.log(
+            "val_rouge_l",
+            sum(rouge_scores) / len(rouge_scores),
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams["learning_rate"])
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.hparams["max_epochs"])
+        optimizer = torch.optim.AdamW(
+            self.parameters(), lr=self.hparams["learning_rate"]
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.hparams["max_epochs"]
+        )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "monitor": "val_loss",
                 "interval": "epoch",
-                "frequency": 1
-            }
+                "frequency": 1,
+            },
         }
 
     def train_dataloader(self):
@@ -122,7 +155,7 @@ def main():
 
     early_stop_callback = EarlyStopping(monitor="val_loss", patience=3, mode="min")
 
-    lr_monitor = LearningRateMonitor(logging_interval='step')
+    lr_monitor = LearningRateMonitor(logging_interval="step")
 
     logger = TensorBoardLogger("logs", name="uncertain-transformer")
 

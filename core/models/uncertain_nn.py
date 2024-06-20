@@ -3,7 +3,11 @@ import torch.nn as nn
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-from core.models.embedding import PositionalEncoding, RotaryEmbedding, apply_rotary_pos_emb
+from core.models.embedding import (
+    PositionalEncoding,
+    RotaryEmbedding,
+    apply_rotary_pos_emb,
+)
 from core.models.layers import TransformerEncoderLayer
 
 
@@ -11,24 +15,24 @@ class UncertainTransformerConfig(PretrainedConfig):
     model_type = "uncertain_transformer"
 
     def __init__(
-            self,
-            vocab_size=50257,
-            d_model=768,
-            n_heads=12,
-            d_ff=3072,
-            n_layers=12,
-            dropout=0.1,
-            max_position_embeddings=1024,
-            layer_norm_epsilon=1e-5,
-            initializer_range=0.02,
-            use_cache=True,
-            pad_token_id=50256,  # Set this to the EOS token ID for GPT-2
-            bos_token_id=50256,
-            eos_token_id=50256,
-            tie_word_embeddings=True,
-            use_rotary_embeddings=True,
-            rotary_dim=32,
-            **kwargs
+        self,
+        vocab_size=50257,
+        d_model=768,
+        n_heads=12,
+        d_ff=3072,
+        n_layers=12,
+        dropout=0.1,
+        max_position_embeddings=1024,
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        use_cache=True,
+        pad_token_id=50256,  # Set this to the EOS token ID for GPT-2
+        bos_token_id=50256,
+        eos_token_id=50256,
+        tie_word_embeddings=True,
+        use_rotary_embeddings=True,
+        rotary_dim=32,
+        **kwargs
     ):
         super().__init__(
             pad_token_id=pad_token_id,
@@ -59,15 +63,23 @@ class UncertainTransformer(PreTrainedModel):
         self.config = config
 
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos_encoding = PositionalEncoding(config.d_model, config.dropout, config.max_position_embeddings)
+        self.pos_encoding = PositionalEncoding(
+            config.d_model, config.dropout, config.max_position_embeddings
+        )
 
         if config.use_rotary_embeddings:
-            self.rotary_emb = RotaryEmbedding(config.rotary_dim, config.max_position_embeddings)
+            self.rotary_emb = RotaryEmbedding(
+                config.rotary_dim, config.max_position_embeddings
+            )
 
-        self.layers = nn.ModuleList([
-            TransformerEncoderLayer(config.d_model, config.n_heads, config.d_ff, config.dropout)
-            for _ in range(config.n_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                TransformerEncoderLayer(
+                    config.d_model, config.n_heads, config.d_ff, config.dropout
+                )
+                for _ in range(config.n_layers)
+            ]
+        )
 
         self.norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
 
@@ -87,7 +99,9 @@ class UncertainTransformer(PreTrainedModel):
             attention_mask = torch.ones_like(input_ids)
 
         extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)
+        extended_attention_mask = extended_attention_mask.to(
+            dtype=next(self.parameters()).dtype
+        )
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         embedding_output = self.embedding(input_ids)
@@ -138,7 +152,9 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
