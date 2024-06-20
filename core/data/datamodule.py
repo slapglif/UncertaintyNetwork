@@ -16,6 +16,9 @@ class SlimPajamaDataModule(LightningDataModule):
         self.max_length = max_length
         self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
+        # Set the pad_token to the eos_token
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+
     def setup(self, stage=None):
         if stage == "fit" or stage is None:
             self.train_dataset = SlimPajamaDataset(

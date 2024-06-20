@@ -94,7 +94,7 @@ def main():
         "batch_size": 32,
         "learning_rate": 1e-4,
         "max_epochs": 10,
-        "pad_token_id": 0,
+        "pad_token_id": 50256,  # Set this to the EOS token ID for GPT-2
         "max_length": 1024,
         "subset_size": 0.1,
         "accumulate_grad_batches": 1,

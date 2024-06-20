@@ -22,15 +22,20 @@ class UncertainTransformerConfig(PretrainedConfig):
             layer_norm_epsilon=1e-5,
             initializer_range=0.02,
             use_cache=True,
-            pad_token_id=0,
-            bos_token_id=1,
-            eos_token_id=2,
+            pad_token_id=50256,  # Set this to the EOS token ID for GPT-2
+            bos_token_id=50256,
+            eos_token_id=50256,
             tie_word_embeddings=True,
             use_rotary_embeddings=True,
             rotary_dim=32,
             **kwargs
     ):
-        super().__init__(pad_token_id=pad_token_id, bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            **kwargs
+        )
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_heads = n_heads
