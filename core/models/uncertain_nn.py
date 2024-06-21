@@ -1,13 +1,10 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-from core.models.embedding import (
-    PositionalEncoding,
-    RotaryEmbedding,
-    apply_rotary_pos_emb,
-)
+from core.models.embedding import PositionalEncoding, RotaryEmbedding, apply_rotary_pos_emb
 from core.models.layers import TransformerEncoderLayer
 
 
@@ -17,12 +14,12 @@ class UncertainTransformerConfig(PretrainedConfig):
     def __init__(
             self,
             vocab_size=50257,
-            d_model=768,
-            n_heads=12,
-            d_ff=3072,
-            n_layers=12,
+            d_model=512,
+            n_heads=8,
+            d_ff=2048,
+            n_layers=6,
             dropout=0.1,
-            max_position_embeddings=1024,
+            max_position_embeddings=512,
             layer_norm_epsilon=1e-5,
             initializer_range=0.02,
             use_cache=True,
@@ -73,13 +70,22 @@ class UncertainTransformer(PreTrainedModel):
 
         self.norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
 
+        self.gradient_checkpointing = False
         self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
 
     def forward(self, input_ids, attention_mask=None):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        # Convert attention mask to float and change 0s to -inf, 1s to 0
         extended_attention_mask = (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -10000.0
 
         embedding_output = self.embedding(input_ids)
@@ -91,7 +97,10 @@ class UncertainTransformer(PreTrainedModel):
             hidden_states, _ = apply_rotary_pos_emb(hidden_states, hidden_states, cos, sin)
 
         for layer in self.layers:
-            hidden_states = layer(hidden_states, extended_attention_mask)
+            if self.gradient_checkpointing and self.training:
+                hidden_states = checkpoint(layer, hidden_states, extended_attention_mask)
+            else:
+                hidden_states = layer(hidden_states, extended_attention_mask)
 
         output = self.norm(hidden_states)
         return output
@@ -130,9 +139,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
@@ -143,3 +150,9 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
 
     def generate(self, input_ids, max_length, **kwargs):
         return self.generate(input_ids, max_length=max_length, **kwargs)
+
+    def enable_gradient_checkpointing(self):
+        self.transformer.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        self.transformer.gradient_checkpointing = False
