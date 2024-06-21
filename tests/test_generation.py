@@ -29,14 +29,7 @@ def model(device):
 def tokenizer():
     return Tokenizer.from_pretrained("gpt2")
 
-
-def generate_text(
-    model: UncertainTransformerLMHeadModel,
-    tokenizer: Tokenizer,
-    prompt: str,
-    max_length: int = 50,
-    temperature: float = 1.0,
-) -> str:
+def generate_text(model: UncertainTransformerLMHeadModel, tokenizer: Tokenizer, prompt: str, max_length: int = 50, temperature: float = 1.0) -> str:
     device = next(model.parameters()).device
     input_ids = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(device)
 
@@ -44,22 +37,12 @@ def generate_text(
 
     with torch.no_grad():
         for _ in range(max_length):
-            outputs = model(input_ids)
+            outputs = model(input_ids[:, -512:])  # Limit context size to 512 tokens
             next_token_logits = outputs.logits[:, -1, :] / temperature
 
-            print(
-                f"Logits min: {next_token_logits.min().item()}, max: {next_token_logits.max().item()}, mean: {next_token_logits.mean().item()}"
-            )
-
             # Apply softmax with increased numerical stability
-            next_token_logits = (
-                next_token_logits - next_token_logits.max(dim=-1, keepdim=True)[0]
-            )
+            next_token_logits = next_token_logits - next_token_logits.max(dim=-1, keepdim=True)[0]
             next_token_probs = F.softmax(next_token_logits, dim=-1)
-
-            print(
-                f"Probs min: {next_token_probs.min().item()}, max: {next_token_probs.max().item()}, sum: {next_token_probs.sum().item()}"
-            )
 
             # Handle any remaining NaN or inf values
             next_token_probs = torch.where(
@@ -70,14 +53,23 @@ def generate_text(
 
             # Renormalize if necessary
             if next_token_probs.sum() == 0:
-                next_token_probs = torch.ones_like(
-                    next_token_probs
-                ) / next_token_probs.size(-1)
+                next_token_probs = torch.ones_like(next_token_probs) / next_token_probs.size(-1)
             else:
                 next_token_probs = next_token_probs / next_token_probs.sum()
 
+            # Ensure next_token_probs is 2D
+            if next_token_probs.dim() == 1:
+                next_token_probs = next_token_probs.unsqueeze(0)
+
             # Sample from the probability distribution
-            next_token = torch.multinomial(next_token_probs, num_samples=1)
+            try:
+                next_token = torch.multinomial(next_token_probs, num_samples=1)
+            except RuntimeError as e:
+                print(f"Error in multinomial sampling: {e}")
+                print(f"next_token_probs shape: {next_token_probs.shape}")
+                print(f"next_token_probs sum: {next_token_probs.sum()}")
+                print(f"next_token_probs min: {next_token_probs.min()}, max: {next_token_probs.max()}")
+                raise
 
             # Convert to list and append to generated_tokens
             next_token_ids = next_token.squeeze().cpu().tolist()
