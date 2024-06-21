@@ -141,9 +141,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         transformer_outputs = self.transformer(input_ids, attention_mask=attention_mask)
         hidden_states = transformer_outputs
 
-        hidden_states = hidden_states + 1e-8
         lm_logits = self.lm_head(hidden_states)
-        lm_logits = torch.clamp(lm_logits, min=-100, max=100)
 
         loss = None
         if labels is not None:

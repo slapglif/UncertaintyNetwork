@@ -40,9 +40,16 @@ def generate_text(model: UncertainTransformerLMHeadModel, tokenizer: Tokenizer, 
             outputs = model(input_ids[:, -512:])  # Limit context size to 512 tokens
             next_token_logits = outputs.logits[:, -1, :] / temperature
 
+            print(f"next_token_logits shape: {next_token_logits.shape}")
+            print(f"next_token_logits min: {next_token_logits.min()}, max: {next_token_logits.max()}")
+
             # Apply softmax with increased numerical stability
             next_token_logits = next_token_logits - next_token_logits.max(dim=-1, keepdim=True)[0]
             next_token_probs = F.softmax(next_token_logits, dim=-1)
+
+            print(f"next_token_probs shape after softmax: {next_token_probs.shape}")
+            print(f"next_token_probs sum: {next_token_probs.sum()}")
+            print(f"next_token_probs min: {next_token_probs.min()}, max: {next_token_probs.max()}")
 
             # Handle any remaining NaN or inf values
             next_token_probs = torch.where(
@@ -57,9 +64,16 @@ def generate_text(model: UncertainTransformerLMHeadModel, tokenizer: Tokenizer, 
             else:
                 next_token_probs = next_token_probs / next_token_probs.sum()
 
+            print(f"next_token_probs shape after renormalization: {next_token_probs.shape}")
+            print(f"next_token_probs sum after renormalization: {next_token_probs.sum()}")
+
             # Ensure next_token_probs is 2D
             if next_token_probs.dim() == 1:
                 next_token_probs = next_token_probs.unsqueeze(0)
+            elif next_token_probs.dim() > 2:
+                next_token_probs = next_token_probs.view(-1, next_token_probs.size(-1))
+
+            print(f"Final next_token_probs shape: {next_token_probs.shape}")
 
             # Sample from the probability distribution
             try:
