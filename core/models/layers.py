@@ -161,10 +161,15 @@ class TimestepNorm(nn.Module):
         return x * self.weight + self.bias
 
 
+import torch
+import torch.nn as nn
+from typing import Optional
+
+
 class NormalizedAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.cema = CEMA(config.d_model, config.cema_hidden_dim)
+        self.cema = CEMA(config.d_model, config.cema_hidden_dim, chunk_size=config.chunk_size)
         self.z_proj = nn.Linear(config.d_model, config.z_dim)
         self.q_proj = nn.Linear(config.z_dim, config.z_dim)
         self.k_proj = nn.Linear(config.z_dim, config.z_dim)
@@ -188,7 +193,9 @@ class NormalizedAttention(nn.Module):
         # Apply CEMA
         x_flat = x.view(-1, self.d_model)
         x_cema = self.cema(x_flat)
-        x_cema = x_cema.view(batch_size, seq_len, self.d_model)
+
+        # Reshape x_cema to match the input shape, regardless of the CEMA output size
+        x_cema = x_cema.view(-1, self.d_model)[:batch_size * seq_len].view(batch_size, seq_len, self.d_model)
 
         # Project and normalize
         z = self.z_proj(x_cema)

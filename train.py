@@ -147,12 +147,12 @@ class UncertainTransformerLightningModule(pl.LightningModule):
 def main():
     hparams = {
         "vocab_size": 50257,
-        "d_model": 768,
-        "n_heads": 12,
-        "d_ff": 3072,
-        "n_layers": 12,
+        "d_model": 512,
+        "n_heads": 8,
+        "d_ff": 2048,
+        "n_layers": 6,
         "dropout": 0.1,
-        "batch_size": 32,
+        "batch_size": 16,  # Reduced from 32
         "learning_rate": 3e-5,
         "weight_decay": 0.01,
         "warmup_ratio": 0.1,
@@ -164,15 +164,16 @@ def main():
         "gradient_clip_val": 1.0,
         "val_check_interval": 0.25,
         "use_stable_embedding": True,
-        "num_groups": 32,
-        "cema_hidden_dim": 64,
-        "z_dim": 768,
-        "v_dim": 768,
-        "chunk_size": 4096,
-        "use_gelu_approximation": True,  # Add this line
+        "num_groups": 16,
+        "cema_hidden_dim": 32,
+        "z_dim": 512,
+        "v_dim": 512,
+        "chunk_size": 64,
+        "use_gelu_approximation": True,
     }
 
     model = UncertainTransformerLightningModule(hparams)
+    model.enable_gradient_checkpointing()
 
     datamodule = SlimPajamaDataModule(
         batch_size=hparams["batch_size"],

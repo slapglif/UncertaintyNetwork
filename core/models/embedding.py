@@ -5,10 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import torch
-import torch.nn as nn
-import math
-
 
 class CEMA(nn.Module):
     def __init__(self, d: int, h: int, chunk_size: int = 128):
@@ -55,6 +51,7 @@ class CEMA(nn.Module):
             output.append(y)
 
         return torch.cat(output, dim=0)
+
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):

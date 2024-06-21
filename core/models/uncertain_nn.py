@@ -18,30 +18,30 @@ class UncertainTransformerConfig(PretrainedConfig):
     model_type = "uncertain_transformer"
 
     def __init__(
-            self,
-            vocab_size=50257,
-            d_model=768,
-            n_heads=12,
-            d_ff=3072,
-            n_layers=12,
-            dropout=0.1,
-            max_position_embeddings=1024,
-            layer_norm_epsilon=1e-5,
-            initializer_range=0.02,
-            use_cache=True,
-            pad_token_id=50256,
-            bos_token_id=50256,
-            eos_token_id=50256,
-            tie_word_embeddings=True,
-            use_rotary_embeddings=True,
-            use_stable_embedding=True,
-            num_groups=32,  # for TimestepNorm
-            cema_hidden_dim=64,  # for CEMA
-            z_dim=768,  # for NormalizedAttention
-            v_dim=768,  # for NormalizedAttention
-            chunk_size=4096,  # for chunk-wise attention
-            use_gelu_approximation=True,  # Add this line
-            **kwargs
+        self,
+        vocab_size=50257,
+        d_model=512,  # Reduced from 768
+        n_heads=8,    # Reduced from 12
+        d_ff=2048,    # Reduced from 3072
+        n_layers=6,   # Reduced from 12
+        dropout=0.1,
+        max_position_embeddings=1024,
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        use_cache=True,
+        pad_token_id=50256,
+        bos_token_id=50256,
+        eos_token_id=50256,
+        tie_word_embeddings=True,
+        use_rotary_embeddings=True,
+        use_stable_embedding=True,
+        num_groups=16,  # Reduced from 32
+        cema_hidden_dim=32,  # Reduced from 64
+        z_dim=512,  # Reduced from 768
+        v_dim=512,  # Reduced from 768
+        chunk_size=64,  # Added chunk_size parameter
+        use_gelu_approximation=True,
+        **kwargs
     ):
         super().__init__(
             pad_token_id=pad_token_id,
@@ -67,8 +67,10 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.z_dim = z_dim
         self.v_dim = v_dim
         self.chunk_size = chunk_size
-        self.use_gelu_approximation = use_gelu_approximation  # Add this line
+        self.use_gelu_approximation = use_gelu_approximation
 
+
+from torch.utils.checkpoint import checkpoint
 
 class UncertainTransformer(PreTrainedModel):
     def __init__(self, config):
@@ -90,6 +92,7 @@ class UncertainTransformer(PreTrainedModel):
             [TransformerEncoderLayer(config) for _ in range(config.n_layers)]
         )
         self.norm = TimestepNorm(config.num_groups, config.d_model)
+        self.gradient_checkpointing = False
 
     def forward(self, input_ids, attention_mask=None):
         if attention_mask is None:
@@ -109,10 +112,18 @@ class UncertainTransformer(PreTrainedModel):
             )
 
         for layer in self.layers:
-            hidden_states = layer(hidden_states, extended_attention_mask)
+            if self.gradient_checkpointing and self.training:
+                hidden_states = checkpoint(layer, hidden_states, extended_attention_mask)
+            else:
+                hidden_states = layer(hidden_states, extended_attention_mask)
 
-        output = self.norm(hidden_states)
-        return output
+        return self.norm(hidden_states)
+
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
 
 
 class UncertainTransformerLMHeadModel(PreTrainedModel):
@@ -125,15 +136,6 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
 
         if config.tie_word_embeddings:
             self.lm_head.weight = self.transformer.embedding.weight
-
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         transformer_outputs = self.transformer(input_ids, attention_mask=attention_mask)
@@ -159,11 +161,8 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             attentions=None,
         )
 
-    def generate(self, input_ids, max_length, **kwargs):
-        return self.generate(input_ids, max_length=max_length, **kwargs)
-
     def enable_gradient_checkpointing(self):
-        self.transformer.gradient_checkpointing = True
+        self.transformer.enable_gradient_checkpointing()
 
     def disable_gradient_checkpointing(self):
-        self.transformer.gradient_checkpointing = False
+        self.transformer.disable_gradient_checkpointing()

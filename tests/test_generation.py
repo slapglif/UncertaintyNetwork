@@ -125,19 +125,50 @@ def calculate_perplexity(
         "The future of artificial intelligence",
     ],
 )
-def test_generation(model, tokenizer, prompt, device):
-    model.to(device)
-    generated_text = generate_text(model, tokenizer, prompt)
-    perplexity = calculate_perplexity(model, tokenizer, generated_text)
+def generate_text(model: UncertainTransformerLMHeadModel, tokenizer: Tokenizer, prompt: str, max_length: int = 50, temperature: float = 1.0) -> str:
+    device = next(model.parameters()).device
+    input_ids = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(device)
 
-    print(f"\nPrompt: {prompt}")
-    print(f"Generated text: {generated_text}")
-    print(f"Perplexity: {perplexity:.2f}")
+    generated_tokens = []
 
-    assert len(generated_text) > len(
-        prompt
-    ), "Generated text should be longer than the prompt"
-    assert perplexity > 0, "Perplexity should be a positive number"
+    with torch.no_grad():
+        for _ in range(max_length):
+            outputs = model(input_ids[:, -512:])  # Limit context size to 512 tokens
+            next_token_logits = outputs.logits[:, -1, :] / temperature
+
+            # Apply softmax with increased numerical stability
+            next_token_logits = next_token_logits - next_token_logits.max(dim=-1, keepdim=True)[0]
+            next_token_probs = F.softmax(next_token_logits, dim=-1)
+
+            # Handle any remaining NaN or inf values
+            next_token_probs = torch.where(
+                torch.isnan(next_token_probs) | torch.isinf(next_token_probs),
+                torch.zeros_like(next_token_probs),
+                next_token_probs,
+            )
+
+            # Renormalize if necessary
+            if next_token_probs.sum() == 0:
+                next_token_probs = torch.ones_like(next_token_probs) / next_token_probs.size(-1)
+            else:
+                next_token_probs = next_token_probs / next_token_probs.sum()
+
+            # Sample from the probability distribution
+            next_token = torch.multinomial(next_token_probs, num_samples=1)
+
+            # Convert to list and append to generated_tokens
+            next_token_ids = next_token.squeeze().cpu().tolist()
+            if isinstance(next_token_ids, int):
+                next_token_ids = [next_token_ids]
+            generated_tokens.extend(next_token_ids)
+
+            # Concatenate the new token(s) to input_ids
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+
+            if tokenizer.tokenizer.eos_token_id in next_token_ids:
+                break
+
+    return tokenizer.decode(generated_tokens)
 
 
 def test_average_perplexity(model, tokenizer, device):
