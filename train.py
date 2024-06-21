@@ -1,15 +1,24 @@
+# train.py
+
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from pytorch_lightning.callbacks import (
+    ModelCheckpoint,
+    EarlyStopping,
+    LearningRateMonitor,
+)
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 from torchmetrics.text import Perplexity
 from transformers import get_linear_schedule_with_warmup
 
 from core.data.datamodule import SlimPajamaDataModule
-from core.models.uncertain_nn import UncertainTransformerLMHeadModel, UncertainTransformerConfig
+from core.models.uncertain_nn import (
+    UncertainTransformerLMHeadModel,
+    UncertainTransformerConfig,
+)
 
-torch.set_float32_matmul_precision('medium')
+torch.set_float32_matmul_precision("medium")
 
 
 class UncertainTransformerLightningModule(pl.LightningModule):
@@ -26,9 +35,12 @@ class UncertainTransformerLightningModule(pl.LightningModule):
             dropout=hparams["dropout"],
             max_position_embeddings=hparams["max_length"],
             pad_token_id=hparams["pad_token_id"],
-            use_rezero=hparams["use_rezero"],
-            use_gelu_approximation=hparams["use_gelu_approximation"],
             use_stable_embedding=hparams["use_stable_embedding"],
+            num_groups=hparams["num_groups"],
+            cema_hidden_dim=hparams["cema_hidden_dim"],
+            z_dim=hparams["z_dim"],
+            v_dim=hparams["v_dim"],
+            chunk_size=hparams["chunk_size"],
         )
         self.model = UncertainTransformerLMHeadModel(config)
         self.model.enable_gradient_checkpointing()
@@ -54,7 +66,15 @@ class UncertainTransformerLightningModule(pl.LightningModule):
             print(f"Logits min: {outputs.logits.min()}, max: {outputs.logits.max()}")
             return None
 
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log(
+            "train_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+        )
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -62,10 +82,21 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         attention_mask = (input_ids != self.hparams["pad_token_id"]).long()
         outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
         loss = outputs.loss
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log(
+            "val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True
+        )
 
-        perplexity = self.perplexity(outputs.logits.view(-1, outputs.logits.size(-1)), labels.view(-1))
-        self.log("val_perplexity", perplexity, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        perplexity = self.perplexity(
+            outputs.logits.view(-1, outputs.logits.size(-1)), labels.view(-1)
+        )
+        self.log(
+            "val_perplexity",
+            perplexity,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+        )
 
         return loss
 
@@ -75,11 +106,15 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
             {
-                "params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+                "params": [
+                    p for n, p in param_optimizer if not any(nd in n for nd in no_decay)
+                ],
                 "weight_decay": self.hparams["weight_decay"],
             },
             {
-                "params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+                "params": [
+                    p for n, p in param_optimizer if any(nd in n for nd in no_decay)
+                ],
                 "weight_decay": 0.0,
             },
         ]
@@ -128,9 +163,13 @@ def main():
         "accumulate_grad_batches": 4,
         "gradient_clip_val": 1.0,
         "val_check_interval": 0.25,
-        "use_rezero": True,
-        "use_gelu_approximation": True,
         "use_stable_embedding": True,
+        "num_groups": 32,
+        "cema_hidden_dim": 64,
+        "z_dim": 768,
+        "v_dim": 768,
+        "chunk_size": 4096,
+        "use_gelu_approximation": True,  # Add this line
     }
 
     model = UncertainTransformerLightningModule(hparams)
@@ -151,9 +190,15 @@ def main():
 
     early_stop_callback = EarlyStopping(monitor="val_loss", patience=3, mode="min")
 
-    lr_monitor = LearningRateMonitor(logging_interval='step')
+    lr_monitor = LearningRateMonitor(logging_interval="step")
 
     logger = TensorBoardLogger("logs", name="uncertain-transformer")
+
+    # Configure 4D parallelism
+    strategy = "ddp"  # Distributed Data Parallel
+    devices = 8  # Number of GPUs
+    num_nodes = 4  # Number of nodes
+    accelerator = "gpu"
 
     trainer = pl.Trainer(
         max_epochs=hparams["max_epochs"],
@@ -165,6 +210,10 @@ def main():
         val_check_interval=hparams["val_check_interval"],
         deterministic=True,
         log_every_n_steps=10,
+        # strategy=strategy,
+        # devices=devices,
+        # num_nodes=num_nodes,
+        # accelerator=accelerator,
     )
 
     trainer.fit(model, datamodule=datamodule)

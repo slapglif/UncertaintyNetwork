@@ -4,6 +4,72 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch
+import torch.nn as nn
+from typing import Tuple
+
+
+class CEMA(nn.Module):
+    """
+    Continuous Exponential Moving Average (CEMA) module.
+
+    This module applies a learnable exponential moving average to the input tensor,
+    assuming that the input tensor represents individual embeddings rather than a sequence
+    of embeddings.
+    """
+
+    def __init__(self, d: int, h: int):
+        """
+        Initialize the CEMA module.
+
+        Args:
+            d (int): The input dimension (embedding dimension).
+            h (int): The hidden dimension for the exponential moving average.
+        """
+        super().__init__()
+        self.d = d
+        self.h = h
+        self.alpha = nn.Parameter(torch.rand(d, h))
+        self.delta = nn.Parameter(torch.rand(d, h))
+        self.omega = nn.Parameter(torch.rand(d))
+        self.beta = nn.Parameter(torch.randn(d, h))
+        self.eta = nn.Parameter(torch.randn(d, h))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the CEMA module.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, d), representing individual embeddings.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, d).
+        """
+        batch_size, d = x.shape
+        assert d == self.d, "Input dimension must match CEMA's dimension"
+
+        # Compute u
+        u = torch.einsum('bd,dh->bdh', x, self.beta)
+
+        # Compute theta
+        theta = torch.outer(torch.arange(self.h, device=x.device), self.omega) * (2 * torch.pi / self.h)
+        cos_theta = torch.cos(theta)
+        sin_theta = torch.sin(theta)
+
+        # Compute complex alpha and delta
+        alpha_complex = self.alpha * (cos_theta + 1j * sin_theta)
+        delta_complex = self.delta * (cos_theta + 1j * sin_theta)
+
+        # Initialize h
+        h = torch.zeros(batch_size, self.d, self.h, dtype=torch.complex64, device=x.device)
+
+        # Apply CEMA (assuming a single step for individual embeddings)
+        h = alpha_complex * u + (1 - alpha_complex * delta_complex) * h
+
+        # Compute final output
+        y = torch.einsum('bdh,dh->bd', h.real, self.eta)
+
+        return y
 
 
 class PositionalEncoding(nn.Module):
@@ -12,14 +78,16 @@ class PositionalEncoding(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
         position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        )
         pe = torch.zeros(max_len, 1, d_model)
         pe[:, 0, 0::2] = torch.sin(position * div_term)
         pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
+        self.register_buffer("pe", pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.pe[:x.size(0)]
+        x = x + self.pe[: x.size(0)]
         return self.dropout(x)
 
 
@@ -30,20 +98,34 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq)
 
         self.max_seq_len_cached = max_position_embeddings
-        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        t = torch.arange(
+            self.max_seq_len_cached,
+            device=self.inv_freq.device,
+            dtype=self.inv_freq.dtype,
+        )
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+        self.register_buffer(
+            "cos_cached", emb.cos()[None, None, :, :], persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", emb.sin()[None, None, :, :], persistent=False
+        )
 
     def forward(self, x, seq_len=None):
         if seq_len > self.max_seq_len_cached:
             self.max_seq_len_cached = seq_len
-            t = torch.arange(self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
+            t = torch.arange(
+                self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype
+            )
             freqs = torch.einsum("i,j->ij", t, self.inv_freq)
             emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-            self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
-            self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+            self.register_buffer(
+                "cos_cached", emb.cos()[None, None, :, :], persistent=False
+            )
+            self.register_buffer(
+                "sin_cached", emb.sin()[None, None, :, :], persistent=False
+            )
         return (
             self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
@@ -70,7 +152,9 @@ class StableEmbedding(nn.Module):
     This embedding layer is designed to provide more stable gradients during training.
     """
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: Optional[int] = None):
+    def __init__(
+            self, num_embeddings: int, embedding_dim: int, padding_idx: Optional[int] = None
+    ):
         """
         Initialize the StableEmbedding layer.
 

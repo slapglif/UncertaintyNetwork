@@ -4,6 +4,7 @@ from transformers import GPT2Tokenizer
 
 from core.data.dataset import SlimPajamaDataset
 
+
 class SlimPajamaDataModule(LightningDataModule):
     def __init__(self, batch_size: int, subset_size: float, max_length: int):
         super().__init__()
@@ -43,7 +44,7 @@ class SlimPajamaDataModule(LightningDataModule):
             collate_fn=SlimPajamaDataset.collate_fn,
             num_workers=4,
             persistent_workers=True,
-            pin_memory=True
+            pin_memory=True,
         )
 
     def val_dataloader(self):
@@ -53,7 +54,7 @@ class SlimPajamaDataModule(LightningDataModule):
             collate_fn=SlimPajamaDataset.collate_fn,
             num_workers=4,
             persistent_workers=True,
-            pin_memory=True
+            pin_memory=True,
         )
 
     def test_dataloader(self):
@@ -63,5 +64,5 @@ class SlimPajamaDataModule(LightningDataModule):
             collate_fn=SlimPajamaDataset.collate_fn,
             num_workers=4,
             persistent_workers=True,
-            pin_memory=True
+            pin_memory=True,
         )

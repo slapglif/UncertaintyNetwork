@@ -1,14 +1,17 @@
-from typing import Optional
+# core/models/uncertain_nn.py
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
-from transformers import PreTrainedModel
-from transformers import PretrainedConfig
+from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-from core.models.embedding import PositionalEncoding, RotaryEmbedding, apply_rotary_pos_emb, StableEmbedding
-from core.models.layers import TransformerEncoderLayer
+from core.models.embedding import (
+    PositionalEncoding,
+    RotaryEmbedding,
+    apply_rotary_pos_emb,
+    StableEmbedding,
+)
+from core.models.layers import TransformerEncoderLayer, TimestepNorm
 
 
 class UncertainTransformerConfig(PretrainedConfig):
@@ -31,9 +34,13 @@ class UncertainTransformerConfig(PretrainedConfig):
             eos_token_id=50256,
             tie_word_embeddings=True,
             use_rotary_embeddings=True,
-            use_rezero=True,
-            use_gelu_approximation=True,
             use_stable_embedding=True,
+            num_groups=32,  # for TimestepNorm
+            cema_hidden_dim=64,  # for CEMA
+            z_dim=768,  # for NormalizedAttention
+            v_dim=768,  # for NormalizedAttention
+            chunk_size=4096,  # for chunk-wise attention
+            use_gelu_approximation=True,  # Add this line
             **kwargs
     ):
         super().__init__(
@@ -54,76 +61,37 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.tie_word_embeddings = tie_word_embeddings
         self.use_rotary_embeddings = use_rotary_embeddings
-        self.use_rezero = use_rezero
-        self.use_gelu_approximation = use_gelu_approximation
         self.use_stable_embedding = use_stable_embedding
+        self.num_groups = num_groups
+        self.cema_hidden_dim = cema_hidden_dim
+        self.z_dim = z_dim
+        self.v_dim = v_dim
+        self.chunk_size = chunk_size
+        self.use_gelu_approximation = use_gelu_approximation  # Add this line
 
 
 class UncertainTransformer(PreTrainedModel):
-    """
-    The UncertainTransformer model.
-
-    This model uses either a StableEmbedding or a standard Embedding layer,
-    followed by positional encoding and a series of transformer encoder layers.
-    """
-
-    config_class = UncertainTransformerConfig
-
-    def __init__(self, config: UncertainTransformerConfig):
-        """
-        Initialize the UncertainTransformer model.
-
-        Args:
-            config (UncertainTransformerConfig): The configuration object containing model parameters.
-        """
+    def __init__(self, config):
         super().__init__(config)
         self.config = config
-
-        if config.use_stable_embedding:
-            self.embedding = StableEmbedding(config.vocab_size, config.d_model, padding_idx=config.pad_token_id)
-        else:
-            self.embedding = nn.Embedding(config.vocab_size, config.d_model, padding_idx=config.pad_token_id)
-
-        self.pos_encoding = PositionalEncoding(config.d_model, config.dropout, config.max_position_embeddings)
+        self.embedding = StableEmbedding(
+            config.vocab_size, config.d_model, padding_idx=config.pad_token_id
+        )
+        self.pos_encoding = PositionalEncoding(
+            config.d_model, config.dropout, config.max_position_embeddings
+        )
 
         if config.use_rotary_embeddings:
-            self.rotary_emb = RotaryEmbedding(config.d_model, config.max_position_embeddings)
+            self.rotary_emb = RotaryEmbedding(
+                config.d_model, config.max_position_embeddings
+            )
 
-        self.layers = nn.ModuleList([
-            TransformerEncoderLayer(config) for _ in range(config.n_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [TransformerEncoderLayer(config) for _ in range(config.n_layers)]
+        )
+        self.norm = TimestepNorm(config.num_groups, config.d_model)
 
-        self.norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
-
-        self.gradient_checkpointing = False
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        """
-        Initialize the weights of the model.
-
-        Args:
-            module (nn.Module): The module whose weights need to be initialized.
-        """
-        if isinstance(module, (nn.Linear, nn.Embedding, StableEmbedding)):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-
-    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Forward pass of the UncertainTransformer model.
-
-        Args:
-            input_ids (torch.Tensor): The input tensor containing token ids.
-            attention_mask (Optional[torch.Tensor]): The attention mask tensor.
-
-        Returns:
-            torch.Tensor: The output tensor after passing through the transformer layers.
-        """
+    def forward(self, input_ids, attention_mask=None):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
@@ -136,52 +104,53 @@ class UncertainTransformer(PreTrainedModel):
         if self.config.use_rotary_embeddings:
             seq_len = input_ids.size(1)
             cos, sin = self.rotary_emb(input_ids, seq_len=seq_len)
-            hidden_states, _ = apply_rotary_pos_emb(hidden_states, hidden_states, cos, sin)
+            hidden_states, _ = apply_rotary_pos_emb(
+                hidden_states, hidden_states, cos, sin
+            )
 
         for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                hidden_states = torch.utils.checkpoint.checkpoint(layer, hidden_states, extended_attention_mask)
-            else:
-                hidden_states = layer(hidden_states, extended_attention_mask)
+            hidden_states = layer(hidden_states, extended_attention_mask)
 
         output = self.norm(hidden_states)
         return output
 
 
 class UncertainTransformerLMHeadModel(PreTrainedModel):
-    config_class = UncertainTransformerConfig
-    base_model_prefix = "transformer"
-
-    def __init__(self, config: UncertainTransformerConfig):
+    def __init__(self, config):
         super().__init__(config)
         self.transformer = UncertainTransformer(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
+        self.apply(self._init_weights)
+
         if config.tie_word_embeddings:
             self.lm_head.weight = self.transformer.embedding.weight
 
-        self.apply(self._init_weights)
-
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
+            module.weight.data.normal_(mean=0.0, std=0.02)
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         transformer_outputs = self.transformer(input_ids, attention_mask=attention_mask)
         hidden_states = transformer_outputs
+
+        hidden_states = hidden_states + 1e-8
         lm_logits = self.lm_head(hidden_states)
+        lm_logits = torch.clamp(lm_logits, min=-100, max=100)
 
         loss = None
         if labels is not None:
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
