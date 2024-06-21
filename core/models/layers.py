@@ -164,7 +164,7 @@ class TimestepNorm(nn.Module):
 class NormalizedAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.cema = CEMA(config.d_model, config.cema_hidden_dim, chunk_size=config.chunk_size)
+        self.cema = CEMA(config.d_model, config.cema_hidden_dim)
         self.z_proj = nn.Linear(config.d_model, config.z_dim)
         self.q_proj = nn.Linear(config.z_dim, config.z_dim)
         self.k_proj = nn.Linear(config.z_dim, config.z_dim)
@@ -185,12 +185,10 @@ class NormalizedAttention(nn.Module):
         else:
             raise ValueError(f"Unexpected input shape: {x.shape}")
 
-        # Reshape for CEMA
+        # Apply CEMA
         x_flat = x.view(-1, self.d_model)
         x_cema = self.cema(x_flat)
-
-        # Reshape x_cema to match the input shape
-        x_cema = x_cema.view(-1, self.d_model)[:batch_size * seq_len].view(batch_size, seq_len, self.d_model)
+        x_cema = x_cema.view(batch_size, seq_len, self.d_model)
 
         # Project and normalize
         z = self.z_proj(x_cema)

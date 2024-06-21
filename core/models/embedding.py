@@ -5,9 +5,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import torch
+import torch.nn as nn
+import math
+
 
 class CEMA(nn.Module):
-    def __init__(self, d: int, h: int, chunk_size: int = 64):
+    def __init__(self, d: int, h: int, chunk_size: int = 128):
         super().__init__()
         self.d = d
         self.h = h
@@ -40,16 +44,17 @@ class CEMA(nn.Module):
             u = torch.einsum('bd,dh->bdh', chunk, self.beta)
 
             # Apply CEMA for the chunk
-            h = alpha_complex * u[:, :, None, :]
-            h += (1 - alpha_complex * delta_complex) * torch.zeros(1, d, 1, self.h, dtype=torch.complex64,
-                                                                   device=x.device)
+            h = alpha_complex[None, :, :, :] * u[:, :, None, :]
+            h += (1 - alpha_complex[None, :, :, :] * delta_complex[None, :, :, :]) * torch.zeros(chunk.size(0), d, 1,
+                                                                                                 self.h,
+                                                                                                 dtype=torch.complex64,
+                                                                                                 device=x.device)
 
             # Compute output for the chunk
             y = torch.einsum('bdhk,dh->bd', h.real, self.eta)
             output.append(y)
 
         return torch.cat(output, dim=0)
-
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
