@@ -28,9 +28,10 @@ class UncertainTransformerLightningModule(pl.LightningModule):
             pad_token_id=hparams["pad_token_id"],
         )
         self.model = UncertainTransformerLMHeadModel(config)
+        self.model.enable_gradient_checkpointing()
 
-        self.criterion = nn.CrossEntropyLoss(ignore_index=hparams["pad_token_id"])
-        self.perplexity = Perplexity(ignore_index=hparams["pad_token_id"])
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)  # Changed to -100
+        self.perplexity = Perplexity(ignore_index=-100)  # Changed to -100
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         return self.model(input_ids, attention_mask=attention_mask, labels=labels)
@@ -40,7 +41,7 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         attention_mask = (input_ids != self.hparams["pad_token_id"]).long()
         outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
         loss = outputs.loss
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -48,10 +49,10 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         attention_mask = (input_ids != self.hparams["pad_token_id"]).long()
         outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
         loss = outputs.loss
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True)
 
         perplexity = self.perplexity(outputs.logits.view(-1, outputs.logits.size(-1)), labels.view(-1))
-        self.log("val_perplexity", perplexity, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("val_perplexity", perplexity, on_epoch=True, prog_bar=True, logger=True)
 
         return loss
 
@@ -96,7 +97,7 @@ def main():
         "subset_size": 0.1,
         "accumulate_grad_batches": 2,
         "gradient_clip_val": 1.0,
-        "val_check_interval": 0.25,
+        "val_check_interval": 1000,  # Changed to an integer: check validation every 1000 training batches
     }
 
     datamodule = SlimPajamaDataModule(
@@ -106,7 +107,6 @@ def main():
     )
 
     model = UncertainTransformerLightningModule(hparams, datamodule)
-    model.model.enable_gradient_checkpointing()
 
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints",
@@ -127,11 +127,9 @@ def main():
         callbacks=[checkpoint_callback, early_stop_callback, lr_monitor],
         logger=logger,
         accumulate_grad_batches=hparams["accumulate_grad_batches"],
-        precision=16,  # Use mixed precision training
+        precision="16-mixed",
         gradient_clip_val=hparams["gradient_clip_val"],
         val_check_interval=hparams["val_check_interval"],
-        gpus=1,
-        strategy="ddp",  # Use DistributedDataParallel for multi-GPU training
         deterministic=True,
     )
 
