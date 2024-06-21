@@ -26,7 +26,6 @@ class ScaledDotProductAttention(nn.Module):
         output = torch.matmul(attn, v)
         return output
 
-
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
@@ -43,11 +42,31 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        batch_size, seq_len, _ = x.shape
+        print(f"MultiHeadAttention input shape: {x.shape}")
+        print(f"MultiHeadAttention mask shape: {mask.shape if mask is not None else None}")
 
-        q = self.W_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        k = self.W_k(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        v = self.W_v(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        # Handle different input shapes
+        if x.dim() == 3:
+            batch_size, seq_len, _ = x.shape
+        elif x.dim() == 4:
+            x = x.squeeze(0)  # Remove the extra dimension
+            batch_size, seq_len, _ = x.shape
+        else:
+            raise ValueError(f"Unexpected input shape: {x.shape}")
+
+        q = self.W_q(x)
+        k = self.W_k(x)
+        v = self.W_v(x)
+
+        # Reshape for multi-head attention
+        q = q.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+
+        if mask is not None:
+            # Adjust mask shape if necessary
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(1)
 
         attn_output = self.attention(q, k, v, mask)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
@@ -71,8 +90,6 @@ class PositionwiseFeedForward(nn.Module):
         x = self.dropout(x)
         x = self.fc2(x)
         return x
-
-
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
@@ -84,6 +101,13 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        print(f"TransformerEncoderLayer input shape: {x.shape}")
+        print(f"TransformerEncoderLayer mask shape: {mask.shape if mask is not None else None}")
+
+        # Remove extra dimension if present
+        if x.dim() == 4:
+            x = x.squeeze(0)
+
         attn_output = self.self_attn(x, mask)
         x = x + self.dropout1(attn_output)
         x = self.norm1(x)

@@ -83,24 +83,33 @@ class UncertainTransformer(PreTrainedModel):
             module.weight.data.fill_(1.0)
 
     def forward(self, input_ids, attention_mask=None):
+        print(f"UncertainTransformer input_ids shape: {input_ids.shape}")
+        print(f"UncertainTransformer attention_mask shape: {attention_mask.shape if attention_mask is not None else None}")
+
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        extended_attention_mask = (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -10000.0
+        # Extend attention mask for multi-head attention
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         embedding_output = self.embedding(input_ids)
         hidden_states = self.pos_encoding(embedding_output)
+
+        print(f"UncertainTransformer hidden_states shape after embedding: {hidden_states.shape}")
+        print(f"UncertainTransformer extended_attention_mask shape: {extended_attention_mask.shape}")
 
         if self.config.use_rotary_embeddings:
             seq_len = input_ids.size(1)
             cos, sin = self.rotary_emb(input_ids, seq_len=seq_len)
             hidden_states, _ = apply_rotary_pos_emb(hidden_states, hidden_states, cos, sin)
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
                 hidden_states = checkpoint(layer, hidden_states, extended_attention_mask)
             else:
                 hidden_states = layer(hidden_states, extended_attention_mask)
+            print(f"UncertainTransformer hidden_states shape after layer {i}: {hidden_states.shape}")
 
         output = self.norm(hidden_states)
         return output
