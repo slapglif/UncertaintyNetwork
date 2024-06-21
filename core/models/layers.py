@@ -161,15 +161,12 @@ class TimestepNorm(nn.Module):
         return x * self.weight + self.bias
 
 
-import torch
-import torch.nn as nn
-from typing import Optional
-
-
 class NormalizedAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.cema = CEMA(config.d_model, config.cema_hidden_dim, chunk_size=config.chunk_size)
+        self.cema = CEMA(
+            config.d_model, config.cema_hidden_dim, chunk_size=config.chunk_size
+        )
         self.z_proj = nn.Linear(config.d_model, config.z_dim)
         self.q_proj = nn.Linear(config.z_dim, config.z_dim)
         self.k_proj = nn.Linear(config.z_dim, config.z_dim)
@@ -180,7 +177,9 @@ class NormalizedAttention(nn.Module):
         self.z_dim = config.z_dim
         self.v_dim = config.v_dim
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+            self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         # Handle different input shapes
         if x.dim() == 3:
             batch_size, seq_len, _ = x.shape
@@ -195,7 +194,9 @@ class NormalizedAttention(nn.Module):
         x_cema = self.cema(x_flat)
 
         # Reshape x_cema to match the input shape, regardless of the CEMA output size
-        x_cema = x_cema.view(-1, self.d_model)[:batch_size * seq_len].view(batch_size, seq_len, self.d_model)
+        x_cema = x_cema.view(-1, self.d_model)[: batch_size * seq_len].view(
+            batch_size, seq_len, self.d_model
+        )
 
         # Project and normalize
         z = self.z_proj(x_cema)
@@ -209,7 +210,7 @@ class NormalizedAttention(nn.Module):
         # Compute attention weights
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / (self.z_dim ** 0.5)
         if mask is not None:
-            attn_weights = attn_weights.masked_fill(mask == 0, float('-inf'))
+            attn_weights = attn_weights.masked_fill(mask == 0, float("-inf"))
         attn_weights = torch.softmax(attn_weights, dim=-1)
 
         # Apply attention and project output
@@ -218,45 +219,21 @@ class NormalizedAttention(nn.Module):
 
 
 class TransformerEncoderLayer(nn.Module):
-    """
-    Transformer Encoder Layer with Normalized Attention and Feed Forward networks.
-    """
-
     def __init__(self, config):
-        """
-        Initialize the TransformerEncoderLayer.
-
-        Args:
-            config: Configuration object containing model parameters.
-        """
         super().__init__()
-        self.self_attn = NormalizedAttention(config)
+        self.self_attn = MultiHeadAttention(config)
         self.feed_forward = PositionwiseFeedForward(config)
-        self.norm1 = TimestepNorm(config.num_groups, config.d_model)
+        self.norm1 = nn.LayerNorm(config.d_model)
         self.norm2 = nn.LayerNorm(config.d_model)
-        self.dropout1 = nn.Dropout(config.dropout)
-        self.dropout2 = nn.Dropout(config.dropout)
+        self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Forward pass of the TransformerEncoderLayer.
+    def forward(self, x, mask=None, layer_past=None):
+        # Self-attention
+        attn_output = self.self_attn(self.norm1(x), mask)
+        x = x + self.dropout(attn_output)
 
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
-            mask (Optional[torch.Tensor]): Attention mask tensor.
+        # Feed-forward
+        ff_output = self.feed_forward(self.norm2(x))
+        x = x + self.dropout(ff_output)
 
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_model).
-        """
-        residual = x
-        x = self.norm1(x)
-        x = self.self_attn(x, mask)
-        x = self.dropout1(x)
-        x = x + residual
-
-        residual = x
-        x = self.norm2(x)
-        x = self.feed_forward(x)
-        x = self.dropout2(x)
-        x = x + residual
         return x

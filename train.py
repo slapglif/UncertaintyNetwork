@@ -1,5 +1,3 @@
-# train.py
-
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import (
@@ -17,8 +15,6 @@ from core.models.uncertain_nn import (
     UncertainTransformerLMHeadModel,
     UncertainTransformerConfig,
 )
-
-torch.set_float32_matmul_precision("medium")
 
 
 class UncertainTransformerLightningModule(pl.LightningModule):
@@ -56,15 +52,6 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         attention_mask = (input_ids != self.hparams["pad_token_id"]).long()
         outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
         loss = outputs.loss
-
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"Invalid loss detected at batch {batch_idx}")
-            print(f"Input IDs shape: {input_ids.shape}")
-            print(f"Labels shape: {labels.shape}")
-            print(f"Attention mask shape: {attention_mask.shape}")
-            print(f"Logits shape: {outputs.logits.shape}")
-            print(f"Logits min: {outputs.logits.min()}, max: {outputs.logits.max()}")
-            return None
 
         self.log(
             "train_loss",
@@ -152,7 +139,7 @@ def main():
         "d_ff": 2048,
         "n_layers": 6,
         "dropout": 0.1,
-        "batch_size": 16,  # Reduced from 32
+        "batch_size": 16,
         "learning_rate": 3e-5,
         "weight_decay": 0.01,
         "warmup_ratio": 0.1,
@@ -173,7 +160,6 @@ def main():
     }
 
     model = UncertainTransformerLightningModule(hparams)
-    model.enable_gradient_checkpointing()
 
     datamodule = SlimPajamaDataModule(
         batch_size=hparams["batch_size"],
@@ -195,12 +181,6 @@ def main():
 
     logger = TensorBoardLogger("logs", name="uncertain-transformer")
 
-    # Configure 4D parallelism
-    strategy = "ddp"  # Distributed Data Parallel
-    devices = 8  # Number of GPUs
-    num_nodes = 4  # Number of nodes
-    accelerator = "gpu"
-
     trainer = pl.Trainer(
         max_epochs=hparams["max_epochs"],
         callbacks=[checkpoint_callback, early_stop_callback, lr_monitor],
@@ -211,10 +191,6 @@ def main():
         val_check_interval=hparams["val_check_interval"],
         deterministic=True,
         log_every_n_steps=10,
-        # strategy=strategy,
-        # devices=devices,
-        # num_nodes=num_nodes,
-        # accelerator=accelerator,
     )
 
     trainer.fit(model, datamodule=datamodule)
