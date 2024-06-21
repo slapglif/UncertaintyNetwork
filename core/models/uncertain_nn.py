@@ -1,11 +1,14 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel, PretrainedConfig
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 from torch.utils.checkpoint import checkpoint
+from transformers import PreTrainedModel
+from transformers import PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-from core.models.layers import TransformerEncoderLayer
 from core.models.embedding import PositionalEncoding, RotaryEmbedding, apply_rotary_pos_emb, StableEmbedding
+from core.models.layers import TransformerEncoderLayer
 
 
 class UncertainTransformerConfig(PretrainedConfig):
@@ -57,16 +60,29 @@ class UncertainTransformerConfig(PretrainedConfig):
 
 
 class UncertainTransformer(PreTrainedModel):
+    """
+    The UncertainTransformer model.
+
+    This model uses either a StableEmbedding or a standard Embedding layer,
+    followed by positional encoding and a series of transformer encoder layers.
+    """
+
     config_class = UncertainTransformerConfig
 
     def __init__(self, config: UncertainTransformerConfig):
+        """
+        Initialize the UncertainTransformer model.
+
+        Args:
+            config (UncertainTransformerConfig): The configuration object containing model parameters.
+        """
         super().__init__(config)
         self.config = config
 
         if config.use_stable_embedding:
-            self.embedding = StableEmbedding(config.vocab_size, config.d_model)
+            self.embedding = StableEmbedding(config.vocab_size, config.d_model, padding_idx=config.pad_token_id)
         else:
-            self.embedding = nn.Embedding(config.vocab_size, config.d_model)
+            self.embedding = nn.Embedding(config.vocab_size, config.d_model, padding_idx=config.pad_token_id)
 
         self.pos_encoding = PositionalEncoding(config.d_model, config.dropout, config.max_position_embeddings)
 
@@ -83,7 +99,13 @@ class UncertainTransformer(PreTrainedModel):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
+        """
+        Initialize the weights of the model.
+
+        Args:
+            module (nn.Module): The module whose weights need to be initialized.
+        """
+        if isinstance(module, (nn.Linear, nn.Embedding, StableEmbedding)):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 module.bias.data.zero_()
@@ -91,7 +113,17 @@ class UncertainTransformer(PreTrainedModel):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Forward pass of the UncertainTransformer model.
+
+        Args:
+            input_ids (torch.Tensor): The input tensor containing token ids.
+            attention_mask (Optional[torch.Tensor]): The attention mask tensor.
+
+        Returns:
+            torch.Tensor: The output tensor after passing through the transformer layers.
+        """
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
@@ -108,7 +140,7 @@ class UncertainTransformer(PreTrainedModel):
 
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                hidden_states = checkpoint(layer, hidden_states, extended_attention_mask)
+                hidden_states = torch.utils.checkpoint.checkpoint(layer, hidden_states, extended_attention_mask)
             else:
                 hidden_states = layer(hidden_states, extended_attention_mask)
 
