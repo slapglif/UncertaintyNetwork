@@ -5,15 +5,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import torch
-import torch.nn as nn
-import math
 
 class CEMA(nn.Module):
-    def __init__(self, d: int, h: int):
+    def __init__(self, d: int, h: int, chunk_size: int = 64):
         super().__init__()
         self.d = d
         self.h = h
+        self.chunk_size = chunk_size
         self.alpha = nn.Parameter(torch.rand(d, h))
         self.delta = nn.Parameter(torch.rand(d, h))
         self.omega = nn.Parameter(torch.rand(h))
@@ -24,9 +22,6 @@ class CEMA(nn.Module):
         batch_size, d = x.shape
         assert d == self.d, f"Input dimension {d} must match CEMA's dimension {self.d}"
 
-        # Compute u
-        u = torch.einsum('bd,dh->bdh', x, self.beta)
-
         # Compute theta
         theta = torch.outer(torch.arange(self.h, device=x.device), self.omega) * (2 * math.pi / self.h)
         cos_theta = torch.cos(theta)
@@ -36,14 +31,24 @@ class CEMA(nn.Module):
         alpha_complex = self.alpha[:, None, :] * (cos_theta[None, :, :] + 1j * sin_theta[None, :, :])
         delta_complex = self.delta[:, None, :] * (cos_theta[None, :, :] + 1j * sin_theta[None, :, :])
 
-        # Apply CEMA more efficiently
-        h = alpha_complex * u[:, :, None, :]
-        h += (1 - alpha_complex * delta_complex) * torch.zeros(1, d, 1, self.h, dtype=torch.complex64, device=x.device)
+        # Process in chunks
+        output = []
+        for i in range(0, batch_size, self.chunk_size):
+            chunk = x[i:i + self.chunk_size]
 
-        # Compute final output
-        y = torch.einsum('bdhk,dh->bd', h.real, self.eta)
+            # Compute u for the chunk
+            u = torch.einsum('bd,dh->bdh', chunk, self.beta)
 
-        return y
+            # Apply CEMA for the chunk
+            h = alpha_complex * u[:, :, None, :]
+            h += (1 - alpha_complex * delta_complex) * torch.zeros(1, d, 1, self.h, dtype=torch.complex64,
+                                                                   device=x.device)
+
+            # Compute output for the chunk
+            y = torch.einsum('bdhk,dh->bd', h.real, self.eta)
+            output.append(y)
+
+        return torch.cat(output, dim=0)
 
 
 class PositionalEncoding(nn.Module):

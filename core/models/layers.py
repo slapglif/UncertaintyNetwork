@@ -162,22 +162,9 @@ class TimestepNorm(nn.Module):
 
 
 class NormalizedAttention(nn.Module):
-    """
-    Normalized Attention module with CEMA transformation.
-
-    This module applies a Continuous Exponential Moving Average (CEMA) transformation
-    to the input, followed by normalized attention mechanisms.
-    """
-
     def __init__(self, config):
-        """
-        Initialize the NormalizedAttention module.
-
-        Args:
-            config: Configuration object containing model parameters.
-        """
         super().__init__()
-        self.cema = CEMA(config.d_model, config.cema_hidden_dim)
+        self.cema = CEMA(config.d_model, config.cema_hidden_dim, chunk_size=config.chunk_size)
         self.z_proj = nn.Linear(config.d_model, config.z_dim)
         self.q_proj = nn.Linear(config.z_dim, config.z_dim)
         self.k_proj = nn.Linear(config.z_dim, config.z_dim)
@@ -189,16 +176,6 @@ class NormalizedAttention(nn.Module):
         self.v_dim = config.v_dim
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Forward pass of the NormalizedAttention module.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model) or (batch_size, 1, seq_len, d_model).
-            mask (Optional[torch.Tensor]): Attention mask tensor.
-
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_model).
-        """
         # Handle different input shapes
         if x.dim() == 3:
             batch_size, seq_len, _ = x.shape
@@ -211,7 +188,9 @@ class NormalizedAttention(nn.Module):
         # Reshape for CEMA
         x_flat = x.view(-1, self.d_model)
         x_cema = self.cema(x_flat)
-        x_cema = x_cema.view(batch_size, seq_len, self.d_model)
+
+        # Reshape x_cema to match the input shape
+        x_cema = x_cema.view(-1, self.d_model)[:batch_size * seq_len].view(batch_size, seq_len, self.d_model)
 
         # Project and normalize
         z = self.z_proj(x_cema)
@@ -223,14 +202,15 @@ class NormalizedAttention(nn.Module):
         v = self.v_proj(x)
 
         # Compute attention weights
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.z_dim)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / (self.z_dim ** 0.5)
         if mask is not None:
             attn_weights = attn_weights.masked_fill(mask == 0, float('-inf'))
-        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = torch.softmax(attn_weights, dim=-1)
 
         # Apply attention and project output
         output = torch.matmul(attn_weights, v)
         return self.o_proj(output)
+
 
 class TransformerEncoderLayer(nn.Module):
     """
