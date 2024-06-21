@@ -12,10 +12,9 @@ torch.set_float32_matmul_precision('medium')
 
 
 class UncertainTransformerLightningModule(pl.LightningModule):
-    def __init__(self, hparams: dict, datamodule: SlimPajamaDataModule):
+    def __init__(self, hparams: dict):
         super().__init__()
         self.save_hyperparameters(hparams)
-        self.data_module = datamodule
 
         config = UncertainTransformerConfig(
             vocab_size=hparams["vocab_size"],
@@ -30,8 +29,8 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         self.model = UncertainTransformerLMHeadModel(config)
         self.model.enable_gradient_checkpointing()
 
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)  # Changed to -100
-        self.perplexity = Perplexity(ignore_index=-100)  # Changed to -100
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        self.perplexity = Perplexity(ignore_index=-100)
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         return self.model(input_ids, attention_mask=attention_mask, labels=labels)
@@ -97,16 +96,16 @@ def main():
         "subset_size": 0.1,
         "accumulate_grad_batches": 2,
         "gradient_clip_val": 1.0,
-        "val_check_interval": 1000,  # Changed to an integer: check validation every 1000 training batches
+        "val_check_interval": 1000,
     }
+
+    model = UncertainTransformerLightningModule(hparams)
 
     datamodule = SlimPajamaDataModule(
         batch_size=hparams["batch_size"],
         subset_size=hparams["subset_size"],
         max_length=hparams["max_length"],
     )
-
-    model = UncertainTransformerLightningModule(hparams, datamodule)
 
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints",
