@@ -1,50 +1,26 @@
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class MatryoshkaEmbedding(nn.Module):
-    def __init__(
-            self, vocab_size: int, d_model: int, max_len: int = 5000, n_layers: int = 3
-    ):
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
-        self.d_model = d_model
-        self.max_len = max_len
-        self.n_layers = n_layers
+        self.dropout = nn.Dropout(p=dropout)
 
-        self.embedding_layers = nn.ModuleList(
-            [nn.Embedding(vocab_size, d_model) for _ in range(n_layers)]
-        )
-        self.position_embeddings = nn.ModuleList(
-            [self.create_position_embedding(d_model, max_len) for _ in range(n_layers)]
-        )
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
 
-    def create_position_embedding(self, d_model: int, max_len: int):
-        position_embedding = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
-        )
-        position_embedding[:, 0::2] = torch.sin(position * div_term)
-        position_embedding[:, 1::2] = torch.cos(position * div_term)
-        position_embedding = position_embedding.unsqueeze(0)
-        return nn.Parameter(position_embedding, requires_grad=False)
-
-    def forward(self, src: torch.Tensor):
-        batch_size, seq_len = src.shape
-        embeddings = []
-
-        for i in range(self.n_layers):
-            token_embedding = self.embedding_layers[i](src)
-            position_embedding = self.position_embeddings[i][:, :seq_len, :]
-            embedding = token_embedding + position_embedding
-            embeddings.append(embedding)
-
-        stacked_embeddings = torch.stack(embeddings, dim=2)
-        matryoshka_embedding = torch.sum(stacked_embeddings, dim=2)
-
-        return matryoshka_embedding
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
 
 
 class RotaryEmbedding(nn.Module):
@@ -75,8 +51,8 @@ class RotaryEmbedding(nn.Module):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, offset=0):
-    cos = cos[:, :, offset: q.shape[1] + offset, :]
-    sin = sin[:, :, offset: q.shape[1] + offset, :]
+    cos = cos[:, :, offset: q.shape[-2] + offset, :]
+    sin = sin[:, :, offset: q.shape[-2] + offset, :]
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -87,24 +63,49 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
+class StableEmbedding(nn.Module):
+    """
+    A stable embedding layer that scales the output by the square root of the embedding dimension.
 
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
-        )
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
+    This embedding layer is designed to provide more stable gradients during training.
+    """
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: Optional[int] = None):
         """
+        Initialize the StableEmbedding layer.
+
         Args:
-            x: Tensor, shape [seq_len, batch_size, embedding_dim]
+            num_embeddings (int): Size of the dictionary of embeddings.
+            embedding_dim (int): The size of each embedding vector.
+            padding_idx (Optional[int]): If specified, the entries at padding_idx do not contribute to the gradient.
         """
-        x = x + self.pe[: x.size(0)]
-        return self.dropout(x)
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.padding_idx = padding_idx
+
+        self.weight = nn.Parameter(torch.Tensor(num_embeddings, embedding_dim))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """
+        Reset the parameters (weight) of the embedding layer.
+        """
+        nn.init.normal_(self.weight)
+        if self.padding_idx is not None:
+            with torch.no_grad():
+                self.weight[self.padding_idx].fill_(0)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the StableEmbedding layer.
+
+        Args:
+            input (torch.Tensor): Input tensor containing indices to extract embeddings for.
+
+        Returns:
+            torch.Tensor: The resulting embedding tensor scaled by sqrt(embedding_dim).
+        """
+        return F.embedding(
+            input, self.weight, self.padding_idx, None, 2, False, False
+        ) * (self.embedding_dim ** 0.5)

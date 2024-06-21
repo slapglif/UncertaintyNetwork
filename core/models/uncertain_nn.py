@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+from torch.utils.checkpoint import checkpoint
 
-from core.models.embedding import PositionalEncoding, RotaryEmbedding, apply_rotary_pos_emb
 from core.models.layers import TransformerEncoderLayer
+from core.models.embedding import PositionalEncoding, RotaryEmbedding, apply_rotary_pos_emb, StableEmbedding
 
 
 class UncertainTransformerConfig(PretrainedConfig):
@@ -14,12 +14,12 @@ class UncertainTransformerConfig(PretrainedConfig):
     def __init__(
             self,
             vocab_size=50257,
-            d_model=512,
-            n_heads=8,
-            d_ff=2048,
-            n_layers=6,
+            d_model=768,
+            n_heads=12,
+            d_ff=3072,
+            n_layers=12,
             dropout=0.1,
-            max_position_embeddings=512,
+            max_position_embeddings=1024,
             layer_norm_epsilon=1e-5,
             initializer_range=0.02,
             use_cache=True,
@@ -28,6 +28,9 @@ class UncertainTransformerConfig(PretrainedConfig):
             eos_token_id=50256,
             tie_word_embeddings=True,
             use_rotary_embeddings=True,
+            use_rezero=True,
+            use_gelu_approximation=True,
+            use_stable_embedding=True,
             **kwargs
     ):
         super().__init__(
@@ -48,6 +51,9 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.tie_word_embeddings = tie_word_embeddings
         self.use_rotary_embeddings = use_rotary_embeddings
+        self.use_rezero = use_rezero
+        self.use_gelu_approximation = use_gelu_approximation
+        self.use_stable_embedding = use_stable_embedding
 
 
 class UncertainTransformer(PreTrainedModel):
@@ -57,15 +63,18 @@ class UncertainTransformer(PreTrainedModel):
         super().__init__(config)
         self.config = config
 
-        self.embedding = nn.Embedding(config.vocab_size, config.d_model)
+        if config.use_stable_embedding:
+            self.embedding = StableEmbedding(config.vocab_size, config.d_model)
+        else:
+            self.embedding = nn.Embedding(config.vocab_size, config.d_model)
+
         self.pos_encoding = PositionalEncoding(config.d_model, config.dropout, config.max_position_embeddings)
 
         if config.use_rotary_embeddings:
             self.rotary_emb = RotaryEmbedding(config.d_model, config.max_position_embeddings)
 
         self.layers = nn.ModuleList([
-            TransformerEncoderLayer(config.d_model, config.n_heads, config.d_ff, config.dropout)
-            for _ in range(config.n_layers)
+            TransformerEncoderLayer(config) for _ in range(config.n_layers)
         ])
 
         self.norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
@@ -83,33 +92,25 @@ class UncertainTransformer(PreTrainedModel):
             module.weight.data.fill_(1.0)
 
     def forward(self, input_ids, attention_mask=None):
-        print(f"UncertainTransformer input_ids shape: {input_ids.shape}")
-        print(f"UncertainTransformer attention_mask shape: {attention_mask.shape if attention_mask is not None else None}")
-
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        # Extend attention mask for multi-head attention
         extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
         embedding_output = self.embedding(input_ids)
         hidden_states = self.pos_encoding(embedding_output)
 
-        print(f"UncertainTransformer hidden_states shape after embedding: {hidden_states.shape}")
-        print(f"UncertainTransformer extended_attention_mask shape: {extended_attention_mask.shape}")
-
         if self.config.use_rotary_embeddings:
             seq_len = input_ids.size(1)
             cos, sin = self.rotary_emb(input_ids, seq_len=seq_len)
             hidden_states, _ = apply_rotary_pos_emb(hidden_states, hidden_states, cos, sin)
 
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 hidden_states = checkpoint(layer, hidden_states, extended_attention_mask)
             else:
                 hidden_states = layer(hidden_states, extended_attention_mask)
-            print(f"UncertainTransformer hidden_states shape after layer {i}: {hidden_states.shape}")
 
         output = self.norm(hidden_states)
         return output
@@ -147,7 +148,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         if labels is not None:
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         return CausalLMOutputWithCrossAttentions(
