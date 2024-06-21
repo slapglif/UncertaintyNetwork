@@ -12,15 +12,18 @@ class ScaledDotProductAttention(nn.Module):
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
         self.scale = self.d_k ** -0.5
+
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        attn = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         if mask is not None:
-            attn = attn.masked_fill(mask == 0, float('-inf'))
+            attn = attn.masked_fill(mask == 0, float("-inf"))
+
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
-        output = torch.einsum('bhij,bhjd->bhid', attn, v)
+
+        output = torch.matmul(attn, v)
         return output
 
 
@@ -31,27 +34,28 @@ class MultiHeadAttention(nn.Module):
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
 
-        self.W_qkv = nn.Linear(d_model, 3 * d_model)
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
 
         self.attention = ScaledDotProductAttention(d_model, n_heads, dropout)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        bs = x.size(0)
-        qkv = self.W_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: t.view(bs, -1, self.n_heads, self.d_k).transpose(1, 2), qkv)
+        batch_size, seq_len, _ = x.shape
 
-        if mask is not None:
-            mask = mask.unsqueeze(1)
+        q = self.W_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        k = self.W_k(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        v = self.W_v(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
 
         attn_output = self.attention(q, k, v, mask)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
 
-        out = self.W_o(attn_output)
-        out = self.dropout(out)
+        output = self.W_o(attn_output)
+        output = self.dropout(output)
 
-        return out
+        return output
 
 
 class PositionwiseFeedForward(nn.Module):
@@ -60,11 +64,10 @@ class PositionwiseFeedForward(nn.Module):
         self.fc1 = nn.Linear(d_model, d_ff)
         self.fc2 = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
-        self.activation = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.fc1(x)
-        x = self.activation(x)
+        x = F.gelu(x)
         x = self.dropout(x)
         x = self.fc2(x)
         return x
@@ -81,14 +84,12 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        residual = x
+        attn_output = self.self_attn(x, mask)
+        x = x + self.dropout1(attn_output)
         x = self.norm1(x)
-        x = self.self_attn(x, x, x, mask)
-        x = residual + self.dropout1(x)
 
-        residual = x
+        ff_output = self.feed_forward(x)
+        x = x + self.dropout2(ff_output)
         x = self.norm2(x)
-        x = self.feed_forward(x)
-        x = residual + self.dropout2(x)
 
         return x
