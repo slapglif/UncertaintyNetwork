@@ -1,19 +1,15 @@
-# core/models/uncertain_nn.py
-
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.checkpoint import checkpoint
-from transformers import PreTrainedModel
-from transformers import PretrainedConfig
-from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+from torchmetrics.text import Perplexity
+from transformers import PreTrainedModel, PretrainedConfig
+from transformers import get_cosine_schedule_with_warmup
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, CausalLMOutputWithCrossAttentions
 
-from core.models.embedding import (
-    PositionalEncoding,
-    RotaryEmbedding,
-)
+from core.models.embedding import PositionalEncoding, StableEmbedding
 from core.models.layers import TransformerEncoderLayer
 
 
@@ -22,34 +18,35 @@ class UncertainTransformerConfig(PretrainedConfig):
 
     def __init__(
             self,
-            vocab_size=50257,
-            d_model=512,
-            n_heads=8,
-            d_ff=2048,
-            n_layers=6,
-            dropout=0.1,
-            max_position_embeddings=1024,
-            layer_norm_epsilon=1e-5,
-            initializer_range=0.02,
-            use_cache=True,
-            pad_token_id=50256,
-            bos_token_id=50256,
-            eos_token_id=50256,
-            tie_word_embeddings=True,
-            use_rotary_embeddings=True,
-            use_stable_embedding=True,
-            num_groups=16,
-            cema_hidden_dim=32,
-            z_dim=512,
-            v_dim=512,
-            chunk_size=64,
-            use_gelu_approximation=True,
+            vocab_size: int = 50257,
+            d_model: int = 384,
+            n_heads: int = 6,
+            d_ff: int = 1536,
+            n_layers: int = 4,
+            dropout: float = 0.1,
+            max_position_embeddings: int = 512,
+            layer_norm_epsilon: float = 1e-5,
+            initializer_range: float = 0.02,
+            use_cache: bool = True,
+            pad_token_id: int = 50256,
+            bos_token_id: int = 50256,
+            eos_token_id: int = 50256,
+            tie_word_embeddings: bool = True,
+            use_stable_embedding: bool = True,
+            cema_hidden_dim: int = 64,
+            chunk_size: int = 64,
+            use_gelu_approximation: bool = True,
+            max_grad_norm: float = 1.0,
+            ntk_factor: float = 1.0,
+            uncertainty_factor: float = 0.1,
+            use_flash_attention: bool = True,
             **kwargs
     ):
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
             **kwargs
         )
         self.vocab_size = vocab_size
@@ -62,95 +59,81 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.layer_norm_epsilon = layer_norm_epsilon
         self.initializer_range = initializer_range
         self.use_cache = use_cache
-        self.tie_word_embeddings = tie_word_embeddings
-        self.use_rotary_embeddings = use_rotary_embeddings
         self.use_stable_embedding = use_stable_embedding
-        self.num_groups = num_groups
         self.cema_hidden_dim = cema_hidden_dim
-        self.z_dim = z_dim
-        self.v_dim = v_dim
         self.chunk_size = chunk_size
         self.use_gelu_approximation = use_gelu_approximation
+        self.max_grad_norm = max_grad_norm
+        self.ntk_factor = ntk_factor
+        self.uncertainty_factor = uncertainty_factor
+        self.use_flash_attention = use_flash_attention
 
 
-class UncertainTransformer(PreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
+class UncertainTransformer(nn.Module):
+    def __init__(self, config: UncertainTransformerConfig):
+        super().__init__()
         self.config = config
-        self.embedding = nn.Embedding(config.vocab_size, config.d_model, padding_idx=config.pad_token_id)
+        self.embedding = StableEmbedding(config.vocab_size, config.d_model,
+                                         padding_idx=config.pad_token_id) if config.use_stable_embedding else nn.Embedding(
+            config.vocab_size, config.d_model, padding_idx=config.pad_token_id)
         self.pos_encoding = PositionalEncoding(config.d_model, config.dropout, config.max_position_embeddings)
-
-        if config.use_rotary_embeddings:
-            self.rotary_emb = RotaryEmbedding(config.d_model, config.max_position_embeddings)
-
         self.layers = nn.ModuleList([TransformerEncoderLayer(config) for _ in range(config.n_layers)])
-        self.norm = nn.LayerNorm(config.d_model)
+        self.norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.dropout = nn.Dropout(config.dropout)
         self.gradient_checkpointing = False
 
-    def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            attention_mask: Optional[torch.FloatTensor] = None,
-            past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-    ) -> BaseModelOutputWithPastAndCrossAttentions:
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
+    def forward(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, use_cache=False,
+                output_attentions=False, output_hidden_states=False, return_dict=True):
+        inputs_embeds = self.embedding(input_ids)
+        hidden_states = self.pos_encoding(inputs_embeds)
 
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-
-        embedding_output = self.embedding(input_ids)
-        hidden_states = self.pos_encoding(embedding_output)
-
-        all_hidden_states = () if self.config.output_hidden_states else None
-        all_attentions = () if self.config.output_attentions else None
-        past_key_values = past_key_values or (None,) * len(self.layers)
-
-        for i, (layer, layer_past) in enumerate(zip(self.layers, past_key_values)):
-            if self.gradient_checkpointing and self.training:
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(*inputs)
-
-                    return custom_forward
-
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(layer),
-                    hidden_states,
-                    extended_attention_mask,
-                )
-            else:
-                hidden_states = layer(hidden_states, extended_attention_mask, layer_past)
-
-            if self.config.output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            if self.config.output_attentions:
-                all_attentions += (layer.self_attn.attn_probs,)
-
-        hidden_states = self.norm(hidden_states)
+        if self.gradient_checkpointing and self.training:
+            hidden_states = checkpoint(self._forward_transformer, hidden_states, attention_mask, position_ids,
+                                       past_key_values, use_cache, output_attentions, output_hidden_states)
+        else:
+            hidden_states = self._forward_transformer(hidden_states, attention_mask, position_ids, past_key_values,
+                                                      use_cache, output_attentions, output_hidden_states)
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
-            hidden_states=all_hidden_states,
-            attentions=all_attentions,
+            past_key_values=None,
+            hidden_states=None,
+            attentions=None,
         )
+
+    def _forward_transformer(self, hidden_states, attention_mask, position_ids, past_key_values, use_cache,
+                             output_attentions, output_hidden_states):
+        for i, layer in enumerate(self.layers):
+            layer_outputs = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_value=past_key_values[i] if past_key_values is not None else None,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+            hidden_states = layer_outputs[0]
+
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
 
 
 class UncertainTransformerLMHeadModel(PreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
+    base_model_prefix = "transformer"
+
+    def __init__(self, config: UncertainTransformerConfig):
+        PreTrainedModel.__init__(self, config)
+
         self.config = config
         self.transformer = UncertainTransformer(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.tie_weights()
-
-    def tie_weights(self):
-        """
-        Tie the weights between the input embeddings and the output embeddings.
-        """
-        self.lm_head.weight = self.transformer.embedding.weight
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
+        self.perplexity = Perplexity(ignore_index=-100)
+        self.tokenizer = None
+        self.gradient_checkpointing = False
+        self.post_init()
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -158,77 +141,157 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def get_input_embeddings(self):
+        return self.transformer.embedding
+
+    def set_input_embeddings(self, value):
+        self.transformer.embedding = value
+
     def forward(
             self,
             input_ids: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.FloatTensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
             labels: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple[torch.Tensor], CausalLMOutputWithCrossAttentions]:
-        """
-        Forward pass of the UncertainTransformerLMHeadModel.
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+    ) -> CausalLMOutputWithCrossAttentions:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        Args:
-            input_ids (Optional[torch.LongTensor]): Indices of input sequence tokens in the vocabulary.
-            attention_mask (Optional[torch.FloatTensor]): Mask to avoid performing attention on padding token indices.
-            labels (Optional[torch.LongTensor]): Labels for computing the masked language modeling loss.
+        if self.gradient_checkpointing and self.training:
+            transformer_outputs = checkpoint(self.transformer, input_ids, attention_mask, position_ids, past_key_values,
+                                             use_cache, output_attentions, output_hidden_states, return_dict)
+        else:
+            transformer_outputs = self.transformer(
+                input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
 
-        Returns:
-            Union[Tuple[torch.Tensor], CausalLMOutputWithCrossAttentions]: A tuple or CausalLMOutputWithCrossAttentions
-                containing the loss, logits, hidden states, and attentions.
-        """
-        transformer_outputs = self.transformer(input_ids, attention_mask=attention_mask)
         hidden_states = transformer_outputs.last_hidden_state
-
         lm_logits = self.lm_head(hidden_states)
 
         loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
+            shift_logits = lm_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = self.criterion(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+        if not return_dict:
+            output = (lm_logits,) + transformer_outputs[1:]
+            return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
-            hidden_states=hidden_states,
-            attentions=transformer_outputs.attentions,
+            past_key_values=None,
+            hidden_states=None,
+            attentions=None,
         )
 
-    def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
-        """
-        Prepare inputs for generation.
+    def training_step(self, batch, batch_idx):
+        input_ids, labels = batch
+        attention_mask = (input_ids != self.config.pad_token_id).long()
+        outputs = self(input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
 
-        Args:
-            input_ids (torch.LongTensor): Input ids for the current step.
-            past (Optional[Tuple]): Past key/value states for attention.
-            **kwargs: Additional keyword arguments.
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
-        Returns:
-            dict: A dictionary containing the prepared inputs.
-        """
-        token_type_ids = kwargs.get("token_type_ids", None)
-        attention_mask = kwargs.get("attention_mask", None)
+        return loss
 
-        if past:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-            if token_type_ids is not None:
-                token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
+    def validation_step(self, batch, batch_idx):
+        input_ids, labels = batch
+        attention_mask = (input_ids != self.config.pad_token_id).long()
+        outputs = self(input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+
+        perplexity = self.perplexity(outputs.logits.view(-1, outputs.logits.size(-1)), labels.view(-1))
+        self.log("val_perplexity", perplexity, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+
+        if batch_idx == 0:
+            input_ids = batch[0][:1]
+            generated = self.generate(input_ids, max_length=50)
+            generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+            if isinstance(self.logger, TensorBoardLogger) and hasattr(self.logger.experiment, 'add_text'):
+                self.logger.experiment.add_text("generated_text", generated_text, self.current_epoch)
+
+        return loss
+
+    def configure_optimizers(self):
+        param_optimizer = list(self.named_parameters())
+        no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [
+                    p
+                    for n, p in param_optimizer
+                    if all(nd not in n for nd in no_decay)
+                ],
+                "weight_decay": self.config.weight_decay,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in param_optimizer
+                    if any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = torch.optim.AdamW(
+            optimizer_grouped_parameters,
+            lr=self.config.learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
+
+        num_training_steps = self.trainer.estimated_stepping_batches
+        num_warmup_steps = int(num_training_steps * self.config.warmup_ratio)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
+
+    def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, **kwargs):
+        input_shape = input_ids.shape
+        if attention_mask is None:
+            attention_mask = input_ids.new_ones(input_shape)
+
+        if past is not None:
+            input_ids = input_ids[:, -1:]
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "token_type_ids": token_type_ids,
             "past_key_values": past,
         }
 
-    def _init_weights(self, module):
-        """Initialize the weights."""
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
+    def _reorder_cache(self, past, beam_idx):
+        reordered_past = ()
+        for layer_past in past:
+            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
+        return reordered_past
 
     def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
         self.transformer.enable_gradient_checkpointing()
-
-    def disable_gradient_checkpointing(self):
-        self.transformer.disable_gradient_checkpointing()

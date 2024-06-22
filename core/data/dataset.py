@@ -1,56 +1,52 @@
 import math
+from typing import Optional, Iterator, Tuple
+
 import torch
 from datasets import load_dataset
 from torch.utils.data import IterableDataset
+from tqdm import tqdm
 from transformers import GPT2Tokenizer
 
 
 class SlimPajamaDataset(IterableDataset):
     def __init__(
-        self,
-        split: str,
-        subset_size: float = 0.1,
-        max_length: int = 1024,
-        tokenizer: GPT2Tokenizer = None,
+            self,
+            split: str,
+            tokenizer: Optional[GPT2Tokenizer] = None,
+            max_length: int = 1024,
+            num_examples: int = 10000,
     ):
+        super().__init__()
         self.split = split
-        self.subset_size = subset_size
-        self.max_length = max_length
-
-        self.tokenizer = (
-            tokenizer if tokenizer else GPT2Tokenizer.from_pretrained("gpt2")
-        )
+        self.tokenizer = tokenizer or GPT2Tokenizer.from_pretrained("gpt2")
         self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.max_length = max_length
+        self.num_examples = num_examples
 
-        self.dataset = load_dataset(
-            "cerebras/SlimPajama-627B", split=split, streaming=True
-        )
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        dataset = load_dataset("cerebras/SlimPajama-627B", split=self.split, streaming=True, cache_dir="F:\\.cache")
 
-        self.total_examples = 1000000  # Adjust this value based on the estimated total examples in the dataset
-        self.subset_examples = math.ceil(self.total_examples * self.subset_size)
+        with tqdm(total=self.num_examples, desc=f"Loading {self.split} data") as pbar:
+            for idx, example in enumerate(dataset):
+                if idx >= self.num_examples:
+                    break
 
-    def __len__(self):
-        return self.subset_examples
+                input_ids = self.tokenizer.encode(example["text"], add_special_tokens=False)
+                input_ids = input_ids[:self.max_length]
+                attention_mask = [1] * len(input_ids)
 
-    def __iter__(self):
-        for idx, example in enumerate(self.dataset):
-            if idx >= self.subset_examples:
-                break
+                # Pad input_ids and attention_mask to max_length
+                input_ids = input_ids + [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+                attention_mask = attention_mask + [0] * (self.max_length - len(attention_mask))
 
-            encoding = self.tokenizer(
-                example["text"],
-                max_length=self.max_length,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
-            input_ids = encoding["input_ids"].squeeze()
-            labels = input_ids.clone()
-            labels[labels == self.tokenizer.pad_token_id] = -100
-            yield input_ids, labels
+                labels = input_ids.copy()
+                labels_attention_mask = attention_mask.copy()
 
-    @staticmethod
-    def collate_fn(batch):
-        input_ids = torch.stack([item[0] for item in batch])
-        labels = torch.stack([item[1] for item in batch])
-        return input_ids, labels
+                input_ids = torch.tensor(input_ids, dtype=torch.long)
+                attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+                labels = torch.tensor(labels, dtype=torch.long)
+                labels_attention_mask = torch.tensor(labels_attention_mask, dtype=torch.long)
+
+                yield input_ids, attention_mask, labels, labels_attention_mask
+
+                pbar.update(1)
