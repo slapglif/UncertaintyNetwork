@@ -166,7 +166,7 @@ def main():
         "subset_size": 0.1,
         "accumulate_grad_batches": 4,
         "gradient_clip_val": 1.0,
-        "val_check_interval": 0.25,
+        "val_check_interval": 1.0,  # Set to 1.0 or an int when using IterableDataset for train_dataloader
         "use_stable_embedding": True,
         "num_groups": 16,
         "cema_hidden_dim": 32,
@@ -211,7 +211,7 @@ def main():
         accumulate_grad_batches=hparams["accumulate_grad_batches"],
         precision="16-mixed",
         gradient_clip_val=hparams["gradient_clip_val"],
-        val_check_interval=hparams["val_check_interval"],
+        val_check_interval=hparams["val_check_interval"],  # Use the value from hparams
         deterministic=True,
         log_every_n_steps=10,
     )

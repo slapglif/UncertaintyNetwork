@@ -1,23 +1,23 @@
-import torch
+from typing import Optional
+
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
 from transformers import GPT2Tokenizer
-from typing import Optional
 
 from core.data.dataset import SlimPajamaDataset
 
 
 class SlimPajamaDataModule(LightningDataModule):
     def __init__(
-        self,
-        tokenizer: GPT2Tokenizer,
-        max_length: int = 1024,
-        train_num_examples: int = 100000,
-        val_num_examples: int = 10000,
-        test_num_examples: int = 10000,
-        batch_size: int = 8,
-        num_workers: int = 4,
-        pin_memory: bool = True,
+            self,
+            tokenizer: GPT2Tokenizer,
+            max_length: int = 1024,
+            train_num_examples: int = 100000,
+            val_num_examples: int = 10000,
+            test_num_examples: int = 10000,
+            batch_size: int = 8,
+            num_workers: int = 4,
+            pin_memory: bool = True,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -58,7 +58,7 @@ class SlimPajamaDataModule(LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=self.collate_fn,
+            shuffle=True,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -67,7 +67,7 @@ class SlimPajamaDataModule(LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=self.collate_fn,
+            shuffle=False,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -76,14 +76,5 @@ class SlimPajamaDataModule(LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=self.collate_fn,
+            shuffle=False,
         )
-
-    @staticmethod
-    def collate_fn(batch):
-        input_ids, attention_mask, labels, labels_attention_mask = zip(*batch)
-        input_ids = torch.stack(input_ids)
-        attention_mask = torch.stack(attention_mask)
-        labels = torch.stack(labels)
-        labels_attention_mask = torch.stack(labels_attention_mask)
-        return input_ids, attention_mask, labels, labels_attention_mask

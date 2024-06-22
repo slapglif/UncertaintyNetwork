@@ -1,20 +1,16 @@
-import math
-from typing import Optional, Iterator, Tuple
-
 import torch
-from datasets import load_dataset
-from torch.utils.data import IterableDataset
-from tqdm import tqdm
+from pytorch_lightning import LightningDataModule
+from torch.utils.data import DataLoader, Dataset
 from transformers import GPT2Tokenizer
+from typing import Optional
 
-
-class SlimPajamaDataset(IterableDataset):
+class SlimPajamaDataset(Dataset):
     def __init__(
-            self,
-            split: str,
-            tokenizer: Optional[GPT2Tokenizer] = None,
-            max_length: int = 1024,
-            num_examples: int = 10000,
+        self,
+        split: str,
+        tokenizer: Optional[GPT2Tokenizer] = None,
+        max_length: int = 1024,
+        num_examples: int = 10000,
     ):
         super().__init__()
         self.split = split
@@ -23,30 +19,24 @@ class SlimPajamaDataset(IterableDataset):
         self.max_length = max_length
         self.num_examples = num_examples
 
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        dataset = load_dataset("cerebras/SlimPajama-627B", split=self.split, streaming=True, cache_dir="F:\\.cache")
+        self.dataset = load_dataset("cerebras/SlimPajama-627B", split=self.split, streaming=True, cache_dir="F:\\.cache")
+        self.dataset = self.dataset.take(self.num_examples)
+        self.dataset = self.dataset.map(self.preprocess_example, batched=True, remove_columns=["text"])
 
-        with tqdm(total=self.num_examples, desc=f"Loading {self.split} data") as pbar:
-            for idx, example in enumerate(dataset):
-                if idx >= self.num_examples:
-                    break
+    def __len__(self):
+        return self.num_examples
 
-                input_ids = self.tokenizer.encode(example["text"], add_special_tokens=False)
-                input_ids = input_ids[:self.max_length]
-                attention_mask = [1] * len(input_ids)
+    def __getitem__(self, idx):
+        return self.dataset[idx]
 
-                # Pad input_ids and attention_mask to max_length
-                input_ids = input_ids + [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
-                attention_mask = attention_mask + [0] * (self.max_length - len(attention_mask))
+    def preprocess_example(self, examples):
+        input_ids = self.tokenizer(examples["text"], truncation=True, max_length=self.max_length, padding="max_length")["input_ids"]
+        attention_mask = [[1] * len(ids) + [0] * (self.max_length - len(ids)) for ids in input_ids]
+        labels = [ids.copy() for ids in input_ids]
 
-                labels = input_ids.copy()
-                labels_attention_mask = attention_mask.copy()
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
 
-                input_ids = torch.tensor(input_ids, dtype=torch.long)
-                attention_mask = torch.tensor(attention_mask, dtype=torch.long)
-                labels = torch.tensor(labels, dtype=torch.long)
-                labels_attention_mask = torch.tensor(labels_attention_mask, dtype=torch.long)
-
-                yield input_ids, attention_mask, labels, labels_attention_mask
-
-                pbar.update(1)
