@@ -9,6 +9,7 @@ from pytorch_lightning.callbacks import (
     ModelCheckpoint,
     EarlyStopping,
     LearningRateMonitor,
+    Callback
 )
 from pytorch_lightning.loggers import TensorBoardLogger
 from torchmetrics.text import Perplexity
@@ -28,6 +29,22 @@ logger.add(
 )
 
 torch.set_float32_matmul_precision("high")
+
+
+class LRRangeTestCallback(Callback):
+    def __init__(self, min_lr=1e-7, max_lr=1.0, num_steps=100):
+        super().__init__()
+        self.min_lr = min_lr
+        self.max_lr = max_lr
+        self.num_steps = num_steps
+
+    def on_train_start(self, trainer, pl_module):
+        """Runs the learning rate range test before training begins."""
+        logger.info("Starting Learning Rate Range Test")
+        pl_module.lr_range_test(
+            trainer.datamodule, self.min_lr, self.max_lr, self.num_steps
+        )
+        logger.info("Learning Rate Range Test Complete")
 
 
 class UncertainTransformerLightningModule(pl.LightningModule):
@@ -200,7 +217,7 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         Returns:
             torch.Tensor: The generated token IDs.
         """
-        for i in range(max_length):
+        for _ in range(max_length):
             outputs = self.forward(
                 input_ids[:, -1:],
                 past_key_values=self.past_key_values,
