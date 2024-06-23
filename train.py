@@ -1,5 +1,6 @@
 import sys
 
+import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -10,7 +11,6 @@ from pytorch_lightning.callbacks import (
     LearningRateMonitor,
 )
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.tuner import Tuner
 from torchmetrics.text import Perplexity
 from transformers import get_cosine_schedule_with_warmup, GPT2Tokenizer
 
@@ -57,7 +57,7 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         if hasattr(self.model, "gradient_checkpointing"):
             self.model.gradient_checkpointing = True
         elif hasattr(self.model, "transformer") and hasattr(
-            self.model.transformer, "enable_gradient_checkpointing"
+                self.model.transformer, "enable_gradient_checkpointing"
         ):
             self.model.transformer.enable_gradient_checkpointing()
         else:
@@ -71,13 +71,18 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         # Initialize state for streaming inference
         self.past_key_values = None
 
+        # Learning rate range test
+        self.lr_test_mode = False
+        self.losses = []
+        self.lrs = []
+
     def forward(
-        self,
-        input_ids,
-        attention_mask=None,
-        labels=None,
-        past_key_values=None,
-        use_cache=False,
+            self,
+            input_ids,
+            attention_mask=None,
+            labels=None,
+            past_key_values=None,
+            use_cache=False,
     ):
         return self.model(
             input_ids,
@@ -102,6 +107,12 @@ class UncertainTransformerLightningModule(pl.LightningModule):
             logger=True,
             sync_dist=True,
         )
+
+        # Learning rate range test logging
+        if self.lr_test_mode:
+            self.losses.append(loss.item())
+            lr_tensor = self.lr_schedulers().get_last_lr()[0]
+            self.lrs.append(lr_tensor)
 
         return loss
 
@@ -201,6 +212,49 @@ class UncertainTransformerLightningModule(pl.LightningModule):
             self.past_key_values = outputs.past_key_values
         return input_ids
 
+    def lr_range_test(self, datamodule, min_lr=1e-7, max_lr=1.0, num_steps=100):
+        """Performs a learning rate range test."""
+
+        self.lr_test_mode = True
+
+        # Reset losses and learning rates
+        self.losses = []
+        self.lrs = []
+
+        # Use a simple one-cycle LR scheduler
+        optimizer = self.configure_optimizers()["optimizer"]
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lr,
+            total_steps=num_steps,
+            pct_start=0.1,  # Warmup for 10% of steps
+            anneal_strategy="linear",
+        )
+        self.lr_schedulers = lr_scheduler  # Needed by PyTorch Lightning
+
+        # Manual training loop for LR range test
+        iterator = iter(datamodule.train_dataloader())
+        for i in range(num_steps):
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                iterator = iter(datamodule.train_dataloader())
+                batch = next(iterator)
+
+            self.training_step(batch, i)
+            lr_scheduler.step()  # Update learning rate
+
+        # Plot the results
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.lrs, self.losses)
+        plt.xscale("log")
+        plt.xlabel("Learning Rate (log scale)")
+        plt.ylabel("Loss")
+        plt.title("Learning Rate Range Test")
+        plt.show()
+
+        self.lr_test_mode = False  # Turn off test mode
+
 
 def main():
     logger.info("Starting main function...")
@@ -291,17 +345,7 @@ def main():
 
     logger.info("Starting learning rate finder...")
     try:
-        tuner = Tuner(trainer)
-        lr_finder = tuner.lr_find(model, datamodule=datamodule)
-        # Retrieve suggested learning rate directly
-        suggested_lr = lr_finder.suggestion()
-        if suggested_lr is not None:
-            logger.success(f"Suggested Learning Rate: {suggested_lr}")
-            model.hparams.learning_rate = suggested_lr
-        else:
-            logger.warning(
-                "Learning rate finder failed to suggest a learning rate. Using default."
-            )
+        model.lr_range_test(datamodule)
     except Exception as e:
         logger.error(f"Error during learning rate finding: {str(e)}")
         logger.info("Proceeding with default learning rate.")
@@ -316,6 +360,7 @@ def main():
     generated_ids = model.stream_generate(input_ids, max_length=50)
     generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     logger.info(f"Generated text (streaming): {generated_text}")
+
 
 if __name__ == "__main__":
     main()
