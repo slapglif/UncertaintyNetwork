@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
@@ -123,26 +123,35 @@ class SlimPajamaDataModule(pl.LightningDataModule):
             collate_fn=self.collate_fn,
         )
 
-    def collate_fn(self, batch: list) -> Dict[str, Any]:
+    def collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """
         Custom collate function to process batches.
 
         Args:
-            batch (list): A list of samples from the dataset.
+            batch (List[Dict[str, torch.Tensor]]): A list of samples from the dataset.
 
         Returns:
-            Dict[str, Any]: A dictionary containing the processed batch.
+            Dict[str, torch.Tensor]: A dictionary containing the processed batch.
         """
         input_ids = [item['input_ids'] for item in batch]
         attention_mask = [item['attention_mask'] for item in batch]
 
+        # Get max length in the batch
+        max_len = max(ids.size(0) for ids in input_ids)
+
         # Pad sequences to the maximum length in the batch
-        max_len = max(len(ids) for ids in input_ids)
-        input_ids = [ids + [self.tokenizer.pad_token_id] * (max_len - len(ids)) for ids in input_ids]
-        attention_mask = [mask + [0] * (max_len - len(mask)) for mask in attention_mask]
+        input_ids_padded = torch.stack([
+            torch.cat([ids, torch.full((max_len - ids.size(0),), self.tokenizer.pad_token_id, dtype=ids.dtype,
+                                       device=ids.device)])
+            for ids in input_ids
+        ])
+        attention_mask_padded = torch.stack([
+            torch.cat([mask, torch.zeros(max_len - mask.size(0), dtype=mask.dtype, device=mask.device)])
+            for mask in attention_mask
+        ])
 
         return {
-            'input_ids': torch.tensor(input_ids),
-            'attention_mask': torch.tensor(attention_mask),
-            'labels': torch.tensor(input_ids).clone(),  # Use input_ids as labels for language modeling
+            'input_ids': input_ids_padded,
+            'attention_mask': attention_mask_padded,
+            'labels': input_ids_padded.clone(),  # Use input_ids as labels for language modeling
         }
