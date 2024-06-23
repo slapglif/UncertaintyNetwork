@@ -42,6 +42,8 @@ class SlimPajamaDataModule(LightningDataModule):
                 max_length=self.max_length,
                 num_examples=self.train_size,
                 streaming=self.streaming,
+                num_workers=11,
+                chunk_size=10000
             )
             self.val_dataset = SlimPajamaDataset(
                 split="validation",
@@ -49,6 +51,8 @@ class SlimPajamaDataModule(LightningDataModule):
                 max_length=self.max_length,
                 num_examples=self.val_size,
                 streaming=self.streaming,
+                num_workers=11,
+                chunk_size=10000
             )
 
         if stage == "test" or stage is None:
@@ -58,6 +62,8 @@ class SlimPajamaDataModule(LightningDataModule):
                 max_length=self.max_length,
                 num_examples=self.test_size,
                 streaming=self.streaming,
+                num_workers=11,
+                chunk_size=10000
             )
 
     def train_dataloader(self):
