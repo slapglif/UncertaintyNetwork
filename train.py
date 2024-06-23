@@ -130,7 +130,6 @@ def main():
         max_length=hparams["max_length"],
         batch_size=hparams["batch_size"],
     )
-
     logger.info("Setting up callbacks...")
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints",
@@ -150,7 +149,7 @@ def main():
         max_epochs=hparams["max_epochs"],
         callbacks=[checkpoint_callback, early_stop_callback, lr_monitor],
         logger=tb_logger,
-        precision=16 if torch.cuda.is_available() else 32,
+        precision="16-mixed" if torch.cuda.is_available() else 32,
         accumulate_grad_batches=hparams["accumulate_grad_batches"],
         gradient_clip_val=1.0,
         log_every_n_steps=10,

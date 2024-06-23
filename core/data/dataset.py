@@ -1,5 +1,3 @@
-# core/data/dataset.py
-
 import os
 import pickle
 from typing import Optional, Dict, List
@@ -11,20 +9,22 @@ import time
 from tqdm import tqdm
 import torch
 
+from core.utils.tokenizer import Tokenizer
+
 
 class SlimPajamaDataset(Dataset):
     def __init__(
             self,
             split: str,
-            tokenizer: Optional[GPT2Tokenizer] = None,
+            tokenizer: Optional[Tokenizer] = None,
             max_length: int = 1024,
             num_examples: int = 1000,
             cache_dir: str = "dataset_cache",
     ):
         super().__init__()
         self.split = split
-        self.tokenizer = tokenizer or GPT2Tokenizer.from_pretrained("gpt2")
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer = tokenizer or Tokenizer.from_pretrained("gpt2")
+        # No need to set pad_token here as it's already set in the Tokenizer class
         self.max_length = max_length
         self.num_examples = num_examples
         self.cache_dir = cache_dir
@@ -67,7 +67,7 @@ class SlimPajamaDataset(Dataset):
             logger.info(f"Dataset loading and preprocessing took {end_time - start_time:.2f} seconds")
 
     def preprocess_example(self, example: Dict[str, str]) -> Dict[str, torch.Tensor]:
-        inputs = self.tokenizer(
+        inputs = self.tokenizer.tokenizer(
             example["text"],
             truncation=True,
             max_length=self.max_length,

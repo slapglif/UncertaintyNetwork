@@ -1,5 +1,3 @@
-# core/utils/tokenizer.py
-
 from transformers import GPT2Tokenizer
 
 class Tokenizer:
@@ -7,6 +5,18 @@ class Tokenizer:
         self.tokenizer = GPT2Tokenizer.from_pretrained(pretrained_tokenizer)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.vocab_size = self.tokenizer.vocab_size
+
+    @property
+    def pad_token(self):
+        return self.tokenizer.pad_token
+
+    @pad_token.setter
+    def pad_token(self, value):
+        self.tokenizer.pad_token = value
+
+    @property
+    def eos_token(self):
+        return self.tokenizer.eos_token
 
     def encode(self, text):
         return self.tokenizer.encode(text, add_special_tokens=True)
