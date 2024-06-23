@@ -48,7 +48,7 @@ class SlimPajamaDataset(IterableDataset):
             end_time = time.time()
             logger.info(f"Dataset loading took {end_time - start_time:.2f} seconds")
 
-        logger.info(f"SlimPajamaDataset initialization complete.")
+        logger.info("SlimPajamaDataset initialization complete.")
 
     def __iter__(self) -> Iterator[Dict]:
         """

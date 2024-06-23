@@ -54,19 +54,19 @@ class SlimPajamaDataModule(LightningDataModule):
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            num_workers=0 if self.streaming else 1,  # Adjust num_workers based on streaming
+            num_workers=11 if self.streaming else 11,  # Adjust num_workers based on streaming
         )
 
     def val_dataloader(self) -> DataLoader:
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
-            num_workers=0 if self.streaming else 1,  # Adjust num_workers based on streaming
+            num_workers=11 if self.streaming else 11,  # Adjust num_workers based on streaming
         )
 
     def test_dataloader(self) -> DataLoader:
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
-            num_workers=0 if self.streaming else 1,  # Adjust num_workers based on streaming
+            num_workers=11 if self.streaming else 11,  # Adjust num_workers based on streaming
         )
