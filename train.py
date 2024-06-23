@@ -133,18 +133,29 @@ class UncertainTransformerLightningModule(pl.LightningModule):
 
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        input_ids, labels = batch
+    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Perform a validation step.
+
+        Args:
+            batch (Dict[str, torch.Tensor]): A dictionary containing the input batch data.
+            batch_idx (int): The index of the current batch.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary containing the validation loss and perplexity.
+        """
+        input_ids = batch['input_ids']
+        labels = batch['labels'] if 'labels' in batch else input_ids.clone()
         attention_mask = (input_ids != self.hparams["pad_token_id"]).long()
+
         outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
         loss = outputs.loss
+
         self.log(
             "val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True
         )
 
-        perplexity = self.perplexity(
-            outputs.logits.view(-1, outputs.logits.size(-1)), labels.view(-1)
-        )
+        perplexity = torch.exp(loss)
         self.log(
             "val_perplexity",
             perplexity,
@@ -155,16 +166,12 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         )
 
         if batch_idx == 0:
-            input_ids = batch[0][:1]
-            generated = self.model.generate(input_ids, max_length=50)
-            generated_text = self.tokenizer.decode(
-                generated[0], skip_special_tokens=True
-            )
-            self.logger.experiment.add_text(
-                "generated_text", generated_text, self.current_epoch
-            )
+            sample_input_ids = input_ids[:1]
+            generated = self.generate(sample_input_ids, max_length=50)
+            generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
+            self.logger.experiment.add_text("generated_text", generated_text, self.current_epoch)
 
-        return loss
+        return {"val_loss": loss, "val_perplexity": perplexity}
 
     def configure_optimizers(self):
         # Prepare optimizer

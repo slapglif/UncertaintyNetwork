@@ -1,5 +1,6 @@
-from typing import Optional
+from typing import Optional, List, Dict
 
+import torch
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
 from transformers import GPT2Tokenizer
@@ -51,22 +52,51 @@ class SlimPajamaDataModule(LightningDataModule):
             )
 
     def train_dataloader(self) -> DataLoader:
+        """
+        Creates and returns the training DataLoader.
+
+        Returns:
+            DataLoader: The DataLoader for the training dataset.
+        """
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            num_workers=11 if self.streaming else 11,  # Adjust num_workers based on streaming
+            num_workers=11 if self.streaming else 4,
+            collate_fn=self.collate_fn,
+            pin_memory=True,
         )
 
     def val_dataloader(self) -> DataLoader:
+        """
+        Creates and returns the validation DataLoader.
+
+        Returns:
+            DataLoader: The DataLoader for the validation dataset.
+        """
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
-            num_workers=11 if self.streaming else 11,  # Adjust num_workers based on streaming
+            num_workers=11 if self.streaming else 4,
+            collate_fn=self.collate_fn,
+            pin_memory=True,
         )
 
-    def test_dataloader(self) -> DataLoader:
-        return DataLoader(
-            self.test_dataset,
-            batch_size=self.batch_size,
-            num_workers=11 if self.streaming else 11,  # Adjust num_workers based on streaming
-        )
+    def collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """
+        Custom collate function for batching the data.
+
+        Args:
+            batch (List[Dict[str, torch.Tensor]]): A list of dictionaries containing the data samples.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary containing the batched tensors.
+        """
+        input_ids = torch.stack([item['input_ids'] for item in batch])
+        attention_mask = torch.stack([item['attention_mask'] for item in batch])
+        labels = torch.stack([item['labels'] for item in batch])
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels
+        }
