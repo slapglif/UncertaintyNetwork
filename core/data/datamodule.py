@@ -64,6 +64,7 @@ class SlimPajamaDataModule(LightningDataModule):
             num_workers=11 if self.streaming else 4,
             collate_fn=self.collate_fn,
             pin_memory=True,
+            persistent_workers=True
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -79,6 +80,7 @@ class SlimPajamaDataModule(LightningDataModule):
             num_workers=11 if self.streaming else 4,
             collate_fn=self.collate_fn,
             pin_memory=True,
+            persistent_workers=True
         )
 
     def collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:

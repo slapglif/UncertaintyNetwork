@@ -112,10 +112,7 @@ class UncertainTransformerLightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         input_ids, labels = batch
-        attention_mask = (input_ids != self.hparams["pad_token_id"]).long()
-        outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
-        loss = outputs.loss
-
+        loss = self._extracted_from_validation_step_3(input_ids, labels)
         self.log(
             "train_loss",
             loss,
@@ -147,11 +144,7 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         """
         input_ids = batch['input_ids']
         labels = batch['labels'] if 'labels' in batch else input_ids.clone()
-        attention_mask = (input_ids != self.hparams["pad_token_id"]).long()
-
-        outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
-        loss = outputs.loss
-
+        loss = self._extracted_from_validation_step_3(input_ids, labels)
         self.log(
             "val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True
         )
@@ -168,11 +161,17 @@ class UncertainTransformerLightningModule(pl.LightningModule):
 
         if batch_idx == 0:
             sample_input_ids = input_ids[:1]
-            generated = self.generate(sample_input_ids, max_length=50)
+            generated = self.model.generate(sample_input_ids, max_length=50)
             generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
             self.logger.experiment.add_text("generated_text", generated_text, self.current_epoch)
 
         return {"val_loss": loss, "val_perplexity": perplexity}
+
+    # TODO Rename this here and in `training_step` and `validation_step`
+    def _extracted_from_validation_step_3(self, input_ids, labels):
+        attention_mask = (input_ids != self.hparams["pad_token_id"]).long()
+        outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
+        return outputs.loss
 
     def configure_optimizers(self):
         # Prepare optimizer
