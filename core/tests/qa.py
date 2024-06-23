@@ -8,7 +8,10 @@ from nltk.translate.bleu_score import sentence_bleu
 from rouge import Rouge
 from sentence_transformers import SentenceTransformer, util
 
-from core.models.uncertain_nn import UncertainTransformerLMHeadModel, UncertainTransformerConfig
+from core.models.uncertain_nn import (
+    UncertainTransformerConfig,
+    UncertainTransformerLMHeadModel,
+)
 from core.tests.test_generation import generate_text
 from core.utils.tokenizer import Tokenizer
 
@@ -36,10 +39,10 @@ model.eval()
 
 
 def evaluate_qa(
-        model: UncertainTransformerLMHeadModel,
-        tokenizer: Tokenizer,
-        qa_dataset: Dict,
-        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    model: UncertainTransformerLMHeadModel,
+    tokenizer: Tokenizer,
+    qa_dataset: Dict,
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ) -> None:
     """
     Evaluates the model's zero-shot question answering ability on a QA corpus using RAG.
@@ -55,13 +58,15 @@ def evaluate_qa(
     model.eval()
 
     rouge = Rouge()
-    sentence_model = SentenceTransformer('all-mpnet-base-v2')  # Sentence embedding model
+    sentence_model = SentenceTransformer(
+        "all-mpnet-base-v2"
+    )  # Sentence embedding model
     logger.info("🤖 Loaded Sentence Embedding Model: all-mpnet-base-v2 🤖")
 
     total_bleu = 0
     total_rouge_l = 0
 
-    for i, example in enumerate(qa_dataset['validation']):
+    for i, example in enumerate(qa_dataset["validation"]):
         logger.info(f"🧠 Processing QA Pair {i + 1} 🧠")
         question = example["question"]
         answer = "yes" if example["answer"] else "no"
@@ -70,7 +75,9 @@ def evaluate_qa(
 
         # 1. Retrieve Relevant QA Pairs
         logger.info("🔎 Retrieving Relevant QA Pairs from Corpus 🔎")
-        retrieved_pairs = retrieve_relevant_qa(question, qa_dataset['train'], sentence_model, top_k=3)
+        retrieved_pairs = retrieve_relevant_qa(
+            question, qa_dataset["train"], sentence_model, top_k=3
+        )
         logger.info(f"🧲 Found {len(retrieved_pairs)} Relevant Pairs 🧲")
 
         # 2. Construct Prompt with Retrieved Information
@@ -94,31 +101,39 @@ def evaluate_qa(
             repetition_penalty=1.2,
             num_return_sequences=1,
             device=device,
-        )[0]  # Get the first generated sequence
+        )[
+            0
+        ]  # Get the first generated sequence
         logger.info(f"💬 Generated Answer: {generated_text}")
 
         # Calculate BLEU score
         logger.info("🧮 Calculating BLEU Score 🧮")
-        bleu_score = sentence_bleu([tokenizer.tokenize(answer)], tokenizer.tokenize(generated_text))
+        bleu_score = sentence_bleu(
+            [tokenizer.tokenize(answer)], tokenizer.tokenize(generated_text)
+        )
         total_bleu += bleu_score
         logger.info(f"🔵 BLEU Score: {bleu_score:.4f}")
 
         # Calculate ROUGE-L score
         logger.info("🧮 Calculating ROUGE-L Score 🧮")
         rouge_scores = rouge.get_scores(generated_text, answer)
-        rouge_l_score = rouge_scores[0]['rouge-l']['f']
+        rouge_l_score = rouge_scores[0]["rouge-l"]["f"]
         total_rouge_l += rouge_l_score
         logger.info(f"🔴 ROUGE-L Score: {rouge_l_score:.4f}")
 
-    average_bleu = total_bleu / len(qa_dataset['validation'])
-    average_rouge_l = total_rouge_l / len(qa_dataset['validation'])
+    average_bleu = total_bleu / len(qa_dataset["validation"])
+    average_rouge_l = total_rouge_l / len(qa_dataset["validation"])
     logger.info(f"\n🌟 Average BLEU Score: {average_bleu:.4f} 🌟")
     logger.info(f"🌟 Average ROUGE-L Score: {average_rouge_l:.4f} 🌟")
     logger.info("🎉 QA Evaluation Completed! 🎉")
 
 
-def retrieve_relevant_qa(query: str, qa_corpus: List[Dict], sentence_model: SentenceTransformer, top_k: int = 3) -> \
-        List[Dict]:
+def retrieve_relevant_qa(
+    query: str,
+    qa_corpus: List[Dict],
+    sentence_model: SentenceTransformer,
+    top_k: int = 3,
+) -> List[Dict]:
     """
     Retrieves relevant QA pairs from a corpus based on semantic similarity.
 
@@ -135,10 +150,13 @@ def retrieve_relevant_qa(query: str, qa_corpus: List[Dict], sentence_model: Sent
 
     # Ensure corpus_embeddings is always 2D even for single element
     if len(qa_corpus) == 1:
-        corpus_embeddings = sentence_model.encode([pair["question"] for pair in qa_corpus],
-                                                  convert_to_tensor=True).unsqueeze(0)
+        corpus_embeddings = sentence_model.encode(
+            [pair["question"] for pair in qa_corpus], convert_to_tensor=True
+        ).unsqueeze(0)
     else:
-        corpus_embeddings = sentence_model.encode([pair["question"] for pair in qa_corpus], convert_to_tensor=True)
+        corpus_embeddings = sentence_model.encode(
+            [pair["question"] for pair in qa_corpus], convert_to_tensor=True
+        )
 
     similarities = util.pytorch_cos_sim(query_embedding, corpus_embeddings)[0]
     top_k_indices = torch.topk(similarities, top_k).indices
@@ -161,4 +179,4 @@ def boolq_dataset():
 tokenizer = Tokenizer.from_pretrained("gpt2")
 
 if __name__ == "__main__":
-    evaluate_qa(model, tokenizer, boolq_dataset(), torch.device('cuda'))
+    evaluate_qa(model, tokenizer, boolq_dataset(), torch.device("cuda"))

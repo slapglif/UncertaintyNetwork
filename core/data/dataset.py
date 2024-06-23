@@ -8,14 +8,15 @@ from torch.utils.data import IterableDataset
 
 from core.utils.tokenizer import Tokenizer
 
+
 class SlimPajamaDataset(IterableDataset):
     def __init__(
-            self,
-            split: str,
-            tokenizer: Optional[Tokenizer] = None,
-            max_length: int = 1024,
-            num_examples: int = 1000,
-            cache_dir: str = "dataset_cache",
+        self,
+        split: str,
+        tokenizer: Optional[Tokenizer] = None,
+        max_length: int = 1024,
+        num_examples: int = 1000,
+        cache_dir: str = "dataset_cache",
     ):
         super().__init__()
         self.split = split
@@ -38,7 +39,7 @@ class SlimPajamaDataset(IterableDataset):
         for i, example in enumerate(self.dataset):
             if i >= self.num_examples:
                 break
-            yield self.process_example(example['text'])
+            yield self.process_example(example["text"])
 
     def process_example(self, text: str) -> Dict[str, torch.Tensor]:
         tokenized = self.tokenizer.tokenizer(
@@ -46,12 +47,12 @@ class SlimPajamaDataset(IterableDataset):
             truncation=True,
             max_length=self.max_length,
             padding="max_length",
-            return_tensors="pt"
+            return_tensors="pt",
         )
         return {
-            'input_ids': tokenized['input_ids'].squeeze(0),
-            'attention_mask': tokenized['attention_mask'].squeeze(0),
-            'labels': tokenized['input_ids'].squeeze(0).clone()
+            "input_ids": tokenized["input_ids"].squeeze(0),
+            "attention_mask": tokenized["attention_mask"].squeeze(0),
+            "labels": tokenized["input_ids"].squeeze(0).clone(),
         }
 
     def __len__(self):

@@ -6,9 +6,14 @@ from transformers import GPT2Tokenizer, get_cosine_schedule_with_warmup
 
 from core.data.datamodule import SlimPajamaDataModule
 from core.models.layers import MambaLayer, TransformerEncoderLayer
-from core.models.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
+from core.models.uncertain_nn import (
+    UncertainTransformerConfig,
+    UncertainTransformerLMHeadModel,
+)
 from core.tests.test_generation import calculate_perplexity
-torch.set_float32_matmul_precision('high')
+
+torch.set_float32_matmul_precision("high")
+
 
 def objective(trial: optuna.Trial):
     """
@@ -24,7 +29,9 @@ def objective(trial: optuna.Trial):
     # Mamba Layer Hyperparameters
     d_state = trial.suggest_int("d_state", 4, 64, step=4)  # State dimension
     d_conv = trial.suggest_int("d_conv", 2, 8, step=2)  # Convolution kernel size
-    expand_factor = trial.suggest_float("expand_factor", 1.5, 3.0, step=0.5)  # Expansion factor
+    expand_factor = trial.suggest_float(
+        "expand_factor", 1.5, 3.0, step=0.5
+    )  # Expansion factor
     dt_rank = trial.suggest_int("dt_rank", 4, 32, step=4)  # Rank of dt parameter
     dt_min = trial.suggest_float("dt_min", 1e-4, 1e-2, log=True)  # Minimum value for dt
     dt_max = trial.suggest_float("dt_max", 1e-2, 1.0, log=True)  # Maximum value for dt
@@ -54,7 +61,9 @@ def objective(trial: optuna.Trial):
     )
     mamba_layer = MambaLayer(config)
 
-    class SAMBAModel(UncertainTransformerLMHeadModel, pl.LightningModule):  # Inherit from pl.LightningModule
+    class SAMBAModel(
+        UncertainTransformerLMHeadModel, pl.LightningModule
+    ):  # Inherit from pl.LightningModule
         def __init__(self, config):
             super().__init__(config)
             self.transformer.layers = torch.nn.ModuleList(
@@ -70,18 +79,34 @@ def objective(trial: optuna.Trial):
         def training_step(self, batch, batch_idx):
             input_ids, labels = batch
             attention_mask = (input_ids != self.config.pad_token_id).long()
-            outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
+            outputs = self.forward(
+                input_ids, attention_mask=attention_mask, labels=labels
+            )
             loss = outputs.loss
-            self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log(
+                "train_loss",
+                loss,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
             return loss
 
         def validation_step(self, batch, batch_idx):
             input_ids, labels = batch
             attention_mask = (input_ids != self.hparams["pad_token_id"]).long()
-            outputs = self.forward(input_ids, attention_mask=attention_mask, labels=labels)
+            outputs = self.forward(
+                input_ids, attention_mask=attention_mask, labels=labels
+            )
             loss = outputs.loss
             self.log(
-                "val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True
+                "val_loss",
+                loss,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                sync_dist=True,
             )
 
             perplexity = self.perplexity(
@@ -99,8 +124,12 @@ def objective(trial: optuna.Trial):
             if batch_idx == 0:
                 input_ids = batch[0][:1]
                 generated = self.model.generate(input_ids, max_length=50)
-                generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
-                self.logger.experiment.add_text("generated_text", generated_text, self.current_epoch)
+                generated_text = self.tokenizer.decode(
+                    generated[0], skip_special_tokens=True
+                )
+                self.logger.experiment.add_text(
+                    "generated_text", generated_text, self.current_epoch
+                )
 
             return loss
 
@@ -111,7 +140,9 @@ def objective(trial: optuna.Trial):
             optimizer_grouped_parameters = [
                 {
                     "params": [
-                        p for n, p in param_optimizer if all(nd not in n for nd in no_decay)
+                        p
+                        for n, p in param_optimizer
+                        if all(nd not in n for nd in no_decay)
                     ],
                     "weight_decay": self.hparams["weight_decay"],
                 },
@@ -151,11 +182,13 @@ def objective(trial: optuna.Trial):
 
     # Train and Evaluate Your SAMBA Model
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    datamodule = SlimPajamaDataModule(tokenizer=tokenizer,
-                                      max_length=config.max_position_embeddings,
-                                      batch_size=32)  # Adjust batch size as needed
-    trainer = pl.Trainer(max_epochs=5,  # Adjust as needed
-                         accelerator="gpu" if torch.cuda.is_available() else "cpu")
+    datamodule = SlimPajamaDataModule(
+        tokenizer=tokenizer, max_length=config.max_position_embeddings, batch_size=32
+    )  # Adjust batch size as needed
+    trainer = pl.Trainer(
+        max_epochs=5,  # Adjust as needed
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+    )
     trainer.fit(model, datamodule=datamodule)
 
     # Calculate Perplexity on Validation Set

@@ -1,15 +1,23 @@
 # train.py
 
 import sys
+from typing import Dict, Any
 
 import pytorch_lightning as pl
 import torch
 from loguru import logger
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from pytorch_lightning.callbacks import (
+    ModelCheckpoint,
+    EarlyStopping,
+    LearningRateMonitor,
+)
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from core.data.datamodule import SlimPajamaDataModule
-from core.models.uncertain_nn import UncertainTransformerLMHeadModel, UncertainTransformerConfig
+from core.models.uncertain_nn import (
+    UncertainTransformerLMHeadModel,
+    UncertainTransformerConfig,
+)
 from core.utils.tokenizer import Tokenizer
 
 # Configure Loguru
@@ -23,7 +31,7 @@ torch.set_float32_matmul_precision("high")
 
 
 class UncertainTransformerLightningModule(pl.LightningModule):
-    def __init__(self, hparams: dict):
+    def __init__(self, hparams: Dict[str, Any]):
         super().__init__()
         self.save_hyperparameters(hparams)
 
@@ -37,42 +45,64 @@ class UncertainTransformerLightningModule(pl.LightningModule):
             max_position_embeddings=hparams["max_length"],
             pad_token_id=hparams["pad_token_id"],
             use_stable_embedding=hparams["use_stable_embedding"],
+            use_mamba=hparams["use_mamba"],
+            d_state=hparams["d_state"],
+            d_conv=hparams["d_conv"],
+            expand_factor=hparams["expand_factor"],
+            dt_rank=hparams["dt_rank"],
+            dt_min=hparams["dt_min"],
+            dt_max=hparams["dt_max"],
         )
         self.model = UncertainTransformerLMHeadModel(config)
-        self.criterion = torch.nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
-        self.perplexity = torch.nn.CrossEntropyLoss(ignore_index=-100)  # For perplexity calculation
         self.tokenizer = None
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         return self.model(input_ids, attention_mask=attention_mask, labels=labels)
 
-    def training_step(self, batch, batch_idx):
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
-        labels = batch["labels"]
-        outputs = self(input_ids, attention_mask=attention_mask, labels=labels)
+    def training_step(
+        self, batch: Dict[str, torch.Tensor], batch_idx: int
+    ) -> torch.Tensor:
+        outputs = self(**batch)
         loss = outputs.loss
-
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log(
+            "train_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+        )
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
-        labels = batch["labels"]
-        outputs = self(input_ids, attention_mask=attention_mask, labels=labels)
+    def validation_step(
+        self, batch: Dict[str, torch.Tensor], batch_idx: int
+    ) -> Dict[str, torch.Tensor]:
+        outputs = self(**batch)
         loss = outputs.loss
+        self.log(
+            "val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True
+        )
 
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-
-        perplexity = torch.exp(self.perplexity(outputs.logits.view(-1, outputs.logits.size(-1)), labels.view(-1)))
-        self.log("val_perplexity", perplexity, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        perplexity = torch.exp(loss)
+        self.log(
+            "val_perplexity",
+            perplexity,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+        )
 
         if batch_idx == 0:
-            sample_input_ids = input_ids[:1]
+            sample_input_ids = batch["input_ids"][:1]
             generated = self.model.generate(sample_input_ids, max_new_tokens=50)
-            generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
-            self.logger.experiment.add_text("generated_text", generated_text, self.current_epoch)
+            generated_text = self.tokenizer.decode(
+                generated[0], skip_special_tokens=True
+            )
+            self.logger.experiment.add_text(
+                "generated_text", generated_text, self.current_epoch
+            )
 
         return {"val_loss": loss, "val_perplexity": perplexity}
 
@@ -116,6 +146,13 @@ def main():
         "pad_token_id": 50256,
         "use_stable_embedding": True,
         "streaming": True,
+        "use_mamba": True,
+        "d_state": 16,
+        "d_conv": 4,
+        "expand_factor": 2.0,
+        "dt_rank": None,
+        "dt_min": 0.001,
+        "dt_max": 0.1,
     }
 
     logger.info("Initializing model...")
@@ -132,6 +169,7 @@ def main():
         batch_size=hparams["batch_size"],
         streaming=hparams["streaming"],
     )
+
     logger.info("Setting up callbacks...")
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints",
