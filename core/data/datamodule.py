@@ -22,6 +22,9 @@ class SlimPajamaDataModule(LightningDataModule):
             streaming: bool = False,
     ):
         super().__init__()
+        self.test_dataset = None
+        self.train_dataset = None
+        self.val_dataset = None
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.batch_size = batch_size
