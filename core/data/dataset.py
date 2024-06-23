@@ -1,33 +1,39 @@
 import os
 import pickle
-import time
 from typing import Optional, Dict, List
-
-import torch
 from datasets import load_dataset
-from loguru import logger
 from torch.utils.data import IterableDataset
+from loguru import logger
+import time
 from tqdm import tqdm
-from transformers import GPT2Tokenizer
+import torch
+import multiprocessing as mp
+from functools import partial
+
+from core.utils.tokenizer import Tokenizer
 
 
 class SlimPajamaDataset(IterableDataset):
     def __init__(
             self,
             split: str,
-            tokenizer: Optional[GPT2Tokenizer] = None,
+            tokenizer: Optional[Tokenizer] = None,
             max_length: int = 1024,
             num_examples: int = 1000,
             cache_dir: str = "dataset_cache",
             streaming: bool = False,
+            batch_size: int = 1000,
+            num_workers: int = 4
     ):
         super().__init__()
         self.split = split
-        self.tokenizer = tokenizer or GPT2Tokenizer.from_pretrained("gpt2")
+        self.tokenizer = tokenizer or Tokenizer.from_pretrained("gpt2")
         self.max_length = max_length
         self.num_examples = num_examples
         self.cache_dir = cache_dir
         self.streaming = streaming
+        self.batch_size = batch_size
+        self.num_workers = num_workers
 
         os.makedirs(self.cache_dir, exist_ok=True)
         self.cache_file = os.path.join(self.cache_dir, f"{split}_{num_examples}{'_streaming' if streaming else ''}.pkl")
@@ -42,7 +48,7 @@ class SlimPajamaDataset(IterableDataset):
             self.dataset = load_dataset(
                 "cerebras/SlimPajama-627B",
                 split=f"{self.split}",
-                streaming=True,  # Always use streaming for initial load
+                streaming=True,
                 cache_dir="F:\\.cache",
             )
             self.data = self.load_and_preprocess_data()
@@ -55,29 +61,35 @@ class SlimPajamaDataset(IterableDataset):
 
     def load_and_preprocess_data(self) -> List[Dict[str, torch.Tensor]]:
         start_time = time.time()
-        preprocessed_data = []
-        try:
+
+        def process_batch(batch):
+            return [self.preprocess_example(_example) for _example in batch]
+
+        with mp.Pool(processes=self.num_workers) as pool:
+            batches = []
+            current_batch = []
             for i, example in enumerate(
-                    tqdm(self.dataset, desc=f"Preprocessing {self.split} data", total=self.num_examples)):
+                    tqdm(self.dataset, desc=f"Collecting {self.split} data", total=self.num_examples)):
                 if i >= self.num_examples:
                     break
-                preprocessed_data.append(self.preprocess_example(example))
+                current_batch.append(example)
+                if len(current_batch) == self.batch_size:
+                    batches.append(current_batch)
+                    current_batch = []
 
-                # Save intermediate results every 1000 examples
-                if (i + 1) % 1000 == 0:
-                    logger.info(f"Saving intermediate results: {i + 1} examples processed")
-                    with open(self.cache_file, 'wb') as f:
-                        pickle.dump(preprocessed_data, f)
-        except Exception as e:
-            logger.error(f"Error loading dataset: {str(e)}")
-            raise
-        finally:
-            end_time = time.time()
-            logger.info(f"Dataset loading and preprocessing took {end_time - start_time:.2f} seconds")
+            if current_batch:
+                batches.append(current_batch)
+
+            preprocessed_data = []
+            for result in tqdm(pool.imap(process_batch, batches), total=len(batches), desc="Preprocessing batches"):
+                preprocessed_data.extend(result)
+
+        end_time = time.time()
+        logger.info(f"Dataset loading and preprocessing took {end_time - start_time:.2f} seconds")
         return preprocessed_data
 
     def preprocess_example(self, example: Dict[str, str]) -> Dict[str, torch.Tensor]:
-        inputs = self.tokenizer(
+        inputs = self.tokenizer.tokenizer(
             example["text"],
             truncation=True,
             max_length=self.max_length,
