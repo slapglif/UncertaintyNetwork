@@ -1,6 +1,8 @@
 # test_generation.py
 
+import matplotlib.pyplot as plt
 import pytest
+import seaborn as sns
 import torch
 from loguru import logger
 from transformers import StoppingCriteria
@@ -57,7 +59,7 @@ class MaxLengthCriteria(StoppingCriteria):
         self.max_length = max_length
 
     def __call__(
-            self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
     ) -> bool:
         return input_ids.shape[-1] >= self.max_length
 
@@ -73,24 +75,11 @@ class MaxLengthCriteria(StoppingCriteria):
     ],
 )
 def test_generation_and_perplexity(
-        model: UncertainTransformerLMHeadModel,
-        tokenizer: Tokenizer,
-        prompt: str,
-        device: torch.device,
+    model: UncertainTransformerLMHeadModel,
+    tokenizer: Tokenizer,
+    prompt: str,
+    device: torch.device,
 ):
-    """
-    Test the text generation and perplexity calculation capabilities of the model.
-
-    This test function generates text based on various prompts and then calculates the perplexity
-    of the generated text. It asserts that the generated text is not empty and the perplexity
-    is a finite positive number.
-
-    Args:
-        model (UncertainTransformerLMHeadModel): The model to test.
-        tokenizer (Tokenizer): The tokenizer to use for encoding and decoding text.
-        prompt (str): The prompt to start text generation from.
-        device (torch.device): The device to run the model on.
-    """
     model.to(device)
     logger.info(f"\nTesting prompt: {prompt}")
 
@@ -104,46 +93,47 @@ def test_generation_and_perplexity(
             top_k=50,
             top_p=0.95,
             repetition_penalty=1.2,
-            num_return_sequences=NUM_SAMPLES,
+            num_return_sequences=3,
             device=device,
         )
 
-        for i, generated_text in enumerate(generated_texts):
-            perplexity = calculate_perplexity(
-                model, tokenizer.tokenizer, generated_text, device=device
-            )
+        assert len(generated_texts) > 0, "No text was generated"
 
+        perplexities = []
+        for i, generated_text in enumerate(generated_texts):
             logger.info(f"\nSample {i + 1}:")
             logger.info(f"Generated text: '{generated_text}'")
             logger.info(f"Generated text length: {len(generated_text)}")
+
+            assert len(generated_text) > 0, f"Generated text {i + 1} is empty"
+
+            perplexity = calculate_perplexity(
+                model, tokenizer.tokenizer, generated_text, device=device
+            )
+            perplexities.append(perplexity)
             logger.info(f"Perplexity: {perplexity:.2f}")
 
-            assert len(generated_text) > 0, "Generated text should not be empty"
             assert (
-                    0 < perplexity < float("inf")
-            ), "Perplexity should be a finite positive number"
+                0 < perplexity < float("inf")
+            ), f"Invalid perplexity value: {perplexity}"
+
+        # Visualize perplexities
+        plt.figure(figsize=(10, 6))
+        sns.boxplot(x=perplexities)
+        plt.title(f"Perplexity Distribution for Prompt: '{prompt}'")
+        plt.xlabel("Perplexity")
+        plt.savefig(f"perplexity_distribution_{prompt.replace(' ', '_')}.png")
+        plt.close()
 
     except Exception as e:
-        logger.error(f"Error generating text for prompt '{prompt}': {str(e)}")
-        logger.error(f"Error details: {type(e).__name__}")
-        import traceback
-
-        logger.error(traceback.format_exc())
+        logger.error(
+            f"Error in test_generation_and_perplexity for prompt '{prompt}': {str(e)}"
+        )
+        logger.exception("Full traceback:")
         pytest.fail(f"Test failed due to an error: {str(e)}")
 
 
 def test_model_output_shapes(model, tokenizer, device):
-    """
-    Test the output shapes of the model.
-
-    This function checks the shapes of the model's outputs (logits) to ensure they match the expected dimensions.
-    It also checks for NaN values in the logits and logs a warning if any are found.
-
-    Args:
-        model (UncertainTransformerLMHeadModel): The model to test.
-        tokenizer (Tokenizer): The tokenizer to use for encoding text.
-        device (torch.device): The device to run the model on.
-    """
     model.to(device)
     prompt = "Test prompt"
     input_ids = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(device)
@@ -152,35 +142,24 @@ def test_model_output_shapes(model, tokenizer, device):
         outputs = model(input_ids)
 
     logger.info(f"\nModel output shapes:")
+    logger.info(f"Input shape: {input_ids.shape}")
     logger.info(f"Logits shape: {outputs.logits.shape}")
 
-    # Check for nan values
     if torch.isnan(outputs.logits).any():
         logger.warning("NaN values detected in logits")
 
-    assert outputs.logits.shape[0] == 1, "Batch size should be 1"
-    assert outputs.logits.shape[1] == len(
-        input_ids[0]
-    ), "Sequence length should match input"
     assert (
-            outputs.logits.shape[2] == model.config.vocab_size
-    ), "Last dimension should be vocab size"
+        outputs.logits.shape[0] == input_ids.shape[0]
+    ), f"Batch size mismatch: expected {input_ids.shape[0]}, got {outputs.logits.shape[0]}"
+    assert (
+        outputs.logits.shape[1] == input_ids.shape[1]
+    ), f"Sequence length mismatch: expected {input_ids.shape[1]}, got {outputs.logits.shape[1]}"
+    assert (
+        outputs.logits.shape[2] == model.config.vocab_size
+    ), f"Vocabulary size mismatch: expected {model.config.vocab_size}, got {outputs.logits.shape[2]}"
 
 
 def test_attention_mask(model, tokenizer, device):
-    """
-    Tests the effect of the attention mask on the model's output.
-
-    This function compares the model's outputs with and without an attention mask. The attention mask
-    is used to simulate padding in the input sequence. For models with standard attention mechanisms,
-    the outputs should differ when an attention mask is used. For models using Mamba layers, the
-    attention mask should have no effect, as Mamba layers do not rely on attention masks.
-
-    Args:
-        model (UncertainTransformerLMHeadModel): The model to test.
-        tokenizer (Tokenizer): The tokenizer to use for encoding text.
-        device (torch.device): The device to run the model on.
-    """
     model.to(device)
     prompt = "Test with padding"
     input_ids = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(device)
@@ -199,8 +178,8 @@ def test_attention_mask(model, tokenizer, device):
     logger.info("\nTesting attention mask:")
 
     if (
-            torch.isnan(outputs_with_mask.logits).any()
-            or torch.isnan(outputs_without_mask.logits).any()
+        torch.isnan(outputs_with_mask.logits).any()
+        or torch.isnan(outputs_without_mask.logits).any()
     ):
         logger.warning("NaN values detected in logits")
         return
@@ -213,6 +192,7 @@ def test_attention_mask(model, tokenizer, device):
     )
     logger.info(f"Difference in last token logits: {diff:.4f}")
 
+    # sourcery skip: no-conditionals-in-tests
     if not model.config.use_mamba:
         assert diff > 0, "Outputs should differ when using attention mask"
     else:

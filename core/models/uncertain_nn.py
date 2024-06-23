@@ -1,23 +1,18 @@
-# core/models/uncertain_nn.py
-from typing import Any, Dict
-from typing import List
-from typing import Optional, Tuple, Union
+# core\models\uncertain_nn.py
+from typing import Optional, Tuple, Union, List
 
 import torch
 import torch.nn as nn
-from transformers import LogitsProcessor
-from transformers import PreTrainedModel
-from transformers import PretrainedConfig
-from transformers.generation import GenerationMixin
-from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
-from transformers.utils import ModelOutput
-
-from core.models.layers import (
-    TransformerEncoderLayer,
-    SentenceEncoder,
-    SentenceGP,
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+from transformers import PreTrainedModel, PretrainedConfig
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPastAndCrossAttentions,
+    CausalLMOutputWithCrossAttentions,
 )
+
+from core.models.embedding import SentenceGP, SentenceEncoder
+from core.models.layers import TransformerEncoderLayer
 
 
 class UncertainTransformerConfig(PretrainedConfig):
@@ -50,7 +45,7 @@ class UncertainTransformerConfig(PretrainedConfig):
             dt_init_floor=1e-4,
             use_flash_attention=False,
             n_inducing=10,
-            use_gelu_approximation=False,  # Add this line
+            use_gelu_approximation=False,
             **kwargs,
     ):
         super().__init__(
@@ -82,17 +77,17 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.dt_init_floor = dt_init_floor
         self.use_flash_attention = use_flash_attention
         self.n_inducing = n_inducing
-        self.use_gelu_approximation = use_gelu_approximation  # Add this line
+        self.use_gelu_approximation = use_gelu_approximation
 
-    @property
-    def hidden_size(self):
-        return self.d_model
+        # Add _no_split_modules to the config
+        self._no_split_modules = []
 
 
 class UncertainNN(nn.Module):
-    def __init__(self, config: UncertainTransformerConfig):
+    def __init__(self, config: UncertainTransformerConfig | PretrainedConfig):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False
 
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.position_embedding = nn.Embedding(
@@ -109,7 +104,6 @@ class UncertainNN(nn.Module):
             config.d_model, eps=config.layer_norm_epsilon
         )
 
-        # SentenceEncoder and SentenceGP components
         self.sentence_encoder = SentenceEncoder(
             config.d_model, config.d_model * 2, config.d_model, num_grids=8
         )
@@ -121,9 +115,9 @@ class UncertainNN(nn.Module):
             self,
             input_ids: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.FloatTensor] = None,
-            token_type_ids: Optional[torch.LongTensor] = None,
+            _token_type_ids: Optional[torch.LongTensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[Tuple[torch.FloatTensor]] = None,
+            _past_key_values: Optional[Tuple[torch.FloatTensor]] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
@@ -131,26 +125,6 @@ class UncertainNN(nn.Module):
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         # sourcery skip: low-code-quality
-        """
-        Forward pass of the UncertainNN model.
-
-        Args:
-            input_ids (torch.Tensor): Input token IDs of shape (batch_size, sequence_length).
-            attention_mask (Optional[torch.Tensor]): Attention mask of shape (batch_size, sequence_length).
-            token_type_ids (Optional[torch.LongTensor]): Token type IDs. Not used.
-            position_ids (Optional[torch.LongTensor]): Position IDs of shape (batch_size, sequence_length).
-            past_key_values (Optional[Tuple[torch.FloatTensor]]): Past key values for efficient decoding.
-            inputs_embeds (Optional[torch.FloatTensor]): Pre-computed input embeddings.
-            use_cache (Optional[bool]): Whether to use the past key/values cache.
-            output_attentions (Optional[bool]): Whether to output attention weights.
-            output_hidden_states (Optional[bool]): Whether to output hidden states.
-            return_dict (Optional[bool]): Whether to return a ModelOutput object.
-
-        Returns:
-            Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]: Model outputs including
-            last hidden state, past key values (if applicable), all hidden states (if requested),
-            and attention weights (if requested).
-        """
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -179,8 +153,9 @@ class UncertainNN(nn.Module):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         if position_ids is None:
+            device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = torch.arange(
-                0, input_shape[-1], dtype=torch.long, device=input_ids.device
+                0, input_shape[-1], dtype=torch.long, device=device
             )
             position_ids = position_ids.unsqueeze(0).expand(input_shape)
 
@@ -200,35 +175,39 @@ class UncertainNN(nn.Module):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-            )
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    layer.__call__,
+                    hidden_states,
+                    attention_mask,
+                    output_attentions,
+                )
+            else:
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                )
+
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache += (layer_outputs[1:],)  # Collect all cache outputs
+                next_decoder_cache += (layer_outputs[1 if output_attentions else 1],)
 
-            if output_attentions and len(layer_outputs) > 1:
-                all_attentions += (
-                    layer_outputs[-1],
-                )  # Get the last element as attention weights
+            if output_attentions:
+                all_attentions += (layer_outputs[1],)
 
         hidden_states = self.final_layer_norm(hidden_states)
 
-        # Apply SentenceEncoder and SentenceGP only if the sequence is long enough
-        batch_size = hidden_states.shape[0]  # Get batch size directly
-        seq_len = hidden_states.shape[1]  # Get sequence length directly
-
+        # Apply SentenceEncoder and SentenceGP
+        batch_size, seq_len, _ = hidden_states.shape
         if seq_len >= self.config.max_position_embeddings:
-            # Calculate the number of sentences based on the sequence length and max_position_embeddings
             num_sentences = seq_len // self.config.max_position_embeddings
             remainder = seq_len % self.config.max_position_embeddings
 
             if remainder > 0:
-                # Pad the sequence length to be a multiple of max_position_embeddings
                 padding_needed = self.config.max_position_embeddings - remainder
-                hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, padding_needed))
+                hidden_states = F.pad(hidden_states, (0, 0, 0, padding_needed))
                 seq_len += padding_needed
 
             hidden_states = hidden_states.view(
@@ -236,26 +215,21 @@ class UncertainNN(nn.Module):
             )
             sentence_embeddings = self.sentence_encoder(hidden_states)
 
-            # Apply SentenceGP
             sentence_mean, sentence_var = self.sentence_gp(
                 sentence_embeddings, num_sentences
             )
 
             if self.training:
-                # During training, sample from the Gaussian distribution defined by sentence_mean and sentence_var
                 hidden_states = sentence_mean + torch.randn_like(
                     sentence_mean
                 ) * torch.sqrt(sentence_var)
             else:
-                # During evaluation, use the mean as the output
                 hidden_states = sentence_mean
 
-            # Flatten hidden_states back to the original shape for compatibility with subsequent layers
             hidden_states = hidden_states.view(batch_size, seq_len, -1)
-
-            # Remove padding if added
+            padding_needed = 0
             if remainder > 0:
-                hidden_states = hidden_states[:, :seq_len - padding_needed, :]
+                hidden_states = hidden_states[:, : seq_len - padding_needed, :]
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -279,85 +253,65 @@ class UncertainNN(nn.Module):
             attentions=all_attentions,
         )
 
-    def enable_gradient_checkpointing(self):
-        """
-        Enables gradient checkpointing for memory efficiency during training.
-        """
-        self.gradient_checkpointing = True
+    @classmethod
+    def _gradient_checkpointing_func(cls, func, *args, **kwargs):
+        return checkpoint(func, *args, **kwargs)
 
 
-class TemperatureSoftmaxLogitsProcessor(LogitsProcessor):
-    """
-    Processes the logits by applying a softmax with temperature scaling.
-
-    Args:
-        temperature (float): The temperature for scaling the logits before softmax.
-    """
-
-    def __init__(self, temperature=1.0):
-        self.temperature = temperature
-
-    def __call__(
-            self, input_ids: torch.LongTensor, scores: torch.FloatTensor
-    ) -> torch.Tensor:
-        """
-        Applies temperature scaling and softmax to the input scores.
-
-        Args:
-            input_ids (torch.LongTensor): The input token IDs. Not used in this processor.
-            scores (torch.FloatTensor): The logits to be processed.
-
-        Returns:
-            torch.Tensor: The processed logits after applying temperature scaling and softmax.
-        """
-        scores = scores / self.temperature
-
-        # Numerically stable softmax calculation
-        max_scores = scores.max(dim=-1, keepdim=True).values
-        exp_scores = torch.exp(scores - max_scores)
-        probs = exp_scores / exp_scores.sum(dim=-1, keepdim=True)
-        return torch.log(probs)  # Return log probabilities
-
-
-class UncertainTransformerLMHeadModel(PreTrainedModel, GenerationMixin):
-    """
-    Language Model with a Hybrid Transformer and Sentence-Level Uncertainty.
-
-    This model combines the UncertainNN with a language modeling head for text generation,
-    incorporating uncertainty estimation at the sentence level. It uses Hugging Face's
-    GenerationMixin for text generation capabilities.
-
-    Attributes:
-        config (UncertainTransformerConfig): Configuration object for the model.
-        transformer (UncertainNN): The main transformer model with uncertainty estimation.
-        lm_head (nn.Linear): Language modeling head for vocabulary projection.
-    """
-
-    def __init__(self, config: PretrainedConfig):
+class UncertainTransformerLMHeadModel(PreTrainedModel):
+    def __init__(self, config):
         super().__init__(config)
-        self.config = config
         self.transformer = UncertainNN(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        # Explicitly tell transformers that this is a decoder model with a language model head
+        self.config.is_decoder = True
+        # Access the _no_split_modules list from the config
+        self.config._no_split_modules += ["UncertainNN"]  # Prevent splitting the custom module
         self.tie_weights()
 
-        # This is important for generation
-        self.main_input_name = "input_ids"
+    def get_input_embeddings(self) -> nn.Module:
+        """
+        Returns the model's input embeddings.
 
-    def tie_weights(self):
-        """Tie the weights between the input embeddings and the output embeddings."""
-        self.lm_head.weight = self.transformer.embedding.weight
+        Returns:
+            `nn.Module`: A torch module mapping vocabulary to hidden states.
+        """
+        return self.transformer.embedding
 
-    def get_output_embeddings(self) -> nn.Linear:
-        """Get the output embeddings layer."""
+    def set_input_embeddings(self, value: nn.Module):
+        """
+        Set model's input embeddings.
+
+        Args:
+            value (`nn.Module`): A module mapping vocabulary to hidden states.
+        """
+        self.transformer.embedding = value
+
+    def get_output_embeddings(self) -> nn.Module:
+        """
+        Returns the model's output embeddings.
+
+        Returns:
+            `nn.Module`: A torch module mapping hidden states to vocabulary.
+        """
         return self.lm_head
 
-    def set_output_embeddings(self, new_embeddings: nn.Linear):
-        """Set the output embeddings layer."""
+    def set_output_embeddings(self, new_embeddings: nn.Module):
+        """
+        Set model's output embeddings.
+
+        Args:
+            value (`nn.Module`): A module mapping hidden states to vocabulary.
+            :param new_embeddings:
+        """
         self.lm_head = new_embeddings
 
-    def get_input_embeddings(self) -> nn.Embedding:
-        """Get the input embeddings layer."""
-        return self.transformer.embedding
+    def tie_weights(self):
+        """
+        Tie the weights between the input embeddings and the output layer.
+        """
+        if self.config.tie_word_embeddings:
+            self._tie_or_clone_weights(self.lm_head, self.transformer.embedding)
 
     def forward(
             self,
@@ -373,25 +327,6 @@ class UncertainTransformerLMHeadModel(PreTrainedModel, GenerationMixin):
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithCrossAttentions]:
-        """
-        Forward pass of the UncertainTransformerLMHeadModel.
-
-        Args:
-            input_ids (Optional[torch.LongTensor]): Input token IDs.
-            attention_mask (Optional[torch.FloatTensor]): Attention mask.
-            token_type_ids (Optional[torch.LongTensor]): Token type IDs.
-            position_ids (Optional[torch.LongTensor]): Position IDs.
-            past_key_values (Optional[List[torch.FloatTensor]]): Past key values for efficient decoding.
-            inputs_embeds (Optional[torch.FloatTensor]): Pre-computed input embeddings.
-            labels (Optional[torch.LongTensor]): Labels for language modeling.
-            use_cache (Optional[bool]): Whether to use the past key/values cache.
-            output_attentions (Optional[bool]): Whether to output attention weights.
-            output_hidden_states (Optional[bool]): Whether to output hidden states.
-            return_dict (Optional[bool]): Whether to return a ModelOutput object.
-
-        Returns:
-            Union[Tuple, CausalLMOutputWithCrossAttentions]: Model outputs including loss, logits, and other optional elements.
-        """
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
@@ -410,16 +345,12 @@ class UncertainTransformerLMHeadModel(PreTrainedModel, GenerationMixin):
         )
 
         hidden_states = transformer_outputs[0]
-
-        # Ensure logits are calculated for each token in the sequence
         logits = self.lm_head(hidden_states)
 
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
@@ -438,120 +369,5 @@ class UncertainTransformerLMHeadModel(PreTrainedModel, GenerationMixin):
             cross_attentions=transformer_outputs.cross_attentions,
         )
 
-    def prepare_inputs_for_generation(
-            self, input_ids, past=None, attention_mask=None, **kwargs
-    ):
-        """
-        Prepare inputs for generation. This method is used by Hugging Face's generation utilities.
-
-        Args:
-            input_ids (torch.LongTensor): Input token IDs.
-            past (Optional[List[torch.FloatTensor]]): Past key values for efficient decoding.
-            attention_mask (Optional[torch.LongTensor]): Attention mask.
-            **kwargs: Additional keyword arguments.
-
-        Returns:
-            dict: Dictionary of prepared inputs for generation.
-        """
-        # only last token for inputs_ids if past is defined in kwargs
-        if past:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-
-        return {
-            "input_ids": input_ids,
-            "past_key_values": past,
-            "use_cache": kwargs.get("use_cache"),
-            "attention_mask": attention_mask,
-        }
-
-    @staticmethod
-    def _reorder_cache(past, beam_idx):
-        """
-        Reorder the cache for beam search. This method is used by Hugging Face's generation utilities.
-
-        Args:
-            past (List[torch.Tensor]): Past key values.
-            beam_idx (torch.LongTensor): Beam indices.
-
-        Returns:
-            List[torch.Tensor]: Reordered past key values.
-        """
-        return tuple(layer_past.index_select(0, beam_idx) for layer_past in past)
-
-    def _update_model_kwargs_for_generation(
-            self,
-            outputs: ModelOutput,
-            model_kwargs: Dict[str, Any],
-            is_encoder_decoder: bool = False,
-            standardize_cache_format: bool = False,
-            num_new_tokens: int = 1,
-    ) -> Dict[str, Any]:
-        # update past_key_values
-        model_kwargs["past_key_values"] = self._extract_past_from_model_output(
-            outputs, standardize_cache_format=standardize_cache_format
-        )
-        if getattr(outputs, "state", None) is not None:
-            model_kwargs["state"] = outputs.state
-
-        # update token_type_ids with last value
-        if "token_type_ids" in model_kwargs:
-            token_type_ids = model_kwargs["token_type_ids"]
-            model_kwargs["token_type_ids"] = torch.cat(
-                [token_type_ids, token_type_ids[:, -1].unsqueeze(-1)], dim=-1
-            )
-
-        if not is_encoder_decoder:
-            # update attention mask
-            if "attention_mask" in model_kwargs:
-                attention_mask = model_kwargs["attention_mask"]
-                model_kwargs["attention_mask"] = torch.cat(
-                    [
-                        attention_mask,
-                        attention_mask.new_ones((attention_mask.shape[0], 1)),
-                    ],
-                    dim=-1,
-                )
-        else:
-            # update decoder attention mask
-            if "decoder_attention_mask" in model_kwargs:
-                decoder_attention_mask = model_kwargs["decoder_attention_mask"]
-                model_kwargs["decoder_attention_mask"] = torch.cat(
-                    [
-                        decoder_attention_mask,
-                        decoder_attention_mask.new_ones(
-                            (decoder_attention_mask.shape[0], 1)
-                        ),
-                    ],
-                    dim=-1,
-                )
-
-        if (
-                model_kwargs.get("use_cache", True)
-                and "cache_position" in model_kwargs
-                and model_kwargs["cache_position"] is not None
-        ):
-            model_kwargs["cache_position"] = (
-                    model_kwargs["cache_position"][-1:] + num_new_tokens
-            )
-
-        return model_kwargs
-
-    def _extract_past_from_model_output(
-            self, outputs: ModelOutput, standardize_cache_format: bool = False
-    ):
-        past = None
-        if "past_key_values" in outputs:
-            past = outputs.past_key_values
-        elif "mems" in outputs:
-            past = outputs.mems
-        elif "past_buckets_states" in outputs:
-            past = outputs.past_buckets_states
-
-        # Standardize the format of the cache
-        if standardize_cache_format and past is not None:
-            if isinstance(past[0], tuple):
-                past = tuple(tuple(torch.stack(p) for p in layer) for layer in past)
-            else:
-                past = tuple(p.transpose(1, 2) for p in past)
-
-        return past
+    def enable_gradient_checkpointing(self):
+        self.transformer.gradient_checkpointing = True

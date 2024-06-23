@@ -1,6 +1,7 @@
 # core/utils/utils.py
 import math
-from typing import List, Union
+from typing import List, Optional
+from typing import Union
 
 import torch
 from loguru import logger
@@ -34,34 +35,33 @@ def softplus(x: torch.Tensor) -> torch.Tensor:
 
 
 def generate_text(
-        model: PreTrainedModel,
-        tokenizer: GPT2Tokenizer,
-        prompt: str,
-        max_length: int = 1024,
-        temperature: float = 0.7,
-        top_k: int = 50,
-        top_p: float = 0.95,
-        repetition_penalty: float = 1.2,
-        num_return_sequences: int = 1,
-        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    model: PreTrainedModel,
+    tokenizer: GPT2Tokenizer,
+    prompt: str,
+    max_length: int = 1024,
+    temperature: float = 0.7,
+    top_k: int = 50,
+    top_p: float = 0.95,
+    repetition_penalty: float = 1.2,
+    num_return_sequences: int = 1,
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    pad_token_id: Optional[int] = None,
 ) -> List[str]:
     """
     Generates text using the provided model and tokenizer.
 
-    Handles the case where `do_sample=True` and `num_return_sequences > 1`
-    by replicating the input sequence to create a batch.
-
     Args:
-        model (UncertainTransformerLMHeadModel): The model to use for text generation.
+        model (PreTrainedModel): The model to use for text generation.
         tokenizer (GPT2Tokenizer): The tokenizer to use for encoding and decoding text.
         prompt (str): The initial text to start generation from.
-        max_length (int, optional): The maximum length of the generated text. Defaults to 1024.
-        temperature (float, optional): The temperature for sampling. Defaults to 0.7.
-        top_k (int, optional): The number of top-k tokens to consider during sampling. Defaults to 50.
-        top_p (float, optional): The cumulative probability threshold for nucleus sampling. Defaults to 0.95.
-        repetition_penalty (float, optional): The penalty for repeating tokens. Defaults to 1.2.
-        num_return_sequences (int, optional): The number of sequences to generate. Defaults to 1.
-        device (torch.device, optional): The device to run the model on. Defaults to CUDA if available, else CPU.
+        max_length (int): The maximum length of the generated text. Defaults to 1024.
+        temperature (float): The temperature for sampling. Defaults to 0.7.
+        top_k (int): The number of top-k tokens to consider during sampling. Defaults to 50.
+        top_p (float): The cumulative probability threshold for nucleus sampling. Defaults to 0.95.
+        repetition_penalty (float): The penalty for repeating tokens. Defaults to 1.2.
+        num_return_sequences (int): The number of sequences to generate. Defaults to 1.
+        device (torch.device): The device to run the model on. Defaults to CUDA if available, else CPU.
+        pad_token_id (Optional[int]): The ID of the padding token. If None, uses the model's pad_token_id.
 
     Returns:
         List[str]: The list of generated text sequences.
@@ -69,45 +69,78 @@ def generate_text(
     model.to(device)
     model.eval()
 
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    # Encode the prompt
+    try:
+        encoded_prompt = tokenizer.encode(
+            prompt, add_special_tokens=True, return_tensors="pt"
+        )
+        encoded_prompt = encoded_prompt.to(device)
+    except Exception as e:
+        logger.error(f"Error encoding prompt: {str(e)}")
+        return []
 
-    # Replicate the input sequence for the batch if num_return_sequences > 1
-    if num_return_sequences > 1:
-        input_ids = input_ids.repeat(num_return_sequences, 1)
-        attention_mask = torch.ones_like(input_ids)
-    else:
-        attention_mask = torch.ones_like(input_ids)  # Create the mask regardless of the number of sequences
+    # Set pad_token_id if not provided
+    if pad_token_id is None:
+        pad_token_id = (
+            getattr(model.config, "pad_token_id", None) or tokenizer.eos_token_id
+        )
 
-    generated_texts = []
+    # Log input shapes and devices for debugging
+    logger.info(f"Encoded prompt shape: {encoded_prompt.shape}")
+    logger.info(f"Encoded prompt device: {encoded_prompt.device}")
+    logger.info(f"Model device: {next(model.parameters()).device}")
+
     try:
         with torch.no_grad():
-            output = model.generate(
-                input_ids=input_ids,
+            output_sequences = model.generate(
+                input_ids=encoded_prompt,
                 max_length=max_length,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
+                do_sample=True,
                 num_return_sequences=num_return_sequences,
-                do_sample=True,  # Enable sampling
-                attention_mask=attention_mask  # Provide attention mask
+                pad_token_id=pad_token_id,
             )
-            generated_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in output]
-    except Exception as e:
-        logger.error(f"Error during generation: {str(e)}")
-        logger.error(f"Input shape: {input_ids.shape}")
-        logger.error(f"Input device: {input_ids.device}")
-        logger.error(f"Model device: {next(model.parameters()).device}")
-        raise
 
-    return generated_texts
+        # Decode the generated sequences
+        generated_texts = []
+        for generated_sequence in output_sequences:
+            generated_sequence = generated_sequence.tolist()
+            text = tokenizer.decode(
+                generated_sequence, clean_up_tokenization_spaces=True
+            )
+            text = text[
+                len(
+                    tokenizer.decode(
+                        encoded_prompt[0], clean_up_tokenization_spaces=True
+                    )
+                ) :
+            ]
+            generated_texts.append(text.strip())
+
+        return generated_texts
+
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            logger.error(f"CUDA out of memory error: {str(e)}")
+            torch.cuda.empty_cache()
+            return []
+        else:
+            logger.error(f"Runtime error during text generation: {str(e)}")
+            return []
+    except Exception as e:
+        logger.error(f"Error during text generation: {str(e)}")
+        logger.exception("Full traceback:")
+        return []
 
 
 def calculate_perplexity(
-        model: PreTrainedModel,
-        tokenizer: GPT2Tokenizer,
-        text: Union[str, List[str]],
-        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    model: PreTrainedModel,
+    tokenizer: GPT2Tokenizer,
+    text: Union[str, List[str]],
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ) -> Union[float, List[float]]:
     """
     Calculates the perplexity of the given text using the provided model and tokenizer,
