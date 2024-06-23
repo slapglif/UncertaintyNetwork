@@ -1,7 +1,7 @@
 import math
 from typing import Optional
 from typing import Tuple
-from loguru import logger
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -109,12 +109,16 @@ class PositionalEncoding(nn.Module):
         # Expand positional encoding to match input shape
         pos_encoding_mean = pos_encoding_mean.unsqueeze(0).expand(batch_size, -1, -1)
 
+        # Truncate positional encoding if it exceeds the sequence length
+        pos_encoding_mean = pos_encoding_mean[:, :seq_len, :]  # Add this line
+
         # Add positional encoding to input
         x = x + pos_encoding_mean
 
         # Add uncertainty during training
         if self.training:
             pos_encoding_var = pos_encoding_var.unsqueeze(0).expand(batch_size, -1, -1)
+            pos_encoding_var = pos_encoding_var[:, :seq_len, :]  # Add this line
             x = x + torch.randn_like(x) * pos_encoding_var.sqrt()
 
         return self.dropout(x)

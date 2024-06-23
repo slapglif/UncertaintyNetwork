@@ -1,8 +1,16 @@
 import torch
+import torch.nn as nn
+from loguru import logger
+from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 from transformers import LogitsProcessor, LogitsProcessorList
 from transformers import PreTrainedModel
 from transformers import PretrainedConfig
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+
+from core.models.embedding import PositionalEncoding, StableEmbedding
+from core.models.layers import TransformerEncoderLayer
 
 
 class UncertainTransformerConfig(PretrainedConfig):
@@ -76,17 +84,8 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.attribute_map = {"hidden_size": "d_model"}
 
 
-import torch.nn as nn
-from torch import Tensor
-from torch.utils.checkpoint import checkpoint
-from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
-from loguru import logger
-from core.models.embedding import PositionalEncoding, StableEmbedding
-from core.models.layers import TransformerEncoderLayer
-
-
 class UncertainTransformer(nn.Module):
-    def __init__(self, config: UncertainTransformerConfig):
+    def __init__(self, config: UncertainTransformerConfig | PretrainedConfig):
         super().__init__()
         self.config = config
         self.embedding = StableEmbedding(config.vocab_size, config.d_model,
@@ -190,6 +189,7 @@ class TemperatureSoftmaxLogitsProcessor(LogitsProcessor):
 class UncertainTransformerLMHeadModel(PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
+        self.gradient_checkpointing = None
         self.transformer = UncertainTransformer(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.temperature = getattr(config, 'temperature', 1.0)
