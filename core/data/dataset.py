@@ -110,7 +110,7 @@ class SlimPajamaDataset(IterableDataset):
         preprocessed_data = []
         chunk_size = min(10, len(batches))  # Process 10 batches at a time, or fewer if there are less than 10 batches
 
-        with limit_num_open_files(4096):  # Limit the number of open files
+        with limit_num_open_files(1024):  # Limit the number of open files
             for i in range(0, len(batches), chunk_size):
                 chunk = batches[i:i + chunk_size]
                 with mp.Pool(processes=self.num_workers) as pool:
