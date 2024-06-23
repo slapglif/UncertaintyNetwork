@@ -1,32 +1,31 @@
-from typing import Optional, List, Dict
+# core/data/datamodule.py
 
-import torch
+from typing import Optional
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
 from transformers import GPT2Tokenizer
 
 from core.data.dataset import SlimPajamaDataset
 
-
 class SlimPajamaDataModule(LightningDataModule):
     def __init__(
-            self,
-            tokenizer: GPT2Tokenizer,
-            max_length: int = 1024,
-            train_num_examples: int = 100000,
-            val_num_examples: int = 10000,
-            test_num_examples: int = 10000,
-            batch_size: int = 32,
-            streaming: bool = True
+        self,
+        tokenizer: GPT2Tokenizer,
+        max_length: int = 1024,
+        batch_size: int = 32,
+        num_workers: int = 4,
+        train_size: int = 100000,
+        val_size: int = 10000,
+        test_size: int = 10000,
     ):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.train_num_examples = train_num_examples
-        self.val_num_examples = val_num_examples
-        self.test_num_examples = test_num_examples
         self.batch_size = batch_size
-        self.streaming = streaming
+        self.num_workers = num_workers
+        self.train_size = train_size
+        self.val_size = val_size
+        self.test_size = test_size
 
     def setup(self, stage: Optional[str] = None):
         if stage == "fit" or stage is None:
@@ -34,13 +33,13 @@ class SlimPajamaDataModule(LightningDataModule):
                 split="train",
                 tokenizer=self.tokenizer,
                 max_length=self.max_length,
-                num_examples=self.train_num_examples,
+                num_examples=self.train_size,
             )
             self.val_dataset = SlimPajamaDataset(
                 split="validation",
                 tokenizer=self.tokenizer,
                 max_length=self.max_length,
-                num_examples=self.val_num_examples,
+                num_examples=self.val_size,
             )
 
         if stage == "test" or stage is None:
@@ -48,57 +47,30 @@ class SlimPajamaDataModule(LightningDataModule):
                 split="test",
                 tokenizer=self.tokenizer,
                 max_length=self.max_length,
-                num_examples=self.test_num_examples,
+                num_examples=self.test_size,
             )
 
-    def train_dataloader(self) -> DataLoader:
-        """
-        Creates and returns the training DataLoader.
-
-        Returns:
-            DataLoader: The DataLoader for the training dataset.
-        """
+    def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            num_workers=11 if self.streaming else 4,
-            collate_fn=self.collate_fn,
+            num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=True
+            shuffle=True,
         )
 
-    def val_dataloader(self) -> DataLoader:
-        """
-        Creates and returns the validation DataLoader.
-
-        Returns:
-            DataLoader: The DataLoader for the validation dataset.
-        """
+    def val_dataloader(self):
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
-            num_workers=11 if self.streaming else 4,
-            collate_fn=self.collate_fn,
+            num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=True
         )
 
-    def collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        """
-        Custom collate function for batching the data.
-
-        Args:
-            batch (List[Dict[str, torch.Tensor]]): A list of dictionaries containing the data samples.
-
-        Returns:
-            Dict[str, torch.Tensor]: A dictionary containing the batched tensors.
-        """
-        input_ids = torch.stack([item['input_ids'] for item in batch])
-        attention_mask = torch.stack([item['attention_mask'] for item in batch])
-        labels = torch.stack([item['labels'] for item in batch])
-
-        return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': labels
-        }
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
