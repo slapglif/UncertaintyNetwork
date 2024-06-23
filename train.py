@@ -70,7 +70,7 @@ class UncertainTransformerLightningModule(pl.LightningModule):
 
         if batch_idx == 0:
             sample_input_ids = input_ids[:1]
-            generated = self.model.generate(sample_input_ids, max_length=50)
+            generated = self.model.generate(sample_input_ids, max_new_tokens=50)
             generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
             self.logger.experiment.add_text("generated_text", generated_text, self.current_epoch)
 

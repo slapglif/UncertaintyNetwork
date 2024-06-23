@@ -1,7 +1,9 @@
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, List
+
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
+
 from core.data.dataset import SlimPajamaDataset
 from core.utils.tokenizer import Tokenizer
 
@@ -16,7 +18,7 @@ class SlimPajamaDataModule(pl.LightningDataModule):
             train_size: int = 100000,
             val_size: int = 10000,
             test_size: int = 10000,
-            streaming: bool = False,
+            streaming: bool = True,
     ):
         """
         Initialize the SlimPajamaDataModule.
@@ -75,75 +77,43 @@ class SlimPajamaDataModule(pl.LightningDataModule):
             )
 
     def train_dataloader(self) -> DataLoader:
-        """
-        Create and return the training DataLoader.
-
-        Returns:
-            DataLoader: The training DataLoader.
-        """
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
             shuffle=not self.streaming,
-            persistent_workers=True,
-            collate_fn=self.collate_fn,
+            collate_fn=self._collate_fn,
         )
 
     def val_dataloader(self) -> DataLoader:
-        """
-        Create and return the validation DataLoader.
-
-        Returns:
-            DataLoader: The validation DataLoader.
-        """
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=True,
-            collate_fn=self.collate_fn,
+            collate_fn=self._collate_fn,
         )
 
     def test_dataloader(self) -> DataLoader:
-        """
-        Create and return the test DataLoader.
-
-        Returns:
-            DataLoader: The test DataLoader.
-        """
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=True,
-            collate_fn=self.collate_fn,
+            collate_fn=self._collate_fn,
         )
 
-    def collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        """
-        Custom collate function to process batches.
-
-        Args:
-            batch (List[Dict[str, torch.Tensor]]): A list of samples from the dataset.
-
-        Returns:
-            Dict[str, torch.Tensor]: A dictionary containing the processed batch.
-        """
+    @staticmethod
+    def _collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         input_ids = [item['input_ids'] for item in batch]
         attention_mask = [item['attention_mask'] for item in batch]
         labels = [item['labels'] for item in batch]
 
-        # Get max length in the batch
         max_len = max(ids.size(0) for ids in input_ids)
 
-        # Pad sequences to the maximum length in the batch
         input_ids_padded = torch.stack([
-            torch.cat([ids, torch.full((max_len - ids.size(0),), self.tokenizer.pad_token_id, dtype=ids.dtype,
-                                       device=ids.device)])
+            torch.cat([ids, torch.full((max_len - ids.size(0),), 50256, dtype=ids.dtype, device=ids.device)])
             for ids in input_ids
         ])
         attention_mask_padded = torch.stack([
