@@ -4,7 +4,7 @@ from typing import List, Union
 
 import torch
 from loguru import logger
-from torch import Tensor
+from torch import Tensor, nn
 from transformers import PreTrainedModel, GPT2Tokenizer
 
 
@@ -48,6 +48,9 @@ def generate_text(
     """
     Generates text using the provided model and tokenizer.
 
+    Handles the case where `do_sample=True` and `num_return_sequences > 1`
+    by replicating the input sequence to create a batch.
+
     Args:
         model (UncertainTransformerLMHeadModel): The model to use for text generation.
         tokenizer (GPT2Tokenizer): The tokenizer to use for encoding and decoding text.
@@ -68,6 +71,10 @@ def generate_text(
 
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
 
+    # Replicate the input sequence for the batch if num_return_sequences > 1
+    if num_return_sequences > 1:
+        input_ids = input_ids.repeat(num_return_sequences, 1)
+
     generated_texts = []
     try:
         with torch.no_grad():
@@ -79,9 +86,9 @@ def generate_text(
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
                 num_return_sequences=num_return_sequences,
-                do_sample=True,
+                do_sample=True,  # Enable sampling
             )
-            generated_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in output] # Generate all sequences in one call
+            generated_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in output]
     except Exception as e:
         logger.error(f"Error during generation: {str(e)}")
         logger.error(f"Input shape: {input_ids.shape}")
@@ -99,21 +106,21 @@ def calculate_perplexity(
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ) -> Union[float, List[float]]:
     """
-    Calculates the perplexity of the given text using the provided model and tokenizer.
-
-    Perplexity is a measure of how well a language model predicts a sample of text.
-    Lower perplexity indicates better predictive performance.
+    Calculates the perplexity of the given text using the provided model and tokenizer,
+    specifically handling text generated using sampling.
 
     Args:
-        model (UncertainTransformerLMHeadModel): The model to use for perplexity calculation.
+        model (PreTrainedModel): The model to use for perplexity calculation.
         tokenizer (GPT2Tokenizer): The tokenizer to use for encoding and decoding text.
-        text (Union[str, List[str]]): The text to calculate the perplexity for. Can be a single string or a list of strings.
-        device (torch.device, optional): The device to run the model on. Defaults to CUDA if available, else CPU.
+        text (Union[str, List[str]]): The text to calculate the perplexity for.
+            Can be a single string or a list of strings.
+        device (torch.device, optional): The device to run the model on.
+            Defaults to CUDA if available, else CPU.
 
     Returns:
-        Union[float, List[float]]: The perplexity of the text. If the input `text` is a string, returns a float.
-                                   If `text` is a list of strings, returns a list of floats representing the perplexity
-                                   of each string in the list.
+        Union[float, List[float]]: The perplexity of the text. If the input `text` is a string,
+            returns a float. If `text` is a list of strings, returns a list of floats representing the
+            perplexity of each string in the list.
     """
     model.to(device)
     model.eval()
@@ -126,20 +133,28 @@ def calculate_perplexity(
     if not text.strip():
         raise ValueError("Input text is empty.")
 
-    input_ids = (
-        torch.tensor(tokenizer.encode(text, add_special_tokens=True))
-        .unsqueeze(0)
-        .to(device)
-    )
+    tokens = tokenizer.encode(text, add_special_tokens=True)
+    input_ids = torch.tensor(tokens).unsqueeze(0).to(device)
 
-    if input_ids.numel() == 0:
-        raise ValueError("No valid tokens in the input text.")
+    total_loss = 0.0
+    num_tokens = len(tokens) - 1  # Exclude the first token (start token)
+    loss_fct = nn.CrossEntropyLoss()
 
-    with torch.no_grad():
-        outputs = model(input_ids, labels=input_ids)
-        loss = outputs.loss
+    for i in range(1, len(tokens)):
+        # Take the sequence up to the current token
+        current_input_ids = input_ids[:, :i]
+        with torch.no_grad():
+            outputs = model(current_input_ids)
+            logits = outputs.logits
 
-    if torch.isnan(loss) or torch.isinf(loss):
-        raise ValueError(f"Invalid loss value: {loss.item()}. Check the model outputs.")
+        # Get the logits for the next token prediction
+        next_token_logits = logits[:, -1, :]
+        target = input_ids[:, i]
 
-    return math.exp(min(loss.item(), 100))
+        # Calculate the loss for this prediction
+        loss = loss_fct(next_token_logits, target)
+        total_loss += loss.item()
+
+    # Calculate average loss and perplexity
+    avg_loss = total_loss / num_tokens
+    return math.exp(min(avg_loss, 100))

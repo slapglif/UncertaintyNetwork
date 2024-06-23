@@ -130,6 +130,7 @@ class UncertainNN(nn.Module):
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
+        # sourcery skip: low-code-quality
         """
         Forward pass of the UncertainNN model.
 
@@ -215,50 +216,46 @@ class UncertainNN(nn.Module):
 
         hidden_states = self.final_layer_norm(hidden_states)
 
-        # Apply SentenceEncoder
+        # Apply SentenceEncoder and SentenceGP only if the sequence is long enough
         batch_size = hidden_states.shape[0]  # Get batch size directly
         seq_len = hidden_states.shape[1]  # Get sequence length directly
 
-        # Calculate the number of sentences based on the sequence length and max_position_embeddings
-        num_sentences = seq_len // self.config.max_position_embeddings
-        remainder = seq_len % self.config.max_position_embeddings
+        if seq_len >= self.config.max_position_embeddings:
+            # Calculate the number of sentences based on the sequence length and max_position_embeddings
+            num_sentences = seq_len // self.config.max_position_embeddings
+            remainder = seq_len % self.config.max_position_embeddings
 
-        if remainder > 0:
-            # Pad the sequence length to be a multiple of max_position_embeddings
-            padding_needed = self.config.max_position_embeddings - remainder
-            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, padding_needed))
-            seq_len += padding_needed
+            if remainder > 0:
+                # Pad the sequence length to be a multiple of max_position_embeddings
+                padding_needed = self.config.max_position_embeddings - remainder
+                hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, padding_needed))
+                seq_len += padding_needed
 
-        # If num_sentences is 0, it means the sequence is shorter than max_position_embeddings.
-        # In this case, we treat the entire sequence as one sentence.
-        if num_sentences == 0:
-            num_sentences = 1
+            hidden_states = hidden_states.view(
+                batch_size, num_sentences, self.config.max_position_embeddings, -1
+            )
+            sentence_embeddings = self.sentence_encoder(hidden_states)
 
-        hidden_states = hidden_states.view(
-            batch_size, num_sentences, self.config.max_position_embeddings, -1
-        )
-        sentence_embeddings = self.sentence_encoder(hidden_states)
+            # Apply SentenceGP
+            sentence_mean, sentence_var = self.sentence_gp(
+                sentence_embeddings, num_sentences
+            )
 
-        # Apply SentenceGP
-        sentence_mean, sentence_var = self.sentence_gp(
-            sentence_embeddings, num_sentences
-        )
+            if self.training:
+                # During training, sample from the Gaussian distribution defined by sentence_mean and sentence_var
+                hidden_states = sentence_mean + torch.randn_like(
+                    sentence_mean
+                ) * torch.sqrt(sentence_var)
+            else:
+                # During evaluation, use the mean as the output
+                hidden_states = sentence_mean
 
-        if self.training:
-            # During training, sample from the Gaussian distribution defined by sentence_mean and sentence_var
-            hidden_states = sentence_mean + torch.randn_like(
-                sentence_mean
-            ) * torch.sqrt(sentence_var)
-        else:
-            # During evaluation, use the mean as the output
-            hidden_states = sentence_mean
+            # Flatten hidden_states back to the original shape for compatibility with subsequent layers
+            hidden_states = hidden_states.view(batch_size, seq_len, -1)
 
-        # Flatten hidden_states back to the original shape for compatibility with subsequent layers
-        hidden_states = hidden_states.view(batch_size, seq_len, -1)
-
-        # Remove padding if added
-        if remainder > 0:
-            hidden_states = hidden_states[:, :seq_len - padding_needed, :]
+            # Remove padding if added
+            if remainder > 0:
+                hidden_states = hidden_states[:, :seq_len - padding_needed, :]
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
