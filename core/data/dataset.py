@@ -84,9 +84,11 @@ class SlimPajamaDataset(IterableDataset):
             item = self.process_queue.get(timeout=5)
             item['labels'] = item['input_ids'].clone()
             return item
-        except Queue.empty:
-            self.stop_event.set()
-            raise StopIteration
+        except Exception as e:
+            logger.error(e)
+            if self.process_queue.empty():
+                self.stop_event.set()
+                raise StopIteration
 
     def __len__(self):
         return self.num_examples
