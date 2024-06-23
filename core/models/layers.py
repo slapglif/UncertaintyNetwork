@@ -1,37 +1,18 @@
-# Importing the key components from your FasterKAN implementation
+# core/models/layers.py
 
 import math
-from typing import Optional, Any
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
+from loguru import logger
+from transformers import PretrainedConfig
 
 from core.fasterkan.fasterkan_basis import ReflectionalSwitchFunction, SplineLinear
-from core.models.uncertain_nn import UncertainTransformerConfig
 
 
 class MultiHeadAttention(nn.Module):
-    """
-    Multi-Head Attention layer with Sliding Window Attention (SWA) support.
-
-    This module implements multi-head attention, optionally with Sliding Window Attention
-    for efficient processing of long sequences.
-
-
-
-    Example:
-        >>> config = UncertainTransformerConfig(d_model=512, n_heads=8, max_position_embeddings=1024, ...)
-        >>> attention_layer = MultiHeadAttention(config)
-        >>> x = torch.randn(1, 100, 512) # Example input tensor
-        >>> attention_mask = torch.ones(1, 100) # Example attention mask
-        >>> outputs = attention_layer(x, attention_mask, use_cache=False)
-        >>> print(outputs[0].shape)
-        torch.Size([1, 100, 512])
-    """
-
     def __init__(self, config):
         super().__init__()
         self.d_model = config.d_model
@@ -45,37 +26,30 @@ class MultiHeadAttention(nn.Module):
 
         self.dropout = nn.Dropout(config.dropout)
         self.window_size = (
-            config.max_position_embeddings // 2
+                config.max_position_embeddings // 2
         )  # Example: Window size is half the max_position_embeddings
 
-    # noinspection PyTypeChecker
     def forward(
-        self,
-        x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        _: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
+            self,
+            x: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            _: Optional[torch.Tensor] = None,
+            past_key_value: Optional[Tuple[torch.Tensor]] = None,
+            output_attentions: bool = False,
+            use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        batch_size, seq_len, _ = x.shape
+        batch_size, seq_len, d_model = x.shape
+
+        logger.info(f"MultiHeadAttention input shape: {x.shape}")
 
         # Project input into query, key, and value matrices
-        q = (
-            self.W_q(x)
-            .view(batch_size, seq_len, self.n_heads, self.d_k)
-            .transpose(1, 2)
-        )
-        k = (
-            self.W_k(x)
-            .view(batch_size, seq_len, self.n_heads, self.d_k)
-            .transpose(1, 2)
-        )
-        v = (
-            self.W_v(x)
-            .view(batch_size, seq_len, self.n_heads, self.d_k)
-            .transpose(1, 2)
-        )
+        q = self.W_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        k = self.W_k(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        v = self.W_v(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+
+        logger.info(f"Query shape: {q.shape}")
+        logger.info(f"Key shape: {k.shape}")
+        logger.info(f"Value shape: {v.shape}")
 
         # Cache key and value tensors if use_cache is True
         if past_key_value is not None:
@@ -101,11 +75,10 @@ class MultiHeadAttention(nn.Module):
 
         # Weighted sum of values
         attn_output = torch.matmul(attn_probs, v)
-        attn_output = (
-            attn_output.transpose(1, 2)
-            .contiguous()
-            .view(batch_size, seq_len, self.d_model)
-        )
+        logger.info(f"Attention output shape before transpose: {attn_output.shape}")
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len,
+                                                                    d_model)  # combined transpose and view
+        logger.info(f"Attention output shape after transpose: {attn_output.shape}")
 
         # Final linear projection
         output = self.W_o(attn_output)
@@ -117,7 +90,7 @@ class MultiHeadAttention(nn.Module):
             return output, past_key_value, None
 
     def _apply_sliding_window_attention(
-        self, attn_scores: torch.Tensor
+            self, attn_scores: torch.Tensor
     ) -> torch.Tensor:
         """
         Applies sliding window attention to the attention scores.
@@ -137,8 +110,8 @@ class MultiHeadAttention(nn.Module):
 
         # Pad attention scores to handle cases where seq_len is not a multiple of window_size
         padding_len = (
-            self.window_size - (seq_len % self.window_size)
-        ) % self.window_size
+                              self.window_size - (seq_len % self.window_size)
+                      ) % self.window_size
         attn_scores = F.pad(
             attn_scores, (0, padding_len, 0, padding_len), value=float("-inf")
         )
@@ -187,7 +160,7 @@ class PositionwiseFeedForward(nn.Module):
 
 
     Example:
-        >>> config = UncertainTransformerConfig(d_model=512, d_ff=2048, ...)
+        >>> config = PretrainedConfig(d_model=512, d_ff=2048, ...)
         >>> ff_network = PositionwiseFeedForward(config)
         >>> x = torch.randn(1, 100, 512)  # Example input tensor
         >>> output = ff_network(x)
@@ -230,11 +203,11 @@ class GaussianProcessLayer(nn.Module):
     """
 
     def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        n_inducing: int = 10,
-        embedding_dim: int = 512,
+            self,
+            in_features: int,
+            out_features: int,
+            n_inducing: int = 10,
+            embedding_dim: int = 512,
     ):
         super().__init__()
         self.in_features = in_features
@@ -252,7 +225,7 @@ class GaussianProcessLayer(nn.Module):
         self.noise = nn.Parameter(torch.tensor(0.1))  # Learnable noise parameter
 
     def forward(
-        self, x: torch.Tensor, seq_len: int
+            self, x: torch.Tensor, seq_len: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the Gaussian Process layer.
@@ -341,26 +314,11 @@ class CEMA(nn.Module):
         return torch.stack(output, dim=1)
 
 
+# In core/models/layers.py
+
+
 class MambaLayer(nn.Module):
-    """
-    Mamba layer for sequence modeling with selective state space modeling.
-
-    This layer implements the Mamba architecture, which uses a selective
-    state space model for efficient sequence processing. It includes
-    mechanisms for adaptive time decay and efficient convolution operations.
-
-    Attributes:
-        config (UncertainTransformerConfig): Configuration object for the layer.
-        in_proj (nn.Linear): Input projection layer.
-        conv (nn.Conv1d): Depthwise convolution layer.
-        x_proj (nn.Linear): Projection for input-dependent parameters.
-        dt (nn.Parameter): Learnable time decay parameter.
-        A (nn.Parameter): State transition matrix.
-        D (nn.Parameter): Output projection matrix.
-        out_proj (nn.Linear): Output projection layer.
-    """
-
-    def __init__(self, config):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
         self.d_model = config.d_model
@@ -368,9 +326,18 @@ class MambaLayer(nn.Module):
         self.d_conv = config.d_conv
         self.expand_factor = config.expand_factor
         self.d_inner = int(self.expand_factor * self.d_model)
-        self.dt_rank = config.dt_rank or math.ceil(self.d_model / 16)
 
-        self.in_proj = nn.Linear(self.d_model, self.d_inner)
+        logger.info(
+            f"MambaLayer init: d_model={self.d_model}, d_state={self.d_state}, d_inner={self.d_inner}"
+        )
+
+        # Input projection
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2)
+        self.in_proj_bias = nn.Parameter(
+            torch.randn(self.d_inner, self.d_state)
+        )  # This is 'B' in the paper
+
+        # Convolution layer
         self.conv = nn.Conv1d(
             self.d_inner,
             self.d_inner,
@@ -378,103 +345,123 @@ class MambaLayer(nn.Module):
             padding=self.d_conv - 1,
             groups=self.d_inner,
         )
-        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * self.d_state)
 
-        # Initialize A, D, and dt
-        self.A = nn.Parameter(torch.randn(self.d_inner, self.d_state))
+        # Activation function
+        self.activation = nn.SiLU()
+
+        # Projections for Δ, B, and C
+        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2)
+
+        # Learnable parameters
+        self.dt = nn.Parameter(torch.randn(self.d_inner))
+        self.A = nn.Parameter(torch.randn(self.d_state, self.d_state))
         self.D = nn.Parameter(torch.ones(self.d_inner))
-        self.dt = nn.Parameter(torch.rand(self.dt_rank))
-        self._initialize_dt()
 
+        # Output projection
         self.out_proj = nn.Linear(self.d_inner, self.d_model)
 
-    def _initialize_dt(self):
-        """Initialize the dt parameter within the specified range."""
-        nn.init.uniform_(
-            self.dt, a=math.log(self.config.dt_min), b=math.log(self.config.dt_max)
-        )
-        self.dt.data.exp_()
-
-    def _selective_scan(
-        self,
-        x: torch.Tensor,
-        delta: torch.Tensor,
-        A: torch.Tensor,
-        B: torch.Tensor,
-        C: torch.Tensor,
-        D: torch.Tensor,
-        z: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Perform the selective scan operation for the Mamba layer.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_inner).
-            delta (torch.Tensor): Time decay tensor of shape (batch_size, seq_len, d_inner).
-            A (torch.Tensor): State transition matrix of shape (d_inner, d_state).
-            B (torch.Tensor): Input projection matrix of shape (batch_size, seq_len, d_state).
-            C (torch.Tensor): Output projection matrix of shape (batch_size, seq_len, d_state).
-            D (torch.Tensor): Direct feedthrough matrix of shape (d_inner,).
-            z (Optional[torch.Tensor]): Optional initial state.
-
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_inner).
-        """
-        batch_size, seq_len, _ = x.shape
-
-        # Initialize state
-        if z is None:
-            z = torch.zeros(batch_size, self.d_state, device=x.device, dtype=x.dtype)
-
-        output = []
-        for t in range(seq_len):
-            # Update state
-            z = torch.einsum(
-                "bd,bud->bu", z, torch.exp(-torch.clamp(delta[:, t] * A, min=-5, max=5))
-            )
-            z = z + torch.einsum("bud,bd->bu", B[:, t].unsqueeze(1), x[:, t])
-
-            # Compute output
-            y = torch.einsum("bu,bud->bd", z, C[:, t].unsqueeze(1))
-            y = y + D * x[:, t]
-            output.append(y)
-
-        return torch.stack(output, dim=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Forward pass of the Mamba layer.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+            x (torch.Tensor): The input tensor of shape (batch_size, sequence_length, d_model).
 
         Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_model).
+            torch.Tensor: The output tensor of shape (batch_size, sequence_length, d_model).
         """
-        batch_size, seq_len, _ = x.shape
+        batch_size, seq_len, d_model = x.shape
+        logger.info(f"MambaLayer forward: input shape = {x.shape}")
 
-        # Project input
-        x = self.in_proj(x)
+        # Input projection and splitting
+        x_and_res = self.in_proj(x)
+        x, res = x_and_res.chunk(2, dim=-1)
 
-        # Apply short convolution for local context
-        x_conv = self.conv(x.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
+        # Apply convolution
+        x = x.transpose(1, 2)
+        x = self.conv(x)[:, :, :seq_len]
+        x = x.transpose(1, 2)
 
-        # Project for delta, B, and C
-        x_dbc = self.x_proj(x_conv)
-        delta, B, C = torch.split(
-            x_dbc, [self.dt_rank, self.d_state, self.d_state], dim=-1
+        # Apply activation
+        x = self.activation(x)
+
+        # Project x and split into B and C
+        x_dbl = self.x_proj(x)
+        B, C = x_dbl.chunk(2, dim=-1)
+
+        # Compute Δ
+        dt = torch.exp(self.dt.unsqueeze(0).unsqueeze(0))  # Shape: (1, 1, d_inner)
+        logger.info(f"MambaLayer: dt shape after exp = {dt.shape}")
+
+        # Apply selective scan
+        y = self._selective_scan(x, dt, self.A, B, C, self.D)
+
+        # Add residual connection
+        y = y + res
+
+        # Final projection
+        return self.out_proj(y)
+
+    def _selective_scan(
+            self,
+            x: torch.Tensor,
+            dt: torch.Tensor,
+            A: torch.Tensor,
+            B: torch.Tensor,
+            C: torch.Tensor,
+            D: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Performs the selective scan operation within the Mamba layer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, sequence_length, d_inner).
+            dt (torch.Tensor): Time step tensor of shape (1, 1, d_inner).
+            A (torch.Tensor): Learnable parameter matrix of shape (d_state, d_state).
+            B (torch.Tensor): Projected input tensor of shape (batch_size, sequence_length, d_state).
+            C (torch.Tensor): Projected input tensor of shape (batch_size, sequence_length, d_state).
+            D (torch.Tensor): Learnable parameter vector of shape (d_inner).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, sequence_length, d_inner).
+        """
+        batch_size, seq_len, d_inner = x.shape
+        d_state = A.shape[0]
+
+        # Ensure dt has the correct dimensions
+        dt = dt[:, :, :d_state]  # Adjust dt to match the d_state dimension
+
+        logger.info(
+            f"_selective_scan: x shape = {x.shape}, dt shape = {dt.shape}, A shape = {A.shape}, B shape = {B.shape}, C shape = {C.shape}, D shape = {D.shape}"
         )
 
-        # Compute delta
-        delta = F.softplus(delta @ self.dt)
+        x = x * D.unsqueeze(0).unsqueeze(0)  # Apply element-wise scaling with D
+        h = torch.zeros(
+            batch_size, seq_len, d_state, device=x.device
+        )  # Initialize hidden state
+        hs = []  # List to store hidden states
 
-        # Perform selective scan
-        y = self._selective_scan(x, delta, self.A, B, C, self.D)
+        for i in range(seq_len):
+            # Adjust A to match the dimensions of dt for broadcasting
+            A_t = torch.exp(dt[:, :, i % dt.size(2)] * A.unsqueeze(0).unsqueeze(0))
 
-        # Project output
-        y = self.out_proj(y)
+            # Calculate the next hidden state using the modified A_t and input projections B, C
+            h[:, i, :] = torch.tanh(
+                torch.matmul(A_t, h[:, i - 1, :].unsqueeze(-1)).squeeze(-1)
+                + B[:, i, :] * h[:, i - 1, :]
+                + C[:, i, :]
+            )
+            hs.append(h[:, i, :])
 
-        return y
+        # Stack the hidden states
+        hs = torch.stack(hs, dim=1)  # Shape: (batch_size, sequence_length, d_state)
+
+        # Expand hs to match the d_inner dimension
+        hs = hs.repeat(
+            1, 1, d_inner // d_state
+        )  # Use repeat instead of expand to match dimensions correctly
+
+        return hs
 
 
 class SentenceEncoder(nn.Module):
@@ -496,7 +483,7 @@ class SentenceEncoder(nn.Module):
     """
 
     def __init__(
-        self, input_dim: int, hidden_dim: int, output_dim: int, num_grids: int = 8
+            self, input_dim: int, hidden_dim: int, output_dim: int, num_grids: int = 8
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -553,7 +540,7 @@ class SentenceGP(nn.Module):
     """
 
     def __init__(
-        self, input_dim: int, output_dim: int, n_inducing: int, embedding_dim: int
+            self, input_dim: int, output_dim: int, n_inducing: int, embedding_dim: int
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -588,7 +575,7 @@ class SentenceGP(nn.Module):
         return torch.exp(-0.5 * dist / torch.exp(self.log_lengthscale).pow(2))
 
     def forward(
-        self, x: torch.Tensor, num_sentences: int
+            self, x: torch.Tensor, num_sentences: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the SentenceGP.
@@ -629,124 +616,46 @@ class SentenceGP(nn.Module):
         return mean, F.softplus(var)  # Ensure positive variance
 
 
+# In core/models/layers.py
+
 class TransformerEncoderLayer(nn.Module):
-    """
-    Transformer Encoder Layer with optional Mamba integration and CEMA.
-
-    This layer implements a flexible transformer encoder that can use either
-    standard self-attention or Mamba for sequence modeling, followed by a
-    feedforward network and CEMA for enhanced temporal dependency modeling.
-
-    Attributes:
-        config (UncertainTransformerConfig): Configuration object for the layer.
-        self_attn (nn.MultiheadAttention): Multi-head self-attention layer (if not using Mamba).
-        mamba (MambaLayer): Mamba layer for sequence modeling (if using Mamba).
-        ff_layer (nn.Sequential): Feedforward network.
-        cema (CEMA): Conditional Embedding with Memory Augmentation layer.
-        layer_norm1 (nn.LayerNorm): Layer normalization before self-attention or Mamba.
-        layer_norm2 (nn.LayerNorm): Layer normalization before feedforward network.
-        layer_norm3 (nn.LayerNorm): Layer normalization after CEMA.
-        dropout (nn.Dropout): Dropout layer.
-    """
-
-    def __init__(self, config: UncertainTransformerConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
-
-        if not config.use_mamba:
-            self.self_attn = nn.MultiheadAttention(
-                config.d_model, config.n_heads, dropout=config.dropout, batch_first=True
-            )
-        else:
-            self.mamba = MambaLayer(config)
-
-        self.ff_layer = nn.Sequential(
-            nn.Linear(config.d_model, config.d_ff),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.d_ff, config.d_model),
-            nn.Dropout(config.dropout),
-        )
-
-        self.cema = CEMA(config.d_model)
-
+        self.attention = MultiHeadAttention(config)
+        self.mamba_layer = MambaLayer(config)
+        self.feed_forward = PositionwiseFeedForward(config)
         self.layer_norm1 = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.layer_norm2 = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.layer_norm3 = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout)
 
-        if config.use_flash_attention and not config.use_mamba:
-            try:
-                from flash_attn import flash_attn_func
-
-                self.flash_attn = flash_attn_func
-            except ImportError:
-                print(
-                    "Flash Attention is not available. Falling back to standard attention."
-                )
-                self.flash_attn = None
-        else:
-            self.flash_attn = None
-
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-    ) -> tuple[Tensor | Any]:
-        """
-        Forward pass of the TransformerEncoderLayer.
+            self,
+            x: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        logger.info(f"TransformerEncoderLayer input shape: {x.shape}")  # Added logging
 
-        Args:
-            hidden_states (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
-            attention_mask (Optional[torch.Tensor]): Attention mask of shape (batch_size, seq_len).
-            position_ids (Optional[torch.Tensor]): Position IDs of shape (batch_size, seq_len).
-            past_key_value (Optional[Tuple[torch.Tensor]]): Cached key and value tensor for incremental decoding.
-            output_attentions (bool): Whether to output attention weights.
-            use_cache (bool): Whether to use cached key and value tensors.
+        if x.dim() == 2:
+            x = x.unsqueeze(0)  # Add batch dimension if missing
+            logger.info(f"TransformerEncoderLayer input shape after unsqueeze: {x.shape}")  # Added logging
 
-        Returns:
-            Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-                - Output tensor of shape (batch_size, seq_len, d_model)
-                - Attention weights (if output_attentions is True)
-                - Cached key and value tensors (if use_cache is True)
-        """
-        residual = hidden_states
-        hidden_states = self.layer_norm1(hidden_states)
+        residual = x
+        x = self.layer_norm1(x)
+        attention_outputs = self.attention(x, attention_mask=attention_mask)
+        x = attention_outputs[0]
+        x = residual + self.dropout(x)
 
-        if self.config.use_mamba:
-            hidden_states = self.mamba(hidden_states)
-            attn_weights = None  # Mamba doesn't produce attention weights
+        residual = x
+        x = self.layer_norm2(x)
+        mamba_outputs = self.mamba_layer(x)
+        x = mamba_outputs[0] if isinstance(mamba_outputs, tuple) else mamba_outputs
+        x = residual + self.dropout(x)
 
-        elif self.flash_attn is not None and attention_mask is None:
-            hidden_states = self.flash_attn(hidden_states, hidden_states, hidden_states)
-        else:
-            hidden_states, attn_weights = self.self_attn(
-                hidden_states,
-                hidden_states,
-                hidden_states,
-                attn_mask=attention_mask,
-                need_weights=output_attentions,
-            )
-        hidden_states = residual + self.dropout(hidden_states)
-        residual = hidden_states
-        hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.ff_layer(hidden_states)
-        hidden_states = residual + self.dropout(hidden_states)
+        residual = x
+        x = self.layer_norm3(x)
+        x = self.feed_forward(x)
+        x = residual + self.dropout(x)
 
-        # Apply CEMA
-        residual = hidden_states
-        hidden_states = self.layer_norm3(hidden_states)
-        hidden_states = self.cema(hidden_states)
-        hidden_states = residual + self.dropout(hidden_states)
-
-        outputs = (hidden_states,)
-        if output_attentions:
-            outputs += (attn_weights,)
-        if use_cache:
-            outputs += (past_key_value,)
-
-        return outputs
+        return x

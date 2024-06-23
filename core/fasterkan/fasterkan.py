@@ -1,11 +1,9 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
 from typing import *
-from torch.autograd import Function
-from feature_extractor import EnhancedFeatureExtractor
+
+import torch.nn as nn
+
 from fasterkan_layers import FasterKANLayer
+from feature_extractor import EnhancedFeatureExtractor
 
 
 class FasterKAN(nn.Module):
@@ -43,12 +41,6 @@ class FasterKAN(nn.Module):
                 for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])
             ]
         )
-        # print(f"FasterKAN layers_hidden[1:] shape: ", len(layers_hidden[1:]))
-        # print(f"FasterKAN layers_hidden[:-1] shape: ", len(layers_hidden[:-1]))
-        # print("FasterKAN zip shape: \n", *[(in_dim, out_dim) for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])])
-
-        # print(f"FasterKAN self.faster_kan_layers shape: \n", len(self.layers))
-        # print(f"FasterKAN self.faster_kan_layers: \n", self.layers)
 
     def forward(self, x):
         for layer in self.layers:
@@ -69,11 +61,12 @@ class FasterKANvolver(nn.Module):
         inv_denominator: float = 0.5,
         train_grid: bool = False,
         train_inv_denominator: bool = False,
-        # use_base_update: bool = True,
         base_activation=None,
         spline_weight_init_scale: float = 1.0,
-        view=[-1, 1, 28, 28],
+        view=None,
     ) -> None:
+        if view is None:
+            view = [-1, 1, 28, 28]
         super(FasterKANvolver, self).__init__()
 
         self.view = view
@@ -94,11 +87,6 @@ class FasterKANvolver(nn.Module):
 
         # Update layers_hidden with the correct input size from conv layers
         layers_hidden = [flat_features] + layers_hidden
-        # print(f"FasterKANvolver layers_hidden shape: \n", layers_hidden)
-        # print(f"FasterKANvolver layers_hidden[1:] shape: ", len(layers_hidden[1:]))
-        # print(f"FasterKANvolver layers_hidden[:-1] shape: ", len(layers_hidden[:-1]))
-        # print("FasterKANvolver zip shape: \n", *[(in_dim, out_dim) for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])])
-
         # Define the FasterKAN layers
         self.faster_kan_layers = nn.ModuleList(
             [
@@ -119,27 +107,18 @@ class FasterKANvolver(nn.Module):
                 for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])
             ]
         )
-        # print(f"FasterKANvolver self.faster_kan_layers shape: \n", len(self.faster_kan_layers))
-        # print(f"FasterKANvolver self.faster_kan_layers: \n", self.faster_kan_layers)
 
     def forward(self, x):
         # Reshape input from [batch_size, 784] to [batch_size, 1, 28, 28] for MNIST [batch_size, 1, 32, 32] for C
-        # print(f"FasterKAN x view shape: {x.shape}")
+
         # Handle different input shapes based on the length of view
         x = x.view(self.view[0], self.view[1], self.view[2], self.view[3])
-        # print(f"FasterKAN x view shape: {x.shape}")
-        # Apply convolutional layers
-        # print(f"FasterKAN x view shape: {x.shape}")
         x = self.feature_extractor(x)
-        # print(f"FasterKAN x after feature_extractor shape: {x.shape}")
+
         x = x.view(x.size(0), -1)  # Flatten the output from the conv layers
-        # rint(f"FasterKAN x shape: {x.shape}")
 
         # Pass through FasterKAN layers
         for layer in self.faster_kan_layers:
-            # print("FasterKAN layer: \n", layer)
-            # print(f"FasterKAN x shape: {x.shape}")
             x = layer(x)
-            # print(f"FasterKAN x shape: {x.shape}")
 
         return x

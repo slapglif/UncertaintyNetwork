@@ -13,3 +13,16 @@ def _check_nan_inf(tensor: Tensor, message: str):
     """
     if torch.isnan(tensor).any() or torch.isinf(tensor).any():
         logger.warning(f"NaN or Inf detected in {message}.")
+
+
+def softplus(x: torch.Tensor) -> torch.Tensor:
+    """
+    Implements the softplus activation function.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+
+    Returns:
+        torch.Tensor: Output tensor after applying softplus.
+    """
+    return torch.log(1 + torch.exp(x))

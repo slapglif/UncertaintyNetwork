@@ -1,12 +1,10 @@
+# core/models/uncertain_nn.py
 from typing import Any, Dict
 from typing import List
 from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from loguru import logger
-from torch import Tensor
-from torch.utils.checkpoint import checkpoint
 from transformers import LogitsProcessor
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.generation import GenerationMixin
@@ -19,51 +17,10 @@ from core.models.layers import (
     TransformerEncoderLayer,
     SentenceEncoder,
     SentenceGP,
-    MambaLayer,
 )
 
 
 class UncertainTransformerConfig(PretrainedConfig):
-    """
-    Configuration class for the Uncertain Transformer model.
-
-    This configuration class defines the hyperparameters for the Uncertain Transformer model,
-    including architectural choices and training options.
-
-    Attributes:
-        vocab_size (int): Size of the vocabulary.
-        d_model (int): Dimension of the model's hidden states.
-        n_heads (int): Number of attention heads.
-        d_ff (int): Dimension of the feedforward network.
-        n_layers (int): Number of transformer layers.
-        dropout (float): Dropout probability.
-        max_position_embeddings (int): Maximum sequence length the model can handle.
-        layer_norm_epsilon (float): Epsilon value for layer normalization.
-        initializer_range (float): Standard deviation of the truncated normal initializer.
-        use_cache (bool): Whether to use the past key/values cache for decoding.
-        pad_token_id (int): ID of the padding token.
-        bos_token_id (int): ID of the beginning-of-sentence token.
-        eos_token_id (int): ID of the end-of-sentence token.
-        tie_word_embeddings (bool): Whether to tie input and output embeddings.
-        use_mamba (bool): Whether to use Mamba layers instead of attention.
-        d_state (int): Dimension of the state space in Mamba layers.
-        d_conv (int): Kernel size for convolutions in Mamba layers.
-        expand_factor (float): Expansion factor for Mamba layers.
-        dt_rank (Optional[int]): Rank of the Δ matrix in Mamba layers.
-        dt_min (float): Minimum value for Δt in Mamba layers.
-        dt_max (float): Maximum value for Δt in Mamba layers.
-        dt_init (str): Initialization method for Δt in Mamba layers.
-        dt_scale (float): Scaling factor for Δt initialization.
-        dt_init_floor (float): Minimum value for Δt initialization.
-        use_flash_attention (bool): Whether to use Flash Attention for efficiency.
-        temperature (float): Temperature for generation sampling.
-        top_k (int): Top-k value for sampling during generation.
-        top_p (float): Top-p value for nucleus sampling during generation.
-        repetition_penalty (float): Penalty for token repetition during generation.
-        length_penalty (float): Penalty based on generated sequence length.
-        num_beams (int): Number of beams for beam search.
-    """
-
     model_type = "uncertain_transformer"
 
     def __init__(
@@ -81,7 +38,7 @@ class UncertainTransformerConfig(PretrainedConfig):
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
-        use_mamba=False,
+        use_mamba=True,
         d_state=16,
         d_conv=4,
         expand_factor=2.0,
@@ -93,6 +50,7 @@ class UncertainTransformerConfig(PretrainedConfig):
         dt_init_floor=1e-4,
         use_flash_attention=False,
         n_inducing=10,
+        use_gelu_approximation=False,  # Add this line
         **kwargs,
     ):
         super().__init__(
@@ -124,33 +82,17 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.dt_init_floor = dt_init_floor
         self.use_flash_attention = use_flash_attention
         self.n_inducing = n_inducing
+        self.use_gelu_approximation = use_gelu_approximation  # Add this line
 
     @property
     def hidden_size(self):
         return self.d_model
 
 
+# In core/models/uncertain_nn.py
+
+
 class UncertainNN(nn.Module):
-    """
-    Uncertain Neural Network model implementing a hybrid transformer architecture
-    with Mamba layers, SentenceEncoder, and SentenceGP for uncertainty estimation.
-
-    This model combines transformer layers with uncertainty estimation techniques,
-    allowing for both standard attention mechanisms and Mamba layers for sequence modeling,
-    followed by sentence-level encoding and Gaussian Process uncertainty estimation.
-
-    Attributes:
-        config (UncertainTransformerConfig): Configuration object for the model.
-        embedding (nn.Embedding): Token embedding layer.
-        position_embedding (nn.Embedding): Positional embedding layer.
-        layer_norm (nn.LayerNorm): Layer normalization for embeddings.
-        dropout (nn.Dropout): Dropout layer.
-        layers (nn.ModuleList): List of transformer or Mamba layers.
-        final_layer_norm (nn.LayerNorm): Final layer normalization.
-        sentence_encoder (SentenceEncoder): Encoder for sentence-level representations.
-        sentence_gp (SentenceGP): Gaussian Process for sentence-level uncertainty estimation.
-    """
-
     def __init__(self, config: UncertainTransformerConfig):
         super().__init__()
         self.config = config
@@ -162,14 +104,9 @@ class UncertainNN(nn.Module):
         self.layer_norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout)
 
-        if config.use_mamba:
-            self.layers = nn.ModuleList(
-                [MambaLayer(config) for _ in range(config.n_layers)]
-            )
-        else:
-            self.layers = nn.ModuleList(
-                [TransformerEncoderLayer(config) for _ in range(config.n_layers)]
-            )
+        self.layers = nn.ModuleList(
+            [TransformerEncoderLayer(config) for _ in range(config.n_layers)]
+        )
 
         self.final_layer_norm = nn.LayerNorm(
             config.d_model, eps=config.layer_norm_epsilon
@@ -196,16 +133,16 @@ class UncertainNN(nn.Module):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
-        # sourcery skip: low-code-quality
         """
         Forward pass of the UncertainNN model.
 
         Args:
             input_ids (torch.Tensor): Input token IDs of shape (batch_size, sequence_length).
             attention_mask (Optional[torch.Tensor]): Attention mask of shape (batch_size, sequence_length).
-            position_ids (Optional[torch.Tensor]): Position IDs of shape (batch_size, sequence_length).
-            past_key_values (Optional[Tuple[torch.Tensor]]): Past key values for efficient decoding.
-            inputs_embeds (Optional[torch.Tensor]): Pre-computed input embeddings.
+            token_type_ids (Optional[torch.LongTensor]): Token type IDs. Not used.
+            position_ids (Optional[torch.LongTensor]): Position IDs of shape (batch_size, sequence_length).
+            past_key_values (Optional[Tuple[torch.FloatTensor]]): Past key values for efficient decoding.
+            inputs_embeds (Optional[torch.FloatTensor]): Pre-computed input embeddings.
             use_cache (Optional[bool]): Whether to use the past key/values cache.
             output_attentions (Optional[bool]): Whether to output attention weights.
             output_hidden_states (Optional[bool]): Whether to output hidden states.
@@ -268,20 +205,16 @@ class UncertainNN(nn.Module):
             layer_outputs = layer(
                 hidden_states,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=(
-                    past_key_values[i] if past_key_values is not None else None
-                ),
-                output_attentions=output_attentions,
-                use_cache=use_cache,
             )
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache += (layer_outputs[1],)
+                next_decoder_cache += (layer_outputs[1:],)  # Collect all cache outputs
 
-            if output_attentions:
-                all_attentions += (layer_outputs[2 if use_cache else 1],)
+            if output_attentions and len(layer_outputs) > 1:
+                all_attentions += (
+                    layer_outputs[-1],
+                )  # Get the last element as attention weights
 
         hidden_states = self.final_layer_norm(hidden_states)
 
@@ -326,56 +259,6 @@ class UncertainNN(nn.Module):
             hidden_states=all_hidden_states,
             attentions=all_attentions,
         )
-
-    def _forward_transformer(
-        self,
-        hidden_states,
-        attention_mask,
-        position_ids,
-        past_key_values,
-        use_cache,
-        output_attentions,
-        output_hidden_states,
-    ):
-        """
-        Forward pass through the Transformer encoder layers.
-        """
-        for i, layer in enumerate(self.layers):
-            # Apply gradient checkpointing if enabled
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = checkpoint(
-                    layer,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_values[i] if past_key_values is not None else None,
-                    output_attentions,
-                    use_cache,
-                )
-            else:
-                layer_outputs = layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    past_key_value=(
-                        past_key_values[i] if past_key_values is not None else None
-                    ),
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                )
-            hidden_states = layer_outputs[0]
-
-            # Check for NaN/Inf values
-            self._check_nan_inf(hidden_states, f"Hidden states after layer {i}")
-
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
-
-    def _check_nan_inf(self, tensor: Tensor, message: str):
-        """
-        Checks for NaN/Inf values in a tensor and logs a warning.
-        """
-        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-            logger.warning(f"NaN or Inf detected in {message}.")
 
     def enable_gradient_checkpointing(self):
         """
@@ -535,7 +418,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel, GenerationMixin):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past=None, attention_mask=None, **kwargs
+            self, input_ids, past=None, attention_mask=None, **kwargs
     ):
         """
         Prepare inputs for generation. This method is used by Hugging Face's generation utilities.

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fasterkan_basis import ReflectionalSwitchFunction, SplineLinear
+from core.fasterkan.fasterkan_basis import ReflectionalSwitchFunction, SplineLinear
 
 
 class FasterKANLayer(nn.Module):
@@ -43,40 +43,12 @@ class FasterKANLayer(nn.Module):
         #    self.base_linear = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
-        # print("Shape before LayerNorm:", x.shape)  # Debugging line to check the input shape
         x = self.layernorm(x)
-        # print("Shape After LayerNorm:", x.shape)
-        spline_basis = self.rbf(x).view(x.shape[0], -1)
-        # print("spline_basis:", spline_basis.shape)
 
-        # print("-------------------------")
-        # ret = 0
-        ret = self.spline_linear(spline_basis)
-        # print("spline_basis.shape[:-2]:", spline_basis.shape[:-2])
-        # print("*spline_basis.shape[:-2]:", *spline_basis.shape[:-2])
-        # print("spline_basis.view(*spline_basis.shape[:-2], -1):", spline_basis.view(*spline_basis.shape[:-2], -1).shape)
-        # print("ret:", ret.shape)
-        # print("-------------------------")
-        # if self.use_base_update:
-        # base = self.base_linear(self.base_activation(x))
-        # print("self.base_activation(x):", self.base_activation(x).shape)
-        # print("base:", base.shape)
-        # print("@@@@@@@@@")
-        # ret += base
-        return ret
+        spline_basis = self.rbf(x).view(x.shape[0], -1)
+        return self.spline_linear(spline_basis)
 
         # spline_basis = spline_basis.reshape(x.shape[0], -1)  # Reshape to [batch_size, input_dim * num_grids]
-        # print("spline_basis:", spline_basis.shape)
-
-        # spline_weight = self.spline_weight.view(-1, self.spline_weight.shape[0])  # Reshape to [input_dim * num_grids, output_dim]
-        # print("spline_weight:", spline_weight.shape)
-
-        # spline = torch.matmul(spline_basis, spline_weight)  # Resulting shape: [batch_size, output_dim]
-
-        # print("-------------------------")
-        # print("Base shape:", base.shape)
-        # print("Spline shape:", spline.shape)
-        # print("@@@@@@@@@")
 
 
 class FasterKAN(nn.Module):
@@ -114,17 +86,9 @@ class FasterKAN(nn.Module):
                 for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])
             ]
         )
-        # print(f"FasterKAN layers_hidden[1:] shape: ", len(layers_hidden[1:]))
-        # print(f"FasterKAN layers_hidden[:-1] shape: ", len(layers_hidden[:-1]))
-        # print("FasterKAN zip shape: \n", *[(in_dim, out_dim) for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])])
-
-        # print(f"FasterKAN self.faster_kan_layers shape: \n", len(self.layers))
-        # print(f"FasterKAN self.faster_kan_layers: \n", self.layers)
 
     def forward(self, x):
         for layer in self.layers:
-            # print("FasterKAN layer: \n", layer)
-            # print(f"FasterKAN x shape: {x.shape}")
             x = layer(x)
         return x
 
@@ -295,10 +259,6 @@ class FasterKANvolver(nn.Module):
 
         # Update layers_hidden with the correct input size from conv layers
         layers_hidden = [flat_features] + layers_hidden
-        # print(f"FasterKANvolver layers_hidden shape: \n", layers_hidden)
-        # print(f"FasterKANvolver layers_hidden[1:] shape: ", len(layers_hidden[1:]))
-        # print(f"FasterKANvolver layers_hidden[:-1] shape: ", len(layers_hidden[:-1]))
-        # print("FasterKANvolver zip shape: \n", *[(in_dim, out_dim) for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])])
 
         # Define the FasterKAN layers
         self.faster_kan_layers = nn.ModuleList(
@@ -320,26 +280,20 @@ class FasterKANvolver(nn.Module):
                 for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])
             ]
         )
-        # print(f"FasterKANvolver self.faster_kan_layers shape: \n", len(self.faster_kan_layers))
-        # print(f"FasterKANvolver self.faster_kan_layers: \n", self.faster_kan_layers)
 
     def forward(self, x):
         # Reshape input from [batch_size, 784] to [batch_size, 1, 28, 28] for MNIST [batch_size, 1, 32, 32] for C
-        # print(f"FasterKAN x view shape: {x.shape}")
+
         x = x.view(-1, 3, 32, 32)
-        # print(f"FasterKAN x view shape: {x.shape}")
+
         # Apply convolutional layers
-        # print(f"FasterKAN x view shape: {x.shape}")
+
         x = self.feature_extractor(x)
-        # print(f"FasterKAN x after feature_extractor shape: {x.shape}")
+
         x = x.view(x.size(0), -1)  # Flatten the output from the conv layers
-        # rint(f"FasterKAN x shape: {x.shape}")
 
         # Pass through FasterKAN layers
         for layer in self.faster_kan_layers:
-            # print("FasterKAN layer: \n", layer)
-            # print(f"FasterKAN x shape: {x.shape}")
             x = layer(x)
-            # print(f"FasterKAN x shape: {x.shape}")
 
         return x

@@ -1,1 +1,1 @@
-from .fasterkan import FasterKAN, FasterKANLayer, FasterKANvolver
+from core.fasterkan.fasterkan_layers import FasterKAN, FasterKANLayer, FasterKANvolver
