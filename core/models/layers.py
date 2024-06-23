@@ -1,5 +1,4 @@
 # core/models/layers.py
-
 from typing import Optional, Tuple, Union
 
 import torch
@@ -10,23 +9,6 @@ from transformers import PretrainedConfig
 
 
 class MultiHeadAttention(nn.Module):
-    """
-    Multi-Head Attention module.
-
-    This module performs multi-head attention on the input tensor.
-
-    Attributes:
-        d_model (int): The dimension of the model.
-        n_heads (int): The number of attention heads.
-        d_k (int): The dimension of keys and queries in each head.
-        W_q (nn.Linear): Linear transformation for queries.
-        W_k (nn.Linear): Linear transformation for keys.
-        W_v (nn.Linear): Linear transformation for values.
-        W_o (nn.Linear): Linear transformation for output.
-        dropout (nn.Dropout): Dropout layer.
-        window_size (int): Size of the sliding window for attention.
-    """
-
     def __init__(self, config):
         super().__init__()
         self.d_model = config.d_model
@@ -39,7 +21,7 @@ class MultiHeadAttention(nn.Module):
         self.W_o = nn.Linear(config.d_model, config.d_model)
 
         self.dropout = nn.Dropout(config.dropout)
-        self.window_size = config.max_position_embeddings // 2
+        self.window_size = config.sliding_window_size
 
     def forward(
             self,
@@ -49,76 +31,26 @@ class MultiHeadAttention(nn.Module):
             output_attentions: bool = False,
             use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor]], Optional[torch.Tensor]]:
-        """
-        Forward pass of the Multi-Head Attention module.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
-            attention_mask (Optional[torch.Tensor]): Attention mask of shape (batch_size, seq_len).
-            past_key_value (Optional[Tuple[torch.Tensor]]): Tuple of past key and value states.
-            output_attentions (bool): Whether to output attention weights.
-            use_cache (bool): Whether to use cached key/value states.
-
-        Returns:
-            Tuple[torch.Tensor, Optional[Tuple[torch.Tensor]], Optional[torch.Tensor]]:
-                - Output tensor of shape (batch_size, seq_len, d_model).
-                - Optional tuple of present key and value states.
-                - Optional attention weights.
-        """
-        # Ensure input has 3 dimensions (batch_size, seq_len, d_model)
-        if x.dim() == 2:
-            x = x.unsqueeze(0)
-
         batch_size, seq_len, _ = x.shape
 
-        logger.info(f"MultiHeadAttention input shape: {x.shape}")
-
         # Linear transformations
-        q = (
-            self.W_q(x)
-            .view(batch_size, seq_len, self.n_heads, self.d_k)
-            .transpose(1, 2)
-        )
-        k = (
-            self.W_k(x)
-            .view(batch_size, seq_len, self.n_heads, self.d_k)
-            .transpose(1, 2)
-        )
-        v = (
-            self.W_v(x)
-            .view(batch_size, seq_len, self.n_heads, self.d_k)
-            .transpose(1, 2)
-        )
-
-        logger.info(f"Query shape: {q.shape}")
-        logger.info(f"Key shape: {k.shape}")
-        logger.info(f"Value shape: {v.shape}")
+        q = self.W_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        k = self.W_k(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        v = self.W_v(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
 
         if past_key_value is not None:
             k = torch.cat([past_key_value[0], k], dim=2)
             v = torch.cat([past_key_value[1], v], dim=2)
-        else:
-            past_key_value = (k, v)
 
         # Compute attention scores
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k ** 0.5)
 
-        # Apply sliding window attention if necessary
-        if self.window_size < seq_len:
-            attn_scores = self._apply_sliding_window_attention(attn_scores)
+        # Apply sliding window attention
+        attn_scores = self._apply_sliding_window_attention(attn_scores)
 
         # Apply attention mask if provided
         if attention_mask is not None:
-            logger.info(f"Original attention mask shape: {attention_mask.shape}")
-
-            # Ensure attention_mask has the correct dimensions (batch_size, 1, 1, seq_len)
-            attention_mask = self._prepare_attention_mask(
-                attention_mask, batch_size, seq_len
-            )
-
-            logger.info(f"Attention mask shape after reshaping: {attention_mask.shape}")
-            logger.info(f"Attention scores shape: {attn_scores.shape}")
-
+            attention_mask = self._prepare_attention_mask(attention_mask, batch_size, seq_len)
             attn_scores = attn_scores.masked_fill(attention_mask == 0, float("-inf"))
 
         # Compute attention probabilities
@@ -127,15 +59,7 @@ class MultiHeadAttention(nn.Module):
 
         # Compute output
         attn_output = torch.matmul(attn_probs, v)
-        logger.info(f"Attention output shape before transpose: {attn_output.shape}")
-
-        attn_output = (
-            attn_output.transpose(1, 2)
-            .contiguous()
-            .view(batch_size, seq_len, self.d_model)
-        )
-        logger.info(f"Attention output shape after transpose: {attn_output.shape}")
-
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         output = self.W_o(attn_output)
 
         # Prepare outputs
@@ -145,95 +69,62 @@ class MultiHeadAttention(nn.Module):
         else:
             return output, present_key_value, None
 
-    def _apply_sliding_window_attention(
-            self, attn_scores: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Apply sliding window attention to the attention scores.
-
-        Args:
-            attn_scores (torch.Tensor): Attention scores of shape (batch_size, n_heads, seq_len, seq_len).
-
-        Returns:
-            torch.Tensor: Modified attention scores with sliding window attention applied.
-        """
+    def _apply_sliding_window_attention(self, attn_scores: torch.Tensor) -> torch.Tensor:
         batch_size, n_heads, seq_len, _ = attn_scores.shape
 
+        # If sequence length is less than or equal to window size, no need to apply sliding window
+        if seq_len <= self.window_size:
+            return attn_scores
+
         # Create causal mask
-        causal_mask = torch.tril(
-            torch.ones(seq_len, seq_len, device=attn_scores.device)
-        ).bool()
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=attn_scores.device)).bool()
 
-        # Pad attention scores if necessary
-        padding_len = (
-                              self.window_size - (seq_len % self.window_size)
-                      ) % self.window_size
-        attn_scores = F.pad(
-            attn_scores, (0, padding_len, 0, padding_len), value=float("-inf")
-        )
-        padded_len = seq_len + padding_len
-
-        # Reshape attention scores for sliding window
+        # Reshape attention scores and causal mask for sliding window
         attn_scores = attn_scores.view(
             batch_size,
             n_heads,
-            padded_len // self.window_size,
+            seq_len // self.window_size,
             self.window_size,
-            padded_len // self.window_size,
+            seq_len // self.window_size,
+            self.window_size,
+        )
+        causal_mask = causal_mask.view(
+            seq_len // self.window_size,
+            self.window_size,
+            seq_len // self.window_size,
             self.window_size,
         )
 
         # Apply causal mask
         attn_scores = attn_scores.masked_fill(
-            ~causal_mask.view(
-                1,
-                1,
-                padded_len // self.window_size,
-                self.window_size,
-                padded_len // self.window_size,
-                self.window_size,
-            ),
+            ~causal_mask.unsqueeze(0).unsqueeze(0),
             float("-inf"),
         )
 
-        # Apply softmax and reshape back
-        attn_scores = F.softmax(attn_scores, dim=-1)
-        attn_scores = attn_scores.view(batch_size, n_heads, padded_len, padded_len)
-
-        # Remove padding
-        attn_scores = attn_scores[:, :, :seq_len, :seq_len]
+        # Reshape back
+        attn_scores = attn_scores.view(batch_size, n_heads, seq_len, seq_len)
 
         return attn_scores
 
-    @classmethod
-    def _prepare_attention_mask(
-            cls, attention_mask: torch.Tensor, batch_size: int, seq_len: int
-    ) -> torch.Tensor:
+    @staticmethod
+    def _prepare_attention_mask(attention_mask: torch.Tensor, batch_size: int, seq_len: int) -> torch.Tensor:
         """
-        Prepare the attention mask to have the correct shape and dimensions.
+        Prepare the attention mask for multi-head attention.
 
         Args:
-            attention_mask (torch.Tensor): The original attention mask.
-            batch_size (int): The batch size of the input.
-            seq_len (int): The sequence length of the input.
+            attention_mask (torch.Tensor): The attention mask tensor.
+            batch_size (int): The batch size.
+            seq_len (int): The sequence length.
 
         Returns:
-            torch.Tensor: The prepared attention mask of shape (batch_size, 1, 1, seq_len).
+            torch.Tensor: The prepared attention mask.
         """
         if attention_mask.dim() == 2:
-            attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+            # Resize the attention mask to have dimensions [batch_size, 1, 1, seq_len]
+            attention_mask = attention_mask.view(batch_size, 1, 1, seq_len)
         elif attention_mask.dim() == 3:
-            attention_mask = attention_mask.unsqueeze(1)
-
-        # Adjust batch size if necessary
-        if attention_mask.size(0) != batch_size:
-            attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
-
-        # Adjust sequence length if necessary
-        if attention_mask.size(-1) != seq_len:
-            attention_mask = F.pad(
-                attention_mask, (0, seq_len - attention_mask.size(-1)), value=0
-            )
+            # Resize the attention mask to have dimensions [batch_size, 1, seq_len, seq_len]
+            attention_mask = attention_mask.view(batch_size, 1, seq_len, seq_len)
 
         return attention_mask
 
@@ -401,7 +292,7 @@ class CEMA(nn.Module):
 
 
 class MambaLayer(nn.Module):
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.d_model = config.d_model
@@ -410,7 +301,7 @@ class MambaLayer(nn.Module):
         self.expand_factor = config.expand_factor
         self.d_inner = int(self.expand_factor * self.d_model)
 
-        logger.info(
+        logger.debug(
             f"MambaLayer init: d_model={self.d_model}, d_state={self.d_state}, d_inner={self.d_inner}"
         )
 
@@ -444,17 +335,8 @@ class MambaLayer(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, self.d_model)
 
     def forward(self, x: torch.Tensor, **_) -> torch.Tensor:
-        """
-        Forward pass of the Mamba layer.
-
-        Args:
-            x (torch.Tensor): The input tensor of shape (batch_size, sequence_length, d_model).
-
-        Returns:
-            torch.Tensor: The output tensor of shape (batch_size, sequence_length, d_model).
-        """
-        batch_size, seq_len, d_model = x.shape
-        logger.info(f"MambaLayer forward: input shape = {x.shape}")
+        batch_size, seq_len, _ = x.shape
+        logger.debug(f"MambaLayer forward: input shape = {x.shape}")
 
         # Input projection and splitting
         x_and_res = self.in_proj(x)
@@ -474,7 +356,7 @@ class MambaLayer(nn.Module):
 
         # Compute Δ
         dt = torch.exp(self.dt.unsqueeze(0).unsqueeze(0))  # Shape: (1, 1, d_inner)
-        logger.info(f"MambaLayer: dt shape after exp = {dt.shape}")
+        logger.debug(f"MambaLayer: dt shape after exp = {dt.shape}")
 
         # Apply selective scan
         y = self._selective_scan(x, dt, self.A, B, C, self.D)
@@ -495,57 +377,28 @@ class MambaLayer(nn.Module):
             C: torch.Tensor,
             D: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Performs the selective scan operation within the Mamba layer.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, sequence_length, d_inner).
-            dt (torch.Tensor): Time step tensor of shape (1, 1, d_inner).
-            A (torch.Tensor): Learnable parameter matrix of shape (d_state, d_state).
-            B (torch.Tensor): Projected input tensor of shape (batch_size, sequence_length, d_state).
-            C (torch.Tensor): Projected input tensor of shape (batch_size, sequence_length, d_state).
-            D (torch.Tensor): Learnable parameter vector of shape (d_inner).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, sequence_length, d_inner).
-        """
         batch_size, seq_len, d_inner = x.shape
         d_state = A.shape[0]
 
         # Ensure dt has the correct dimensions
-        dt = dt[:, :, :d_state]  # Adjust dt to match the d_state dimension
+        dt = dt[:, :, :d_state]
 
-        logger.info(
-            f"_selective_scan: x shape = {x.shape}, dt shape = {dt.shape}, A shape = {A.shape}, B shape = {B.shape}, C shape = {C.shape}, D shape = {D.shape}"
-        )
+        logger.debug(
+            f"_selective_scan: x shape = {x.shape}, dt shape = {dt.shape}, A shape = {A.shape}, B shape = {B.shape}, C shape = {C.shape}, D shape = {D.shape}")
 
-        x = x * D.unsqueeze(0).unsqueeze(0)  # Apply element-wise scaling with D
-        h = torch.zeros(
-            batch_size, seq_len, d_state, device=x.device
-        )  # Initialize hidden state
-        hs = []  # List to store hidden states
+        x = x * D.unsqueeze(0).unsqueeze(0)
 
+        h = torch.zeros(batch_size, d_state, device=x.device)
+
+        hs = []
         for i in range(seq_len):
-            # Adjust A to match the dimensions of dt for broadcasting
-            A_t = torch.exp(dt[:, :, i % dt.size(2)] * A.unsqueeze(0).unsqueeze(0))
+            u = x[:, i, :]
+            A_t = torch.exp(dt[:, :, i % dt.size(2)] * A)
+            h = torch.tanh(A_t @ h.unsqueeze(-1)).squeeze(-1) + B[:, i, :] * h + C[:, i, :]
+            hs.append(h)
 
-            # Calculate the next hidden state using the modified A_t and input projections B, C
-            h[:, i, :] = torch.tanh(
-                torch.matmul(A_t, h[:, i - 1, :].unsqueeze(-1)).squeeze(-1)
-                + B[:, i, :] * h[:, i - 1, :]
-                + C[:, i, :]
-            )
-            hs.append(h[:, i, :])
-
-        # Stack the hidden states
-        hs = torch.stack(hs, dim=1)  # Shape: (batch_size, sequence_length, d_state)
-
-        # Expand hs to match the d_inner dimension
-        hs = hs.repeat(
-            1, 1, d_inner // d_state
-        )  # Use repeat instead of expand to match dimensions correctly
-
-        return hs
+        hs = torch.stack(hs, dim=1)
+        return hs.repeat_interleave(d_inner // d_state, dim=-1)
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -567,7 +420,7 @@ class TransformerEncoderLayer(nn.Module):
             output_attentions: Optional[bool] = False,
             past_key_value: Optional[Tuple[torch.Tensor]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple[torch.Tensor]]]:
-        logger.info(f"TransformerEncoderLayer input shape: {x.shape}")
+        logger.debug(f"TransformerEncoderLayer input shape: {x.shape}")
 
         if x.dim() == 2:
             x = x.unsqueeze(0)  # Add batch dimension

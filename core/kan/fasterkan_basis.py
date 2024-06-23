@@ -38,8 +38,6 @@ class RSWAFFunction(Function):
 
         # Compute the backward pass for grid
         if ctx.train_grid:
-            # print('\n')
-            # print(f"grad_grid shape: {grad_grid.shape }")
             grad_grid = -inv_denominator * grad_output.sum(dim=0).sum(
                 dim=0
             )  # -(inv_denominator * grad_output * tanh_diff_deriviative).sum(dim=0) #-inv_denominator * grad_output.sum(dim=0).sum(dim=0)

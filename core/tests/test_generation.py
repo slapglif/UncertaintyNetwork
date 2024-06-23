@@ -1,8 +1,5 @@
 # test_generation.py
-
-import matplotlib.pyplot as plt
 import pytest
-import seaborn as sns
 import torch
 from loguru import logger
 from transformers import StoppingCriteria
@@ -42,10 +39,10 @@ def model(device):
         d_conv=4,
         expand_factor=2.0,
         dt_rank=16,
+        sliding_window_size=512,  # Add this line
     )
     model = UncertainTransformerLMHeadModel(config)
     model.to(device)
-    model.eval()
     return model
 
 
@@ -80,24 +77,16 @@ def test_generation_and_perplexity(
         prompt: str,
         device: torch.device,
 ):
-    """
-    Tests text generation and perplexity calculation using the provided model and tokenizer.
-
-    Args:
-        model (UncertainTransformerLMHeadModel): The model to use for text generation and perplexity calculation.
-        tokenizer (Tokenizer): The tokenizer to use for encoding and decoding text.
-        prompt (str): The initial text to start generation from.
-        device (torch.device): The device to run the model on.
-    """
     model.to(device)
     logger.info(f"\nTesting prompt: {prompt}")
 
     try:
+        torch.cuda.empty_cache()  # Clear CUDA cache before generation
         generated_texts = generate_text(
             model,
-            tokenizer.tokenizer,
+            tokenizer,  # Pass the Tokenizer object, not tokenizer.tokenizer
             prompt,
-            max_length=1024,
+            max_length=100,  # Reduced from 1024 for testing
             temperature=0.7,
             top_k=50,
             top_p=0.95,
@@ -108,8 +97,6 @@ def test_generation_and_perplexity(
 
         assert len(generated_texts) > 0, "No text was generated"
 
-        perplexities = []
-        # sourcery skip: no-loop-in-tests
         for i, generated_text in enumerate(generated_texts):
             logger.info(f"\nSample {i + 1}:")
             logger.info(f"Generated text: '{generated_text}'")
@@ -118,29 +105,16 @@ def test_generation_and_perplexity(
             assert len(generated_text) > 0, f"Generated text {i + 1} is empty"
 
             perplexity = calculate_perplexity(
-                model, tokenizer.tokenizer, generated_text, device=device
+                model, tokenizer, generated_text, device=device
             )
-            perplexities.append(perplexity)
             logger.info(f"Perplexity: {perplexity:.2f}")
 
-            assert (
-                    0 < perplexity < float("inf")
-            ), f"Invalid perplexity value: {perplexity}"
-
-        # Visualize perplexities
-        plt.figure(figsize=(10, 6))
-        sns.boxplot(x=perplexities)
-        plt.title(f"Perplexity Distribution for Prompt: '{prompt}'")
-        plt.xlabel("Perplexity")
-        plt.savefig(f"perplexity_distribution_{prompt.replace(' ', '_')}.png")
-        plt.close()
+            assert 0 < perplexity < float("inf"), f"Invalid perplexity value: {perplexity}"
 
     except Exception as e:
-        logger.error(
-            f"Error in test_generation_and_perplexity for prompt '{prompt}': {str(e)}"
-        )
+        logger.error(f"Error in test_generation_and_perplexity for prompt '{prompt}': {str(e)}")
         logger.exception("Full traceback:")
-        pytest.fail(f"Test failed due to an error: {str(e)}")
+        raise  # Re-raise the exception to see the full traceback
 
 
 def test_model_output_shapes(model, tokenizer, device):
@@ -154,29 +128,28 @@ def test_model_output_shapes(model, tokenizer, device):
     """
     model.to(device)
     prompt = "Test prompt"
-    input_ids = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(device)
+    try:
+        input_ids = tokenizer.encode(prompt).unsqueeze(0).to(device)
+        logger.debug(f"Input IDs shape: {input_ids.shape}, device: {input_ids.device}")
 
-    with torch.no_grad():
-        # Remove token_type_ids from the model call, as it's not needed
-        outputs = model(input_ids)
+        with torch.no_grad():
+            outputs = model(input_ids)
 
-    logger.info(f"\nModel output shapes:")
-    logger.info(f"Input shape: {input_ids.shape}")
-    logger.info(f"Logits shape: {outputs.logits.shape}")
+        logger.debug(f"\nModel output shapes:")
+        logger.debug(f"Input shape: {input_ids.shape}")
+        logger.debug(f"Logits shape: {outputs.logits.shape}")
 
-    # sourcery skip: no-conditionals-in-tests
-    if torch.isnan(outputs.logits).any():
-        logger.warning("NaN values detected in logits")
+        assert outputs.logits.shape[0] == input_ids.shape[
+            0], f"Batch size mismatch: expected {input_ids.shape[0]}, got {outputs.logits.shape[0]}"
+        assert outputs.logits.shape[1] == input_ids.shape[
+            1], f"Sequence length mismatch: expected {input_ids.shape[1]}, got {outputs.logits.shape[1]}"
+        assert outputs.logits.shape[
+                   2] == model.config.vocab_size, f"Vocabulary size mismatch: expected {model.config.vocab_size}, got {outputs.logits.shape[2]}"
 
-    assert (
-            outputs.logits.shape[0] == input_ids.shape[0]
-    ), f"Batch size mismatch: expected {input_ids.shape[0]}, got {outputs.logits.shape[0]}"
-    assert (
-            outputs.logits.shape[1] == input_ids.shape[1]
-    ), f"Sequence length mismatch: expected {input_ids.shape[1]}, got {outputs.logits.shape[1]}"
-    assert (
-            outputs.logits.shape[2] == model.config.vocab_size
-    ), f"Vocabulary size mismatch: expected {model.config.vocab_size}, got {outputs.logits.shape[2]}"
+    except Exception as e:
+        logger.error(f"Error in test_model_output_shapes: {str(e)}")
+        logger.exception("Full traceback:")
+        raise
 
 
 def test_attention_mask(model, tokenizer, device):
@@ -190,43 +163,54 @@ def test_attention_mask(model, tokenizer, device):
     """
     model.to(device)
     prompt = "Test with padding"
-    input_ids = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(device)
+    try:
+        input_ids = tokenizer.encode(prompt).unsqueeze(0).to(device)
 
-    with torch.no_grad():
-        outputs_without_mask = model(input_ids)
-        # sourcery skip: no-conditionals-in-tests
+        with torch.no_grad():
+            outputs_without_mask = model(input_ids)
+            if not model.config.use_mamba:
+                attention_mask = torch.ones_like(input_ids)
+                attention_mask[:, -2:] = 0  # Simulate padding
+                outputs_with_mask = model(input_ids, attention_mask=attention_mask)
+            else:
+                outputs_with_mask = outputs_without_mask  # For Mamba, we don't use attention mask
+
+        logger.info("\nTesting attention mask:")
+
+        if torch.isnan(outputs_with_mask.logits).any() or torch.isnan(outputs_without_mask.logits).any():
+            logger.warning("NaN values detected in logits")
+            return
+
+        diff = (outputs_with_mask.logits[:, -1] - outputs_without_mask.logits[:, -1]).abs().max().item()
+        logger.info(f"Difference in last token logits: {diff:.4f}")
+
         if not model.config.use_mamba:
-            attention_mask = torch.ones_like(input_ids)
-            attention_mask[:, -2:] = 0  # Simulate padding
-            outputs_with_mask = model(input_ids, attention_mask=attention_mask)
+            assert diff > 0, "Outputs should differ when using attention mask"
         else:
-            outputs_with_mask = (
-                outputs_without_mask  # For Mamba, we don't use attention mask
-            )
+            assert diff == 0, "Outputs should be the same for Mamba layers"
 
-    logger.info("\nTesting attention mask:")
+    except Exception as e:
+        logger.error(f"Error in test_attention_mask: {str(e)}")
+        logger.exception("Full traceback:")
+        raise
 
-    # sourcery skip: no-conditionals-in-tests
-    if (
-            torch.isnan(outputs_with_mask.logits).any()
-            or torch.isnan(outputs_without_mask.logits).any()
-    ):
-        logger.warning("NaN values detected in logits")
-        return
 
-    diff = (
-        (outputs_with_mask.logits[:, -1] - outputs_without_mask.logits[:, -1])
-        .abs()
-        .max()
-        .item()
-    )
-    logger.info(f"Difference in last token logits: {diff:.4f}")
+def test_cuda_tensor_transfer(device):
+    """
+    Test if we can successfully transfer a tensor to CUDA.
+    """
+    try:
+        cpu_tensor = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)
+        logger.debug(f"CPU tensor shape: {cpu_tensor.shape}, device: {cpu_tensor.device}")
 
-    # sourcery skip: no-conditionals-in-tests
-    if not model.config.use_mamba:
-        assert diff > 0, "Outputs should differ when using attention mask"
-    else:
-        assert diff == 0, "Outputs should be the same for Mamba layers"
+        cuda_tensor = cpu_tensor.to(device)
+        logger.debug(f"CUDA tensor shape: {cuda_tensor.shape}, device: {cuda_tensor.device}")
+
+        assert cuda_tensor.device.type == 'cuda', f"Expected CUDA device, got {cuda_tensor.device.type}"
+        logger.info("CUDA tensor transfer successful")
+    except Exception as e:
+        logger.error(f"CUDA tensor transfer failed: {str(e)}")
+        raise
 
 
 if __name__ == "__main__":

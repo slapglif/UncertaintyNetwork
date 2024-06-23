@@ -1,20 +1,58 @@
+from typing import List
+
+import torch
 from transformers import GPT2Tokenizer
 
 
 class Tokenizer:
     def __init__(self, pretrained_tokenizer: str = "gpt2"):
-        """
-        Initialize the Tokenizer class.
-
-        Args:
-            pretrained_tokenizer (str): The name of the pretrained tokenizer to use.
-        """
         self.tokenizer = GPT2Tokenizer.from_pretrained(pretrained_tokenizer)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.vocab_size = self.tokenizer.vocab_size
         self.pad_token_id = self.tokenizer.pad_token_id
         self.eos_token_id = self.tokenizer.eos_token_id
         self.bos_token_id = self.tokenizer.bos_token_id
+
+    def encode(self, text: str, **kwargs):
+        """
+        Encode the given text into token IDs.
+
+        Args:
+            text (str): The text to encode.
+            **kwargs: Additional arguments to pass to the tokenizer's encode method.
+
+        Returns:
+            torch.Tensor: The encoded token IDs as a tensor.
+        """
+        encoded = self.tokenizer.encode(text, add_special_tokens=True, **kwargs)
+        return torch.tensor(encoded, dtype=torch.long)
+
+    def decode(self, token_ids: torch.Tensor, **kwargs):
+        """
+        Decode the given token IDs back into text.
+
+        Args:
+            token_ids (torch.Tensor): The token IDs to decode.
+            **kwargs: Additional arguments to pass to the tokenizer's decode method.
+
+        Returns:
+            str: The decoded text.
+        """
+        return self.tokenizer.decode(token_ids.tolist(), **kwargs)
+
+    def batch_decode(self, token_ids_batch: List[torch.Tensor], **kwargs):
+        """
+        Decode a batch of token IDs back into text.
+
+        Args:
+            token_ids_batch (List[torch.Tensor]): A list of token ID tensors to decode.
+            **kwargs: Additional arguments to pass to the tokenizer's batch_decode method.
+
+        Returns:
+            List[str]: The list of decoded texts.
+        """
+        return self.tokenizer.batch_decode([ids.tolist() for ids in token_ids_batch], **kwargs)
+
 
     @property
     def pad_token(self):
@@ -28,32 +66,6 @@ class Tokenizer:
     @property
     def eos_token(self):
         return self.tokenizer.eos_token
-
-    def encode(self, text: str, **kwargs):
-        """
-        Encode the given text into token IDs.
-
-        Args:
-            text (str): The text to encode.
-            **kwargs: Additional arguments to pass to the tokenizer's encode method.
-
-        Returns:
-            List[int]: The encoded token IDs.
-        """
-        return self.tokenizer.encode(text, add_special_tokens=True, **kwargs)
-
-    def decode(self, token_ids: list, **kwargs):
-        """
-        Decode the given token IDs back into text.
-
-        Args:
-            token_ids (list): The token IDs to decode.
-            **kwargs: Additional arguments to pass to the tokenizer's decode method.
-
-        Returns:
-            str: The decoded text.
-        """
-        return self.tokenizer.decode(token_ids, skip_special_tokens=True, **kwargs)
 
     def tokenize(self, text: str, **kwargs):
         """
