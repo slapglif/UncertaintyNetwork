@@ -150,7 +150,6 @@ def main():
         max_epochs=hparams["max_epochs"],
         callbacks=[checkpoint_callback, early_stop_callback, lr_monitor],
         logger=tb_logger,
-        gpus=1 if torch.cuda.is_available() else 0,
         precision=16 if torch.cuda.is_available() else 32,
         accumulate_grad_batches=hparams["accumulate_grad_batches"],
         gradient_clip_val=1.0,
