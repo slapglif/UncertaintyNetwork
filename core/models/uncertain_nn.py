@@ -410,6 +410,8 @@ class UncertainTransformerLMHeadModel(PreTrainedModel, GenerationMixin):
         )
 
         hidden_states = transformer_outputs[0]
+
+        # Ensure logits are calculated for each token in the sequence
         logits = self.lm_head(hidden_states)
 
         loss = None

@@ -34,16 +34,16 @@ def softplus(x: torch.Tensor) -> torch.Tensor:
 
 
 def generate_text(
-    model: PreTrainedModel,
-    tokenizer: GPT2Tokenizer,
-    prompt: str,
-    max_length: int = 1024,
-    temperature: float = 0.7,
-    top_k: int = 50,
-    top_p: float = 0.95,
-    repetition_penalty: float = 1.2,
-    num_return_sequences: int = 1,
-    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        model: PreTrainedModel,
+        tokenizer: GPT2Tokenizer,
+        prompt: str,
+        max_length: int = 1024,
+        temperature: float = 0.7,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        num_return_sequences: int = 1,
+        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ) -> List[str]:
     """
     Generates text using the provided model and tokenizer.
@@ -74,6 +74,9 @@ def generate_text(
     # Replicate the input sequence for the batch if num_return_sequences > 1
     if num_return_sequences > 1:
         input_ids = input_ids.repeat(num_return_sequences, 1)
+        attention_mask = torch.ones_like(input_ids)
+    else:
+        attention_mask = torch.ones_like(input_ids)  # Create the mask regardless of the number of sequences
 
     generated_texts = []
     try:
@@ -87,6 +90,7 @@ def generate_text(
                 repetition_penalty=repetition_penalty,
                 num_return_sequences=num_return_sequences,
                 do_sample=True,  # Enable sampling
+                attention_mask=attention_mask  # Provide attention mask
             )
             generated_texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids in output]
     except Exception as e:

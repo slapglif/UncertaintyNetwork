@@ -16,7 +16,7 @@ from core.utils.utils import generate_text, calculate_perplexity
 MAX_LENGTH = 50
 TEMPERATURE = 0.7
 TIMEOUT = 30
-NUM_SAMPLES = 1
+NUM_SAMPLES = 3
 
 
 @pytest.fixture(scope="module")

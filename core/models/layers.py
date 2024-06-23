@@ -38,6 +38,28 @@ class MultiHeadAttention(nn.Module):
             output_attentions: bool = False,
             use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """
+        Forward pass for multi-head attention.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, sequence_length, d_model).
+            attention_mask (Optional[torch.Tensor]): Attention mask of shape (batch_size, sequence_length).
+            _: Placeholder argument not used.
+            past_key_value (Optional[Tuple[torch.Tensor]]): Past key and value tensors for caching.
+            output_attentions (bool): Whether to output attention probabilities.
+            use_cache (bool): Whether to use caching.
+
+        Returns:
+            Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]: A tuple containing:
+                - Output tensor of shape (batch_size, sequence_length, d_model).
+                - Past key and value tensors (if use_cache is True).
+                - Attention probabilities (if output_attentions is True).
+        """
+
+        # Ensure x is 3-dimensional
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+
         batch_size, seq_len, d_model = x.shape
 
         logger.info(f"MultiHeadAttention input shape: {x.shape}")
@@ -65,9 +87,9 @@ class MultiHeadAttention(nn.Module):
 
         # Apply attention mask (if provided)
         if attention_mask is not None:
-            attn_scores = attn_scores.masked_fill(
-                attention_mask.unsqueeze(1).unsqueeze(2) == 0, float("-inf")
-            )
+            # Reshape attention_mask to (batch_size, 1, 1, seq_len)
+            attention_mask = attention_mask.view(batch_size, 1, 1, seq_len)
+            attn_scores = attn_scores.masked_fill(attention_mask == 0, float("-inf"))
 
         # Normalize scores with Softmax
         attn_probs = F.softmax(attn_scores, dim=-1)
@@ -76,9 +98,13 @@ class MultiHeadAttention(nn.Module):
         # Weighted sum of values
         attn_output = torch.matmul(attn_probs, v)
         logger.info(f"Attention output shape before transpose: {attn_output.shape}")
-        # Transpose and reshape to correct dimensions using attn_output.shape[0] for batch size
-        attn_output = attn_output.transpose(1, 2).contiguous().view(attn_output.shape[0], seq_len,
-                                                                    self.n_heads * self.d_k)
+
+        # Transpose and reshape to correct dimensions
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(batch_size, seq_len, self.n_heads * self.d_k)
+        )
         logger.info(f"Attention output shape after transpose: {attn_output.shape}")
 
         # Final linear projection
@@ -90,9 +116,7 @@ class MultiHeadAttention(nn.Module):
         else:
             return output, past_key_value, None
 
-    def _apply_sliding_window_attention(
-            self, attn_scores: torch.Tensor
-    ) -> torch.Tensor:
+    def _apply_sliding_window_attention(self, attn_scores: torch.Tensor) -> torch.Tensor:
         """
         Applies sliding window attention to the attention scores.
 
@@ -105,17 +129,11 @@ class MultiHeadAttention(nn.Module):
         batch_size, n_heads, seq_len, _ = attn_scores.shape
 
         # Create a causal mask to prevent attending to future tokens
-        causal_mask = torch.tril(
-            torch.ones(seq_len, seq_len, device=attn_scores.device)
-        ).bool()
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=attn_scores.device)).bool()
 
         # Pad attention scores to handle cases where seq_len is not a multiple of window_size
-        padding_len = (
-                              self.window_size - (seq_len % self.window_size)
-                      ) % self.window_size
-        attn_scores = F.pad(
-            attn_scores, (0, padding_len, 0, padding_len), value=float("-inf")
-        )
+        padding_len = (self.window_size - (seq_len % self.window_size)) % self.window_size
+        attn_scores = F.pad(attn_scores, (0, padding_len, 0, padding_len), value=float("-inf"))
         padded_len = seq_len + padding_len
 
         # Reshape attention scores for efficient sliding window calculations
@@ -204,11 +222,7 @@ class GaussianProcessLayer(nn.Module):
     """
 
     def __init__(
-            self,
-            in_features: int,
-            out_features: int,
-            n_inducing: int = 10,
-            embedding_dim: int = 512,
+            self, in_features: int, out_features: int, n_inducing: int = 10, embedding_dim: int = 512
     ):
         super().__init__()
         self.in_features = in_features
@@ -225,9 +239,7 @@ class GaussianProcessLayer(nn.Module):
 
         self.noise = nn.Parameter(torch.tensor(0.1))  # Learnable noise parameter
 
-    def forward(
-            self, x: torch.Tensor, seq_len: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the Gaussian Process layer.
 
@@ -240,15 +252,11 @@ class GaussianProcessLayer(nn.Module):
         """
         batch_size, _, _ = x.shape
         # Generate inducing points linearly spaced over the sequence length
-        inducing_points = torch.linspace(
-            0, seq_len - 1, self.n_inducing, device=x.device
-        )
+        inducing_points = torch.linspace(0, seq_len - 1, self.n_inducing, device=x.device)
 
         # Reshape inducing points to (batch_size, n_inducing, embedding_dim)
         inducing_points = (
-            inducing_points.unsqueeze(0)
-            .unsqueeze(-1)
-            .expand(batch_size, -1, self.embedding_dim)
+            inducing_points.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, self.embedding_dim)
         )
 
         # Calculate covariance matrix using the RBF kernel
@@ -289,9 +297,7 @@ class CEMA(nn.Module):
         self.ema = None
         self.d_model = d_model
         self.alpha = alpha
-        self.register_buffer(
-            "ema", torch.zeros(d_model)
-        )  # Buffer to store the EMA state
+        self.register_buffer("ema", torch.zeros(d_model))  # Buffer to store the EMA state
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -311,11 +317,8 @@ class CEMA(nn.Module):
             self.ema = self.alpha * self.ema + (1 - self.alpha) * x[:, i, :]
             output.append(self.ema)
 
-            # Stack the EMA outputs to form the final output tensor
+        # Stack the EMA outputs to form the final output tensor
         return torch.stack(output, dim=1)
-
-
-# In core/models/layers.py
 
 
 class MambaLayer(nn.Module):
@@ -483,9 +486,7 @@ class SentenceEncoder(nn.Module):
 
     """
 
-    def __init__(
-            self, input_dim: int, hidden_dim: int, output_dim: int, num_grids: int = 8
-    ):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_grids: int = 8):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -540,9 +541,7 @@ class SentenceGP(nn.Module):
         embedding_dim (int): The embedding dimension used for reshaping inducing points.
     """
 
-    def __init__(
-            self, input_dim: int, output_dim: int, n_inducing: int, embedding_dim: int
-    ):
+    def __init__(self, input_dim: int, output_dim: int, n_inducing: int, embedding_dim: int):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -575,9 +574,7 @@ class SentenceGP(nn.Module):
         dist = torch.cdist(x1, x2, p=2).pow(2)
         return torch.exp(-0.5 * dist / torch.exp(self.log_lengthscale).pow(2))
 
-    def forward(
-            self, x: torch.Tensor, num_sentences: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, num_sentences: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the SentenceGP.
 
@@ -598,33 +595,25 @@ class SentenceGP(nn.Module):
         K_ii = self.rbf_kernel(self.inducing_points, self.inducing_points)
 
         # Compute predictive distribution
-        K_ii_inv = torch.inverse(
-            K_ii
-            + torch.exp(self.log_noise) * torch.eye(self.n_inducing, device=x.device)
-        )
+        K_ii_inv = torch.inverse(K_ii + torch.exp(self.log_noise) * torch.eye(self.n_inducing, device=x.device))
         mean = K_xi @ K_ii_inv @ self.output_proj.weight.T
         var = K_xx - K_xi @ K_ii_inv @ K_xi.transpose(-1, -2)
 
         # Reshape outputs
         mean = mean.view(batch_size, num_sentences, self.output_dim)
         var = var.view(batch_size, num_sentences, num_sentences)
-        var = (
-            torch.diagonal(var, dim1=-2, dim2=-1)
-            .unsqueeze(-1)
-            .expand(-1, -1, self.output_dim)
-        )
+        var = torch.diagonal(var, dim1=-2, dim2=-1).unsqueeze(-1).expand(-1, -1, self.output_dim)
 
         return mean, F.softplus(var)  # Ensure positive variance
 
-
-# In core/models/layers.py
 
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
         self.attention = MultiHeadAttention(config)
-        self.mamba_layer = MambaLayer(config)
+        self.mamba_layer = MambaLayer(
+            config) if config.use_mamba else nn.Identity()  # Use Identity if use_mamba is False
         self.feed_forward = PositionwiseFeedForward(config)
         self.layer_norm1 = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.layer_norm2 = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
@@ -638,9 +627,7 @@ class TransformerEncoderLayer(nn.Module):
     ) -> torch.Tensor:
         logger.info(f"TransformerEncoderLayer input shape: {x.shape}")  # Added logging
 
-        if x.dim() == 2:
-            x = x.unsqueeze(0)  # Add batch dimension if missing
-            logger.info(f"TransformerEncoderLayer input shape after unsqueeze: {x.shape}")  # Added logging
+        # Removed the conditional unsqueeze as it was causing the batch dimension loss
 
         residual = x
         x = self.layer_norm1(x)
@@ -651,7 +638,7 @@ class TransformerEncoderLayer(nn.Module):
         residual = x
         x = self.layer_norm2(x)
         mamba_outputs = self.mamba_layer(x)
-        x = mamba_outputs[0] if isinstance(mamba_outputs, tuple) else mamba_outputs
+        x = mamba_outputs if isinstance(mamba_outputs, torch.Tensor) else mamba_outputs[0]
         x = residual + self.dropout(x)
 
         residual = x
