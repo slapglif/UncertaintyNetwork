@@ -8,7 +8,6 @@ from torch.utils.data import IterableDataset
 
 from core.utils.tokenizer import Tokenizer
 
-
 class SlimPajamaDataset(IterableDataset):
     def __init__(
             self,

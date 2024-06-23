@@ -135,6 +135,7 @@ class SlimPajamaDataModule(pl.LightningDataModule):
         """
         input_ids = [item['input_ids'] for item in batch]
         attention_mask = [item['attention_mask'] for item in batch]
+        labels = [item['labels'] for item in batch]
 
         # Get max length in the batch
         max_len = max(ids.size(0) for ids in input_ids)
@@ -149,9 +150,13 @@ class SlimPajamaDataModule(pl.LightningDataModule):
             torch.cat([mask, torch.zeros(max_len - mask.size(0), dtype=mask.dtype, device=mask.device)])
             for mask in attention_mask
         ])
+        labels_padded = torch.stack([
+            torch.cat([label, torch.full((max_len - label.size(0),), -100, dtype=label.dtype, device=label.device)])
+            for label in labels
+        ])
 
         return {
             'input_ids': input_ids_padded,
             'attention_mask': attention_mask_padded,
-            'labels': input_ids_padded.clone(),  # Use input_ids as labels for language modeling
+            'labels': labels_padded,
         }
