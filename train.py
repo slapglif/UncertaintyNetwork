@@ -138,7 +138,6 @@ def main():
         save_top_k=3,
         monitor="val_loss",
         mode="min",
-        period=1,
     )
     early_stop_callback = EarlyStopping(monitor="val_loss", patience=3, mode="min")
     lr_monitor = LearningRateMonitor(logging_interval="step")
