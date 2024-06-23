@@ -6,11 +6,12 @@ from torch.utils.data import DataLoader
 from transformers import GPT2Tokenizer
 
 from .dataset import SlimPajamaDataset
+from torch.utils.data import DataLoader
 
 class SlimPajamaDataModule(LightningDataModule):
     def __init__(
         self,
-        tokenizer: GPT2Tokenizer,
+        tokenizer: Tokenizer,
         max_length: int = 1024,
         batch_size: int = 32,
         num_workers: int = 4,
