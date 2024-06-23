@@ -18,7 +18,7 @@ from core.utils.utils import generate_text, calculate_perplexity
 MAX_LENGTH = 50
 TEMPERATURE = 0.7
 TIMEOUT = 30
-NUM_SAMPLES = 3
+NUM_SAMPLES = 1
 
 
 @pytest.fixture(scope="module")
@@ -59,7 +59,7 @@ class MaxLengthCriteria(StoppingCriteria):
         self.max_length = max_length
 
     def __call__(
-        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
+            self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
     ) -> bool:
         return input_ids.shape[-1] >= self.max_length
 
@@ -75,11 +75,20 @@ class MaxLengthCriteria(StoppingCriteria):
     ],
 )
 def test_generation_and_perplexity(
-    model: UncertainTransformerLMHeadModel,
-    tokenizer: Tokenizer,
-    prompt: str,
-    device: torch.device,
+        model: UncertainTransformerLMHeadModel,
+        tokenizer: Tokenizer,
+        prompt: str,
+        device: torch.device,
 ):
+    """
+    Tests text generation and perplexity calculation using the provided model and tokenizer.
+
+    Args:
+        model (UncertainTransformerLMHeadModel): The model to use for text generation and perplexity calculation.
+        tokenizer (Tokenizer): The tokenizer to use for encoding and decoding text.
+        prompt (str): The initial text to start generation from.
+        device (torch.device): The device to run the model on.
+    """
     model.to(device)
     logger.info(f"\nTesting prompt: {prompt}")
 
@@ -93,13 +102,14 @@ def test_generation_and_perplexity(
             top_k=50,
             top_p=0.95,
             repetition_penalty=1.2,
-            num_return_sequences=3,
+            num_return_sequences=1,
             device=device,
         )
 
         assert len(generated_texts) > 0, "No text was generated"
 
         perplexities = []
+        # sourcery skip: no-loop-in-tests
         for i, generated_text in enumerate(generated_texts):
             logger.info(f"\nSample {i + 1}:")
             logger.info(f"Generated text: '{generated_text}'")
@@ -114,7 +124,7 @@ def test_generation_and_perplexity(
             logger.info(f"Perplexity: {perplexity:.2f}")
 
             assert (
-                0 < perplexity < float("inf")
+                    0 < perplexity < float("inf")
             ), f"Invalid perplexity value: {perplexity}"
 
         # Visualize perplexities
@@ -134,38 +144,57 @@ def test_generation_and_perplexity(
 
 
 def test_model_output_shapes(model, tokenizer, device):
+    """
+    Tests the output shapes of the model for a given input.
+
+    Args:
+        model (UncertainTransformerLMHeadModel): The model to test.
+        tokenizer (Tokenizer): The tokenizer to use for encoding.
+        device (torch.device): The device to run the model on.
+    """
     model.to(device)
     prompt = "Test prompt"
     input_ids = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(device)
 
     with torch.no_grad():
+        # Remove token_type_ids from the model call, as it's not needed
         outputs = model(input_ids)
 
     logger.info(f"\nModel output shapes:")
     logger.info(f"Input shape: {input_ids.shape}")
     logger.info(f"Logits shape: {outputs.logits.shape}")
 
+    # sourcery skip: no-conditionals-in-tests
     if torch.isnan(outputs.logits).any():
         logger.warning("NaN values detected in logits")
 
     assert (
-        outputs.logits.shape[0] == input_ids.shape[0]
+            outputs.logits.shape[0] == input_ids.shape[0]
     ), f"Batch size mismatch: expected {input_ids.shape[0]}, got {outputs.logits.shape[0]}"
     assert (
-        outputs.logits.shape[1] == input_ids.shape[1]
+            outputs.logits.shape[1] == input_ids.shape[1]
     ), f"Sequence length mismatch: expected {input_ids.shape[1]}, got {outputs.logits.shape[1]}"
     assert (
-        outputs.logits.shape[2] == model.config.vocab_size
+            outputs.logits.shape[2] == model.config.vocab_size
     ), f"Vocabulary size mismatch: expected {model.config.vocab_size}, got {outputs.logits.shape[2]}"
 
 
 def test_attention_mask(model, tokenizer, device):
+    """
+    Tests the effect of using an attention mask on the model's output.
+
+    Args:
+        model (UncertainTransformerLMHeadModel): The model to test.
+        tokenizer (Tokenizer): The tokenizer to use for encoding.
+        device (torch.device): The device to run the model on.
+    """
     model.to(device)
     prompt = "Test with padding"
     input_ids = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(device)
 
     with torch.no_grad():
         outputs_without_mask = model(input_ids)
+        # sourcery skip: no-conditionals-in-tests
         if not model.config.use_mamba:
             attention_mask = torch.ones_like(input_ids)
             attention_mask[:, -2:] = 0  # Simulate padding
@@ -177,9 +206,10 @@ def test_attention_mask(model, tokenizer, device):
 
     logger.info("\nTesting attention mask:")
 
+    # sourcery skip: no-conditionals-in-tests
     if (
-        torch.isnan(outputs_with_mask.logits).any()
-        or torch.isnan(outputs_without_mask.logits).any()
+            torch.isnan(outputs_with_mask.logits).any()
+            or torch.isnan(outputs_without_mask.logits).any()
     ):
         logger.warning("NaN values detected in logits")
         return

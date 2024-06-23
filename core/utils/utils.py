@@ -35,17 +35,17 @@ def softplus(x: torch.Tensor) -> torch.Tensor:
 
 
 def generate_text(
-    model: PreTrainedModel,
-    tokenizer: GPT2Tokenizer,
-    prompt: str,
-    max_length: int = 1024,
-    temperature: float = 0.7,
-    top_k: int = 50,
-    top_p: float = 0.95,
-    repetition_penalty: float = 1.2,
-    num_return_sequences: int = 1,
-    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    pad_token_id: Optional[int] = None,
+        model: PreTrainedModel,
+        tokenizer: GPT2Tokenizer,
+        prompt: str,
+        max_length: int = 1024,
+        temperature: float = 0.7,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        num_return_sequences: int = 1,
+        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        pad_token_id: Optional[int] = None,
 ) -> List[str]:
     """
     Generates text using the provided model and tokenizer.
@@ -82,7 +82,7 @@ def generate_text(
     # Set pad_token_id if not provided
     if pad_token_id is None:
         pad_token_id = (
-            getattr(model.config, "pad_token_id", None) or tokenizer.eos_token_id
+                getattr(model.config, "pad_token_id", None) or tokenizer.eos_token_id
         )
 
     # Log input shapes and devices for debugging
@@ -93,15 +93,15 @@ def generate_text(
     try:
         with torch.no_grad():
             output_sequences = model.generate(
-                input_ids=encoded_prompt,
+                input_ids=encoded_prompt.repeat(num_return_sequences, 1),
                 max_length=max_length,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
-                do_sample=True,
-                num_return_sequences=num_return_sequences,
                 pad_token_id=pad_token_id,
+                num_return_sequences=num_return_sequences,
+                do_sample=True,
             )
 
         # Decode the generated sequences
@@ -112,12 +112,12 @@ def generate_text(
                 generated_sequence, clean_up_tokenization_spaces=True
             )
             text = text[
-                len(
-                    tokenizer.decode(
-                        encoded_prompt[0], clean_up_tokenization_spaces=True
-                    )
-                ) :
-            ]
+                   len(
+                       tokenizer.decode(
+                           encoded_prompt[0], clean_up_tokenization_spaces=True
+                       )
+                   ):
+                   ]
             generated_texts.append(text.strip())
 
         return generated_texts
@@ -126,10 +126,9 @@ def generate_text(
         if "out of memory" in str(e):
             logger.error(f"CUDA out of memory error: {str(e)}")
             torch.cuda.empty_cache()
-            return []
         else:
             logger.error(f"Runtime error during text generation: {str(e)}")
-            return []
+        return []
     except Exception as e:
         logger.error(f"Error during text generation: {str(e)}")
         logger.exception("Full traceback:")
@@ -137,10 +136,10 @@ def generate_text(
 
 
 def calculate_perplexity(
-    model: PreTrainedModel,
-    tokenizer: GPT2Tokenizer,
-    text: Union[str, List[str]],
-    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        model: PreTrainedModel,
+        tokenizer: GPT2Tokenizer,
+        text: Union[str, List[str]],
+        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ) -> Union[float, List[float]]:
     """
     Calculates the perplexity of the given text using the provided model and tokenizer,

@@ -1,6 +1,6 @@
 # core/models/layers.py
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -42,13 +42,13 @@ class MultiHeadAttention(nn.Module):
         self.window_size = config.max_position_embeddings // 2
 
     def forward(
-        self,
-        x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+            self,
+            x: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_value: Optional[Tuple[torch.Tensor]] = None,
+            output_attentions: bool = False,
+            use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor]], Optional[torch.Tensor]]:
         """
         Forward pass of the Multi-Head Attention module.
 
@@ -60,9 +60,9 @@ class MultiHeadAttention(nn.Module):
             use_cache (bool): Whether to use cached key/value states.
 
         Returns:
-            Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+            Tuple[torch.Tensor, Optional[Tuple[torch.Tensor]], Optional[torch.Tensor]]:
                 - Output tensor of shape (batch_size, seq_len, d_model).
-                - Optional past key/value states.
+                - Optional tuple of present key and value states.
                 - Optional attention weights.
         """
         # Ensure input has 3 dimensions (batch_size, seq_len, d_model)
@@ -97,9 +97,11 @@ class MultiHeadAttention(nn.Module):
         if past_key_value is not None:
             k = torch.cat([past_key_value[0], k], dim=2)
             v = torch.cat([past_key_value[1], v], dim=2)
+        else:
+            past_key_value = (k, v)
 
         # Compute attention scores
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k**0.5)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k ** 0.5)
 
         # Apply sliding window attention if necessary
         if self.window_size < seq_len:
@@ -137,14 +139,14 @@ class MultiHeadAttention(nn.Module):
         output = self.W_o(attn_output)
 
         # Prepare outputs
-        past_key_value = (k, v) if use_cache else None
+        present_key_value = (k, v) if use_cache else None
         if output_attentions:
-            return output, past_key_value, attn_probs
+            return output, present_key_value, attn_probs
         else:
-            return output, past_key_value, None
+            return output, present_key_value, None
 
     def _apply_sliding_window_attention(
-        self, attn_scores: torch.Tensor
+            self, attn_scores: torch.Tensor
     ) -> torch.Tensor:
         """
         Apply sliding window attention to the attention scores.
@@ -164,8 +166,8 @@ class MultiHeadAttention(nn.Module):
 
         # Pad attention scores if necessary
         padding_len = (
-            self.window_size - (seq_len % self.window_size)
-        ) % self.window_size
+                              self.window_size - (seq_len % self.window_size)
+                      ) % self.window_size
         attn_scores = F.pad(
             attn_scores, (0, padding_len, 0, padding_len), value=float("-inf")
         )
@@ -205,7 +207,7 @@ class MultiHeadAttention(nn.Module):
 
     @classmethod
     def _prepare_attention_mask(
-        cls, attention_mask: torch.Tensor, batch_size: int, seq_len: int
+            cls, attention_mask: torch.Tensor, batch_size: int, seq_len: int
     ) -> torch.Tensor:
         """
         Prepare the attention mask to have the correct shape and dimensions.
@@ -287,11 +289,11 @@ class GaussianProcessLayer(nn.Module):
     """
 
     def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        n_inducing: int = 10,
-        embedding_dim: int = 512,
+            self,
+            in_features: int,
+            out_features: int,
+            n_inducing: int = 10,
+            embedding_dim: int = 512,
     ):
         super().__init__()
         self.in_features = in_features
@@ -309,7 +311,7 @@ class GaussianProcessLayer(nn.Module):
         self.noise = nn.Parameter(torch.tensor(0.1))  # Learnable noise parameter
 
     def forward(
-        self, x: torch.Tensor, seq_len: int
+            self, x: torch.Tensor, seq_len: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the Gaussian Process layer.
@@ -485,13 +487,13 @@ class MambaLayer(nn.Module):
 
     @classmethod
     def _selective_scan(
-        cls,
-        x: torch.Tensor,
-        dt: torch.Tensor,
-        A: torch.Tensor,
-        B: torch.Tensor,
-        C: torch.Tensor,
-        D: torch.Tensor,
+            cls,
+            x: torch.Tensor,
+            dt: torch.Tensor,
+            A: torch.Tensor,
+            B: torch.Tensor,
+            C: torch.Tensor,
+            D: torch.Tensor,
     ) -> torch.Tensor:
         """
         Performs the selective scan operation within the Mamba layer.
@@ -559,10 +561,12 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+            self,
+            x: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            output_attentions: Optional[bool] = False,
+            past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple[torch.Tensor]]]:
         logger.info(f"TransformerEncoderLayer input shape: {x.shape}")
 
         if x.dim() == 2:
@@ -570,7 +574,12 @@ class TransformerEncoderLayer(nn.Module):
 
         residual = x
         x = self.layer_norm1(x)
-        attention_output, _, _ = self.attention(x, attention_mask=attention_mask)
+        attention_output, present_key_value, attention_probs = self.attention(
+            x,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions
+        )
         x = residual + self.dropout(attention_output)
 
         residual = x
@@ -588,4 +597,8 @@ class TransformerEncoderLayer(nn.Module):
         x = self.feed_forward(x)
         x = residual + self.dropout(x)
 
-        return x
+        # Return present_key_value if use_cache is True
+        if self.config.use_cache:
+            return x, present_key_value
+        else:
+            return x

@@ -1,18 +1,17 @@
-# core\models\uncertain_nn.py
-from typing import Optional, Tuple, Union, List
+# core/models/uncertain_nn.py
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
-from transformers import PreTrainedModel, PretrainedConfig
+from transformers import PreTrainedModel, PretrainedConfig, GenerationMixin
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
 )
 
 from core.models.embedding import SentenceGP, SentenceEncoder
-from core.models.layers import TransformerEncoderLayer
+from core.models.layers import TransformerEncoderLayer, MambaLayer, MultiHeadAttention
 
 
 class UncertainTransformerConfig(PretrainedConfig):
@@ -84,6 +83,10 @@ class UncertainTransformerConfig(PretrainedConfig):
 
 
 class UncertainNN(nn.Module):
+    """
+    Modified UncertainNN with SAMBA-like architecture.
+    """
+
     def __init__(self, config: UncertainTransformerConfig | PretrainedConfig):
         super().__init__()
         self.config = config
@@ -96,14 +99,19 @@ class UncertainNN(nn.Module):
         self.layer_norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout)
 
+        # Interleave Mamba and Transformer layers (Samba-like)
         self.layers = nn.ModuleList(
-            [TransformerEncoderLayer(config) for _ in range(config.n_layers)]
+            [
+                MambaLayer(config) if i % 2 == 0 else TransformerEncoderLayer(config)
+                for i in range(config.n_layers)
+            ]
         )
 
         self.final_layer_norm = nn.LayerNorm(
             config.d_model, eps=config.layer_norm_epsilon
         )
 
+        # Components for uncertainty modeling
         self.sentence_encoder = SentenceEncoder(
             config.d_model, config.d_model * 2, config.d_model, num_grids=8
         )
@@ -111,20 +119,23 @@ class UncertainNN(nn.Module):
             config.d_model, config.d_model, config.n_inducing, config.d_model
         )
 
+        # Sliding Window Attention (SWA)
+        self.sliding_window_attention = MultiHeadAttention(config)
+        self.sliding_window_size = config.max_position_embeddings // 2  # Adjust as needed
+
     def forward(
             self,
             input_ids: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.FloatTensor] = None,
-            _token_type_ids: Optional[torch.LongTensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
-            _past_key_values: Optional[Tuple[torch.FloatTensor]] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
-        # sourcery skip: low-code-quality
+        # Handle Model Configurations
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -140,6 +151,7 @@ class UncertainNN(nn.Module):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
+        # Manage Inputs
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time"
@@ -152,29 +164,49 @@ class UncertainNN(nn.Module):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
+        seq_len = input_shape[-1]  # Define seq_len here for use in SWA logic
+
+        # Position IDs
         if position_ids is None:
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            device = (
+                input_ids.device
+                if input_ids is not None
+                else inputs_embeds.device
+            )
             position_ids = torch.arange(
                 0, input_shape[-1], dtype=torch.long, device=device
             )
             position_ids = position_ids.unsqueeze(0).expand(input_shape)
 
+        # Embeddings
         if inputs_embeds is None:
             inputs_embeds = self.embedding(input_ids)
-
         position_embeddings = self.position_embedding(position_ids)
+
+        # Combine Embeddings
         hidden_states = inputs_embeds + position_embeddings
         hidden_states = self.layer_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
+        # Outputs Initialization
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
+        # Check Past Key Values
+        if past_key_values is not None:
+            assert len(
+                past_key_values
+            ) == self.config.n_layers // 2, f"past_key_values should have {self.config.n_layers // 2} tuples, got {len(past_key_values)}"
+
+        # Process through layers
+        transformer_layer_index = 0
         for i, layer in enumerate(self.layers):
+            # Store Hidden States
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            # Gradient Checkpointing
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     layer.__call__,
@@ -183,42 +215,63 @@ class UncertainNN(nn.Module):
                     output_attentions,
                 )
             else:
-                layer_outputs = layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    output_attentions=output_attentions,
-                )
+                # Apply Mamba or Transformer layer
+                if isinstance(layer, MambaLayer):
+                    layer_outputs = layer(hidden_states)
+                elif isinstance(layer, TransformerEncoderLayer):
+                    # Apply SWA if needed
+                    if self.sliding_window_size < seq_len:
+                        hidden_states = self._apply_sliding_window_attention(
+                            hidden_states, attention_mask
+                        )
+                    # Apply Transformer layer
+                    layer_outputs = layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        output_attentions=output_attentions,
+                        past_key_value=past_key_values[transformer_layer_index]
+                        if past_key_values is not None
+                        else None,
+                    )
+                    transformer_layer_index += 1
+                else:
+                    raise ValueError(f"Unexpected layer type: {type(layer)}")
 
             hidden_states = layer_outputs[0]
 
-            if use_cache:
-                next_decoder_cache += (layer_outputs[1 if output_attentions else 1],)
+            # Update Cache (Corrected Logic)
+            if use_cache and isinstance(layer, TransformerEncoderLayer):
+                next_decoder_cache += (layer_outputs[1],)
 
+            # Collect Attentions
             if output_attentions:
                 all_attentions += (layer_outputs[1],)
 
+        # Final Normalization
         hidden_states = self.final_layer_norm(hidden_states)
 
-        # Apply SentenceEncoder and SentenceGP
+        # Apply Sentence Encoder and Gaussian Process (for uncertainty)
         batch_size, seq_len, _ = hidden_states.shape
         if seq_len >= self.config.max_position_embeddings:
             num_sentences = seq_len // self.config.max_position_embeddings
             remainder = seq_len % self.config.max_position_embeddings
 
+            # Padding
             if remainder > 0:
                 padding_needed = self.config.max_position_embeddings - remainder
                 hidden_states = F.pad(hidden_states, (0, 0, 0, padding_needed))
                 seq_len += padding_needed
 
+            # Sentence Embedding and Gaussian Process
             hidden_states = hidden_states.view(
                 batch_size, num_sentences, self.config.max_position_embeddings, -1
             )
             sentence_embeddings = self.sentence_encoder(hidden_states)
-
             sentence_mean, sentence_var = self.sentence_gp(
                 sentence_embeddings, num_sentences
             )
 
+            # Training vs. Inference
             if self.training:
                 hidden_states = sentence_mean + torch.randn_like(
                     sentence_mean
@@ -227,13 +280,16 @@ class UncertainNN(nn.Module):
                 hidden_states = sentence_mean
 
             hidden_states = hidden_states.view(batch_size, seq_len, -1)
-            padding_needed = 0
+
+            # Remove Padding
             if remainder > 0:
                 hidden_states = hidden_states[:, : seq_len - padding_needed, :]
 
+        # Collect Hidden States
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
+        # Construct Output
         if not return_dict:
             return tuple(
                 v
@@ -253,63 +309,35 @@ class UncertainNN(nn.Module):
             attentions=all_attentions,
         )
 
-    @classmethod
-    def _gradient_checkpointing_func(cls, func, *args, **kwargs):
-        return checkpoint(func, *args, **kwargs)
 
-
-class UncertainTransformerLMHeadModel(PreTrainedModel):
+class UncertainTransformerLMHeadModel(PreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.transformer = UncertainNN(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        # Explicitly tell transformers that this is a decoder model with a language model head
+
+        # Important for GenerationMixin
         self.config.is_decoder = True
-        # Access the _no_split_modules list from the config
-        self.config._no_split_modules += ["UncertainNN"]  # Prevent splitting the custom module
+        self.main_input_name = "input_ids"
+
+        # Prevent splitting during loading (optional for efficiency)
+        self.config._no_split_modules += ["UncertainNN"]
         self.tie_weights()
 
     def get_input_embeddings(self) -> nn.Module:
-        """
-        Returns the model's input embeddings.
-
-        Returns:
-            `nn.Module`: A torch module mapping vocabulary to hidden states.
-        """
         return self.transformer.embedding
 
     def set_input_embeddings(self, value: nn.Module):
-        """
-        Set model's input embeddings.
-
-        Args:
-            value (`nn.Module`): A module mapping vocabulary to hidden states.
-        """
         self.transformer.embedding = value
 
     def get_output_embeddings(self) -> nn.Module:
-        """
-        Returns the model's output embeddings.
-
-        Returns:
-            `nn.Module`: A torch module mapping hidden states to vocabulary.
-        """
         return self.lm_head
 
     def set_output_embeddings(self, new_embeddings: nn.Module):
-        """
-        Set model's output embeddings.
-
-        Args:
-            value (`nn.Module`): A module mapping hidden states to vocabulary.
-            :param new_embeddings:
-        """
         self.lm_head = new_embeddings
 
     def tie_weights(self):
-        """
-        Tie the weights between the input embeddings and the output layer.
-        """
+        """Tie the weights between the input embeddings and the output layer."""
         if self.config.tie_word_embeddings:
             self._tie_or_clone_weights(self.lm_head, self.transformer.embedding)
 
@@ -317,31 +345,31 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             self,
             input_ids: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.FloatTensor] = None,
-            token_type_ids: Optional[torch.LongTensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             labels: Optional[torch.LongTensor] = None,
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
     ) -> Union[Tuple, CausalLMOutputWithCrossAttentions]:
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
 
+        # Pass use_cache and past_key_values to the transformer
         transformer_outputs = self.transformer(
             input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
             position_ids=position_ids,
-            past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            past_key_values=past_key_values,
         )
 
         hidden_states = transformer_outputs[0]
@@ -349,6 +377,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
 
         loss = None
         if labels is not None:
+            # Shift logits and labels for language modeling
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
@@ -368,6 +397,19 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions,
         )
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+        # Properly pass past_key_values when using beam search or similar strategies
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1].unsqueeze(-1)
+
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache"),
+            "attention_mask": kwargs.get("attention_mask", None),
+            "position_ids": kwargs.get("position_ids", None),
+        }
 
     def enable_gradient_checkpointing(self):
         self.transformer.gradient_checkpointing = True

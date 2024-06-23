@@ -2,8 +2,7 @@ from typing import *
 
 import torch.nn as nn
 
-from fasterkan_layers import FasterKANLayer
-from feature_extractor import EnhancedFeatureExtractor
+from fasterkan_layers import FasterKANLayer, EnhancedFeatureExtractor
 
 
 class FasterKAN(nn.Module):
@@ -71,7 +70,7 @@ class FasterKANvolver(nn.Module):
 
         self.view = view
         # Feature extractor with Convolutional layers
-        self.feature_extractor = EnhancedFeatureExtractor(colors=view[1])
+        self.feature_extractor = EnhancedFeatureExtractor()
         """
         nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),  # 1 input channel (grayscale), 16 output channels
