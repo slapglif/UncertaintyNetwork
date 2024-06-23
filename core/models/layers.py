@@ -4,6 +4,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from loguru import logger
+from torch import Tensor
 
 
 class ReZero(nn.Module):
@@ -129,8 +131,10 @@ class TransformerEncoderLayer(nn.Module):
         super().__init__()
         self.self_attn = MultiHeadAttention(config)
         self.feed_forward = PositionwiseFeedForward(config)
+        self.mamba = MambaLayer(config)
         self.norm1 = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.norm2 = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.norm3 = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout)
         self.config = config
 
@@ -145,6 +149,10 @@ class TransformerEncoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         residual = x
         x = self.norm1(x)
+
+        # Check for NaN/Inf before self-attention
+        self._check_nan_inf(x, "input to self-attention")
+
         self_attn_outputs = self.self_attn(
             x,
             attention_mask=attention_mask,
@@ -156,10 +164,36 @@ class TransformerEncoderLayer(nn.Module):
         attn_output = self_attn_outputs[0]
         outputs = self_attn_outputs[1:]
 
+        # Check for NaN/Inf after self-attention
+        self._check_nan_inf(attn_output, "output of self-attention")
+
         x = residual + self.dropout(attn_output)
+
+        # Add Mamba layer
         residual = x
         x = self.norm2(x)
+
+        # Check for NaN/Inf before Mamba layer
+        self._check_nan_inf(x, "input to Mamba layer")
+
+        x = self.mamba(x)
+
+        # Check for NaN/Inf after Mamba layer
+        self._check_nan_inf(x, "output of Mamba layer")
+
+        x = residual + self.dropout(x)
+
+        residual = x
+        x = self.norm3(x)
+
+        # Check for NaN/Inf before feed-forward
+        self._check_nan_inf(x, "input to feed-forward")
+
         x = self.feed_forward(x)
+
+        # Check for NaN/Inf after feed-forward
+        self._check_nan_inf(x, "output of feed-forward")
+
         x = residual + self.dropout(x)
 
         if use_cache:
@@ -168,6 +202,17 @@ class TransformerEncoderLayer(nn.Module):
             outputs = (x,) + outputs[1:]
 
         return outputs
+
+    def _check_nan_inf(self, tensor: Tensor, message: str):
+        """
+        Checks if the given tensor contains NaN or Inf values and logs a warning if found.
+
+        Args:
+            tensor (torch.Tensor): The tensor to check.
+            message (str): A message to include in the warning log.
+        """
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            logger.warning(f"NaN or Inf detected in {message}.")
 
 
 class GaussianProcessLayer(nn.Module):
@@ -387,3 +432,142 @@ class CEMA(nn.Module):
             output = output.view(batch_size, seq_len, d)
 
         return output
+
+
+class MambaLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.d_model = config.d_model
+        self.d_state = config.d_state
+        self.d_conv = config.d_conv
+        self.expand_factor = config.mamba_expand_factor
+        self.d_inner = int(self.expand_factor * self.d_model)
+        self.dt_rank = config.mamba_dt_rank or math.ceil(self.d_model / 16)
+
+        self.in_proj = nn.Linear(self.d_model, self.d_inner)
+        self.conv = nn.Conv1d(self.d_inner, self.d_inner, kernel_size=self.d_conv, padding=self.d_conv - 1,
+                              groups=self.d_inner)
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * self.d_state)
+
+        self.A = nn.Parameter(torch.randn(self.d_inner, self.d_state))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+
+        self.out_proj = nn.Linear(self.d_inner, self.d_model)
+
+        self.dt = nn.Parameter(torch.rand(self.dt_rank))
+        self._initialize_dt(config.mamba_dt_min, config.mamba_dt_max)
+
+    def _initialize_dt(self, dt_min, dt_max):
+        nn.init.uniform_(self.dt, a=math.log(dt_min), b=math.log(dt_max))
+        self.dt.data.exp_()
+
+    def _selective_scan(self, x: torch.Tensor, delta: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the selective scan operation for the Mamba layer with enhanced numerical stability.
+
+        Args:
+            x (torch.Tensor): The input tensor of shape (batch_size, seq_len, d_inner).
+            delta (torch.Tensor): The delta tensor of shape (batch_size, seq_len, dt_rank).
+            B (torch.Tensor): The B tensor of shape (batch_size, seq_len, d_state).
+            C (torch.Tensor): The C tensor of shape (batch_size, seq_len, d_state).
+
+        Returns:
+            torch.Tensor: The output tensor of shape (batch_size, seq_len, d_inner).
+        """
+        batch_size, seq_len, _ = x.shape
+        H = torch.zeros(batch_size, seq_len, self.d_state, device=x.device, dtype=x.dtype)
+
+        H[:, 0] = B[:, 0]
+
+        for t in range(1, seq_len):
+            delta_t = delta[:, t].unsqueeze(1).unsqueeze(2)
+            A_t = self.A[:self.d_state].T.unsqueeze(0)
+
+            # 1. Log-Domain Exponentiation and Scaling
+            log_A_t = torch.log(torch.abs(A_t) + 1e-8)  # Logarithm of A_t with small epsilon
+            log_delta_t = torch.log(torch.abs(delta_t) + 1e-8)  # Logarithm of delta_t
+            log_exp_term = -log_delta_t - log_A_t  # Log of exp_term
+            exp_term = torch.exp(log_exp_term - log_exp_term.max())  # Stable exponentiation
+
+            # 2. Clamp exp_term to a safe range (adjust these values)
+            exp_term_clip_min = 1e-4  # Adjust this value
+            exp_term_clip_max = 1e4  # Adjust this value
+            exp_term = torch.clamp(exp_term, min=exp_term_clip_min, max=exp_term_clip_max)
+
+            B_t = B[:, t].unsqueeze(-1)
+            H_prev = H[:, t - 1]
+
+            # 3. Optional: Normalize H_prev before multiplication (experiment with this)
+            # H_prev = F.normalize(H_prev, dim=-1)
+
+            # Perform matrix multiplication
+            H[:, t] = torch.matmul(exp_term, H_prev.unsqueeze(-1)).squeeze(-1) + B_t.squeeze(-1)
+
+        C = C.view(batch_size, seq_len, self.d_state)
+
+        # 4. Optional: Normalize H and C before multiplication (experiment with this)
+        # H = F.normalize(H, dim=-1)
+        # C = F.normalize(C, dim=-1)
+
+        y = torch.einsum('bnd,bnd->bn', H, C).unsqueeze(-1) * x
+        y = y + x * self.D.unsqueeze(0).unsqueeze(0)
+
+        # 5. Clamp the final output 'y' (adjust these values)
+        y_clip_min = -1e3  # Adjust this value
+        y_clip_max = 1e3  # Adjust this value
+        y = torch.clamp(y, min=y_clip_min, max=y_clip_max)
+
+        return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the forward pass of the Mamba layer.
+
+        Args:
+            x (torch.Tensor): The input tensor of shape (batch_size, seq_len, d_model).
+
+        Returns:
+            torch.Tensor: The output tensor of shape (batch_size, seq_len, d_model).
+        """
+        B, L, _ = x.shape
+
+        # 1. Apply Layer Normalization to the input
+        x = nn.functional.layer_norm(x, x.shape[-1:])
+
+        x = self.in_proj(x)
+        x_conv = self.conv(x.transpose(1, 2))[:, :, :L].transpose(1, 2)
+
+        x_dbc = self.x_proj(x_conv)
+
+        # 2. Apply Layer Normalization before softplus
+        x_dbc = nn.functional.layer_norm(x_dbc, x_dbc.shape[-1:])
+
+        # 3. Clamp dt before matrix multiplication
+        self.dt.data = torch.clamp(self.dt.data, min=1e-6, max=1e6)
+
+        delta = F.softplus(x_dbc[..., :self.dt_rank] @ self.dt)
+        B = x_dbc[..., self.dt_rank:self.dt_rank + self.d_state]
+        C = x_dbc[..., -self.d_state:]
+
+        # 4. Apply Layer Normalization to B and C
+        B = nn.functional.layer_norm(B, B.shape[-1:])
+        C = nn.functional.layer_norm(C, C.shape[-1:])
+
+        y = self._selective_scan(x, delta, B, C)
+        output = self.out_proj(y)
+
+        # 5. Apply Layer Normalization to the output
+        output = nn.functional.layer_norm(output, output.shape[-1:])
+
+        return output
+
+    def _check_nan_inf(self, tensor: Tensor, message: str):
+        """
+        Checks if the given tensor contains NaN or Inf values and logs a warning if found.
+
+        Args:
+            tensor (torch.Tensor): The tensor to check.
+            message (str): A message to include in the warning log.
+        """
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            logger.warning(f"NaN or Inf detected in {message}.")

@@ -1,5 +1,5 @@
 from transformers import GPT2Tokenizer
-
+from loguru import logger
 
 class Tokenizer:
     def __init__(self, pretrained_tokenizer: str = "gpt2"):

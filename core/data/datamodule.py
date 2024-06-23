@@ -15,9 +15,8 @@ class SlimPajamaDataModule(LightningDataModule):
             train_num_examples: int = 100000,
             val_num_examples: int = 10000,
             test_num_examples: int = 10000,
-            batch_size: int = 8,
-            num_workers: int = 4,
-            pin_memory: bool = True,
+            batch_size: int = 32,
+            streaming: bool = True
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -26,8 +25,7 @@ class SlimPajamaDataModule(LightningDataModule):
         self.val_num_examples = val_num_examples
         self.test_num_examples = test_num_examples
         self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.pin_memory = pin_memory
+        self.streaming = streaming
 
     def setup(self, stage: Optional[str] = None):
         if stage == "fit" or stage is None:
@@ -56,25 +54,19 @@ class SlimPajamaDataModule(LightningDataModule):
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            shuffle=True,
+            num_workers=0 if self.streaming else 1,  # Adjust num_workers based on streaming
         )
 
     def val_dataloader(self) -> DataLoader:
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            shuffle=False,
+            num_workers=0 if self.streaming else 1,  # Adjust num_workers based on streaming
         )
 
     def test_dataloader(self) -> DataLoader:
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            shuffle=False,
+            num_workers=0 if self.streaming else 1,  # Adjust num_workers based on streaming
         )

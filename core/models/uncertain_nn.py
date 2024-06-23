@@ -1,16 +1,8 @@
-from typing import Optional, Tuple
-
 import torch
-import torch.nn as nn
-from pytorch_lightning.loggers import TensorBoardLogger
-from torch.utils.checkpoint import checkpoint
-from torchmetrics.text import Perplexity
-from transformers import PreTrainedModel, PretrainedConfig
-from transformers import get_cosine_schedule_with_warmup
-from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, CausalLMOutputWithCrossAttentions
-
-from core.models.embedding import PositionalEncoding, StableEmbedding
-from core.models.layers import TransformerEncoderLayer
+from transformers import LogitsProcessor, LogitsProcessorList
+from transformers import PreTrainedModel
+from transformers import PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
 
 class UncertainTransformerConfig(PretrainedConfig):
@@ -18,28 +10,34 @@ class UncertainTransformerConfig(PretrainedConfig):
 
     def __init__(
             self,
-            vocab_size: int = 50257,
-            d_model: int = 384,
-            n_heads: int = 6,
-            d_ff: int = 1536,
-            n_layers: int = 4,
-            dropout: float = 0.1,
-            max_position_embeddings: int = 512,
-            layer_norm_epsilon: float = 1e-5,
-            initializer_range: float = 0.02,
-            use_cache: bool = True,
-            pad_token_id: int = 50256,
-            bos_token_id: int = 50256,
-            eos_token_id: int = 50256,
-            tie_word_embeddings: bool = True,
-            use_stable_embedding: bool = True,
-            cema_hidden_dim: int = 64,
-            chunk_size: int = 64,
-            use_gelu_approximation: bool = True,
-            max_grad_norm: float = 1.0,
-            ntk_factor: float = 1.0,
-            uncertainty_factor: float = 0.1,
-            use_flash_attention: bool = True,
+            vocab_size=50257,
+            d_model=512,
+            n_heads=8,
+            d_ff=2048,
+            n_layers=6,
+            dropout=0.1,
+            max_position_embeddings=1024,
+            layer_norm_epsilon=1e-5,
+            initializer_range=0.02,
+            use_cache=True,
+            pad_token_id=50256,
+            bos_token_id=50256,
+            eos_token_id=50256,
+            tie_word_embeddings=True,
+            use_stable_embedding=True,
+            cema_hidden_dim=64,
+            chunk_size=64,
+            use_gelu_approximation=True,
+            max_grad_norm=1.0,
+            ntk_factor=1.0,
+            uncertainty_factor=0.1,
+            use_flash_attention=True,
+            d_state=16,
+            d_conv=4,
+            mamba_expand_factor=2,
+            mamba_dt_rank=None,
+            mamba_dt_min=0.001,
+            mamba_dt_max=0.1,
             **kwargs
     ):
         super().__init__(
@@ -67,6 +65,24 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.ntk_factor = ntk_factor
         self.uncertainty_factor = uncertainty_factor
         self.use_flash_attention = use_flash_attention
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.mamba_expand_factor = mamba_expand_factor
+        self.mamba_dt_rank = mamba_dt_rank
+        self.mamba_dt_min = mamba_dt_min
+        self.mamba_dt_max = mamba_dt_max
+
+        # Add attribute map
+        self.attribute_map = {"hidden_size": "d_model"}
+
+
+import torch.nn as nn
+from torch import Tensor
+from torch.utils.checkpoint import checkpoint
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
+from loguru import logger
+from core.models.embedding import PositionalEncoding, StableEmbedding
+from core.models.layers import TransformerEncoderLayer
 
 
 class UncertainTransformer(nn.Module):
@@ -87,12 +103,18 @@ class UncertainTransformer(nn.Module):
         inputs_embeds = self.embedding(input_ids)
         hidden_states = self.pos_encoding(inputs_embeds)
 
+        # Check for NaN/Inf after positional encoding
+        self._check_nan_inf(hidden_states, "hidden_states after positional encoding")
+
         if self.gradient_checkpointing and self.training:
             hidden_states = checkpoint(self._forward_transformer, hidden_states, attention_mask, position_ids,
                                        past_key_values, use_cache, output_attentions, output_hidden_states)
         else:
             hidden_states = self._forward_transformer(hidden_states, attention_mask, position_ids, past_key_values,
                                                       use_cache, output_attentions, output_hidden_states)
+
+        # Check for NaN/Inf after transformer layers
+        self._check_nan_inf(hidden_states, "hidden_states after transformer layers")
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
@@ -113,164 +135,117 @@ class UncertainTransformer(nn.Module):
             )
             hidden_states = layer_outputs[0]
 
+            # Check for NaN/Inf after each layer
+            self._check_nan_inf(hidden_states, f"hidden_states after layer {i}")
+
         hidden_states = self.norm(hidden_states)
         return hidden_states
+
+    def _check_nan_inf(self, tensor: Tensor, message: str):
+        """
+        Checks if the given tensor contains NaN or Inf values and logs a warning if found.
+
+        Args:
+            tensor (torch.Tensor): The tensor to check.
+            message (str): A message to include in the warning log.
+        """
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            logger.warning(f"NaN or Inf detected in {message}.")
 
     def enable_gradient_checkpointing(self):
         self.gradient_checkpointing = True
 
 
+class TemperatureSoftmaxLogitsProcessor(LogitsProcessor):
+    """
+    Processes the logits by applying a softmax with temperature scaling.
+
+    Args:
+        temperature (float): The temperature for scaling the logits before softmax.
+    """
+
+    def __init__(self, temperature=1.0):
+        self.temperature = temperature
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.Tensor:
+        """
+        Applies temperature scaling and softmax to the input scores.
+
+        Args:
+            input_ids (torch.LongTensor): The input token IDs. Not used in this processor.
+            scores (torch.FloatTensor): The logits to be processed.
+
+        Returns:
+            torch.Tensor: The processed logits after applying temperature scaling and softmax.
+        """
+        scores = scores / self.temperature
+
+        # Numerically stable softmax calculation
+        max_scores = scores.max(dim=-1, keepdim=True).values
+        exp_scores = torch.exp(scores - max_scores)
+        probs = exp_scores / exp_scores.sum(dim=-1, keepdim=True)
+        return torch.log(probs)  # Return log probabilities
+
+
 class UncertainTransformerLMHeadModel(PreTrainedModel):
-    base_model_prefix = "transformer"
-
-    def __init__(self, config: UncertainTransformerConfig):
-        PreTrainedModel.__init__(self, config)
-
-        self.config = config
+    def __init__(self, config):
+        super().__init__(config)
         self.transformer = UncertainTransformer(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
-        self.perplexity = Perplexity(ignore_index=-100)
-        self.tokenizer = None
-        self.gradient_checkpointing = False
-        self.post_init()
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
-    def get_input_embeddings(self):
-        return self.transformer.embedding
-
-    def set_input_embeddings(self, value):
-        self.transformer.embedding = value
+        self.temperature = getattr(config, 'temperature', 1.0)
+        self.logits_processor = LogitsProcessorList([TemperatureSoftmaxLogitsProcessor(self.temperature)])
 
     def forward(
             self,
-            input_ids: Optional[torch.LongTensor] = None,
-            attention_mask: Optional[torch.FloatTensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-    ) -> CausalLMOutputWithCrossAttentions:
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
+            labels=None,
+            past_key_values=None,
+            use_cache=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+    ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if self.gradient_checkpointing and self.training:
-            transformer_outputs = checkpoint(self.transformer, input_ids, attention_mask, position_ids, past_key_values,
-                                             use_cache, output_attentions, output_hidden_states, return_dict)
-        else:
-            transformer_outputs = self.transformer(
-                input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
+        transformer_outputs = self.transformer(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
 
-        hidden_states = transformer_outputs.last_hidden_state
-        lm_logits = self.lm_head(hidden_states)
+        hidden_states = transformer_outputs[0]
+        logits = self.lm_head(hidden_states)
+
+        # Clamp logits to a safe range before softmax
+        logits = torch.clamp(logits, min=-1e6, max=1e6)  # Adjust range if needed
 
         loss = None
         if labels is not None:
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = self.criterion(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
 
         if not return_dict:
-            output = (lm_logits,) + transformer_outputs[1:]
+            output = (logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
-            logits=lm_logits,
-            past_key_values=None,
-            hidden_states=None,
-            attentions=None,
+            logits=logits,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+            cross_attentions=transformer_outputs.cross_attentions,
         )
-
-    def training_step(self, batch, batch_idx):
-        input_ids, labels = batch
-        attention_mask = (input_ids != self.config.pad_token_id).long()
-        outputs = self(input_ids, attention_mask=attention_mask, labels=labels)
-        loss = outputs.loss
-
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        input_ids, labels = batch
-        attention_mask = (input_ids != self.config.pad_token_id).long()
-        outputs = self(input_ids, attention_mask=attention_mask, labels=labels)
-        loss = outputs.loss
-
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-
-        perplexity = self.perplexity(outputs.logits.view(-1, outputs.logits.size(-1)), labels.view(-1))
-        self.log("val_perplexity", perplexity, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-
-        if batch_idx == 0:
-            input_ids = batch[0][:1]
-            generated = self.generate(input_ids, max_length=50)
-            generated_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
-            if isinstance(self.logger, TensorBoardLogger) and hasattr(self.logger.experiment, 'add_text'):
-                self.logger.experiment.add_text("generated_text", generated_text, self.current_epoch)
-
-        return loss
-
-    def configure_optimizers(self):
-        param_optimizer = list(self.named_parameters())
-        no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [
-                    p
-                    for n, p in param_optimizer
-                    if all(nd not in n for nd in no_decay)
-                ],
-                "weight_decay": self.config.weight_decay,
-            },
-            {
-                "params": [
-                    p
-                    for n, p in param_optimizer
-                    if any(nd in n for nd in no_decay)
-                ],
-                "weight_decay": 0.0,
-            },
-        ]
-        optimizer = torch.optim.AdamW(
-            optimizer_grouped_parameters,
-            lr=self.config.learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-        )
-
-        num_training_steps = self.trainer.estimated_stepping_batches
-        num_warmup_steps = int(num_training_steps * self.config.warmup_ratio)
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps,
-        )
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1,
-            },
-        }
 
     def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, **kwargs):
         input_shape = input_ids.shape
@@ -286,11 +261,16 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             "past_key_values": past,
         }
 
-    def _reorder_cache(self, past, beam_idx):
-        reordered_past = ()
-        for layer_past in past:
-            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
-        return reordered_past
+    @staticmethod
+    def _reorder_cache(past, beam_idx):
+        return tuple(
+            tuple(past_state.index_select(0, beam_idx) for past_state in layer_past)
+            for layer_past in past
+        )
+
+    def generate(self, *args, **kwargs):
+        kwargs['logits_processor'] = self.logits_processor
+        return super().generate(*args, **kwargs)
 
     def enable_gradient_checkpointing(self):
         self.gradient_checkpointing = True

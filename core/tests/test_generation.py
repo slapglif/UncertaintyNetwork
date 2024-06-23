@@ -1,10 +1,11 @@
 import math
-from typing import List, Union
-
+from typing import List, Union, Dict
+from loguru import logger
 import pytest
 import torch
 from transformers import GPT2Tokenizer
 from transformers import StoppingCriteria
+from datasets import load_dataset
 
 from core.models.uncertain_nn import UncertainTransformerConfig
 from core.models.uncertain_nn import UncertainTransformerLMHeadModel
@@ -44,6 +45,10 @@ def model(device):
 def tokenizer():
     return Tokenizer.from_pretrained("gpt2")
 
+@pytest.fixture(scope="module")
+def boolq_dataset():
+    """Loads the BoolQ dataset."""
+    return load_dataset("boolq")
 
 class MaxLengthCriteria(StoppingCriteria):
     def __init__(self, max_length: int):
@@ -65,22 +70,47 @@ def generate_text(
         num_return_sequences: int = 1,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ) -> List[str]:
+    """
+    Generate text using the provided UncertainTransformerLMHeadModel and tokenizer.
+
+    Args:
+        model (UncertainTransformerLMHeadModel): The model to use for text generation.
+        tokenizer (GPT2Tokenizer): The tokenizer to use for encoding the prompt and decoding the output.
+        prompt (str): The initial text prompt to start generation from.
+        max_length (int, optional): The maximum length of the generated text. Defaults to 50.
+        temperature (float, optional): The temperature parameter for sampling. Defaults to 0.7.
+        top_k (int, optional): The number of top tokens to consider for sampling. Defaults to 50.
+        top_p (float, optional): The cumulative probability threshold for nucleus sampling. Defaults to 0.95.
+        repetition_penalty (float, optional): The penalty applied to repeated tokens. Defaults to 1.2.
+        num_return_sequences (int, optional): The number of generated sequences to return. Defaults to 1.
+        device (torch.device, optional): The device to run the model on. Defaults to CUDA if available, else CPU.
+
+    Returns:
+        List[str]: A list of generated text strings.
+    """
     model.to(device)
     model.eval()
 
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
 
-    with torch.no_grad():
-        output = model.generate(
-            input_ids,
-            max_length=max_length,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            num_return_sequences=num_return_sequences,
-            do_sample=True,
-        )
+    try:
+        with torch.no_grad():
+            output = model.generate(
+                input_ids,
+                max_length=max_length,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                num_return_sequences=num_return_sequences,
+                do_sample=True,
+            )
+    except Exception as e:
+        logger.error(f"Error during generation: {str(e)}")
+        logger.error(f"Input shape: {input_ids.shape}")
+        logger.error(f"Input device: {input_ids.device}")
+        logger.error(f"Model device: {next(model.parameters()).device}")
+        raise
 
     return [tokenizer.decode(ids, skip_special_tokens=True) for ids in output]
 
@@ -154,7 +184,7 @@ def test_generation_and_perplexity(
         device: torch.device,
 ):
     model.to(device)
-    print(f"\nTesting prompt: {prompt}")
+    logger.info(f"\nTesting prompt: {prompt}")
 
     NUM_SAMPLES = 3
     generated_texts = []
@@ -178,26 +208,26 @@ def test_generation_and_perplexity(
             perplexity = calculate_perplexity(model, tokenizer.tokenizer, generated_text, device=device)
             perplexities.append(perplexity)
 
-            print(f"\nSample {i + 1}:")
-            print(f"Generated text: '{generated_text}'")
-            print(f"Generated text length: {len(generated_text)}")
-            print(f"Perplexity: {perplexity:.2f}")
+            logger.info(f"\nSample {i + 1}:")
+            logger.info(f"Generated text: '{generated_text}'")
+            logger.info(f"Generated text length: {len(generated_text)}")
+            logger.info(f"Perplexity: {perplexity:.2f}")
 
             assert len(generated_text) > 0, "Generated text should not be empty"
             assert 0 < perplexity < float("inf"), "Perplexity should be a finite positive number"
 
     except Exception as e:
-        print(f"Error generating text for prompt '{prompt}': {str(e)}")
-        print(f"Error details: {type(e).__name__}")
+        logger.info(f"Error generating text for prompt '{prompt}': {str(e)}")
+        logger.info(f"Error details: {type(e).__name__}")
         import traceback
-        print(traceback.format_exc())
+        logger.info(traceback.format_exc())
 
     if perplexities:
         avg_perplexity = sum(perplexities) / len(perplexities)
-        print(f"\nAverage Perplexity: {avg_perplexity:.2f}")
+        logger.info(f"\nAverage Perplexity: {avg_perplexity:.2f}")
         assert 0 < avg_perplexity < float("inf"), "Average perplexity should be a finite positive number"
     else:
-        print("No perplexities calculated.")
+        logger.info("No perplexities calculated.")
 
 
 def test_model_output_shapes(model, tokenizer, device):
@@ -208,21 +238,21 @@ def test_model_output_shapes(model, tokenizer, device):
     with torch.no_grad():
         outputs = model(input_ids)
 
-    print(f"\nModel output shapes:")
-    print(f"Logits shape: {outputs.logits.shape}")
+    logger.info(f"\nModel output shapes:")
+    logger.info(f"Logits shape: {outputs.logits.shape}")
     if outputs.hidden_states is not None:
-        print(f"Hidden states shape: {outputs.hidden_states[-1].shape}")
+        logger.info(f"Hidden states shape: {outputs.hidden_states[-1].shape}")
     else:
-        print("Hidden states not returned by the model")
+        logger.info("Hidden states not returned by the model")
 
     # Check for nan values
     if torch.isnan(outputs.logits).any():
-        print("Warning: NaN values detected in logits")
+        logger.info("Warning: NaN values detected in logits")
     if (
             outputs.hidden_states is not None
             and torch.isnan(outputs.hidden_states[-1]).any()
     ):
-        print("Warning: NaN values detected in hidden states")
+        logger.info("Warning: NaN values detected in hidden states")
 
     assert outputs.logits.shape[0] == 1, "Batch size should be 1"
     assert outputs.logits.shape[1] == len(
@@ -244,14 +274,14 @@ def test_attention_mask(model, tokenizer, device):
         outputs_with_mask = model(input_ids, attention_mask=attention_mask)
         outputs_without_mask = model(input_ids)
 
-    print("\nTesting attention mask:")
+    logger.info("\nTesting attention mask:")
 
     # Check for nan values
     if (
             torch.isnan(outputs_with_mask.logits).any()
             or torch.isnan(outputs_without_mask.logits).any()
     ):
-        print("Warning: NaN values detected in logits")
+        logger.info("Warning: NaN values detected in logits")
         return
 
     diff = (
@@ -260,9 +290,10 @@ def test_attention_mask(model, tokenizer, device):
         .max()
         .item()
     )
-    print(f"Difference in last token logits: {diff:.4f}")
+    logger.info(f"Difference in last token logits: {diff:.4f}")
 
     assert diff > 0, "Outputs should differ when using attention mask"
+
 
 
 if __name__ == "__main__":
