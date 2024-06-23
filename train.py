@@ -1,4 +1,5 @@
 import sys
+from typing import Dict
 
 import matplotlib.pyplot as plt
 import pytorch_lightning as pl
@@ -366,7 +367,6 @@ def main():
         deterministic=True,
         log_every_n_steps=10,
     )
-
 
     logger.info("Starting training...")
     trainer.fit(model, datamodule=datamodule)
