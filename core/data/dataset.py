@@ -8,20 +8,8 @@ import time
 from tqdm import tqdm
 import torch
 import multiprocessing as mp
-from contextlib import contextmanager
 
 from core.utils.tokenizer import Tokenizer
-
-
-@contextmanager
-def limit_num_open_files(max_open):
-    import resource
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (max_open, hard))
-    try:
-        yield
-    finally:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
 def process_batch(args):
@@ -94,35 +82,53 @@ class SlimPajamaDataset(IterableDataset):
     def load_and_preprocess_data(self) -> List[Dict[str, torch.Tensor]]:
         start_time = time.time()
 
-        batches = []
-        current_batch = []
-        for i, example in enumerate(tqdm(self.dataset, desc=f"Collecting {self.split} data", total=self.num_examples)):
-            if i >= self.num_examples:
-                break
-            current_batch.append(example)
-            if len(current_batch) == self.batch_size:
-                batches.append(current_batch)
-                current_batch = []
-
-        if current_batch:
-            batches.append(current_batch)
-
+        chunk_size = 10000  # Process 10000 examples at a time
         preprocessed_data = []
-        chunk_size = min(10, len(batches))  # Process 10 batches at a time, or fewer if there are less than 10 batches
 
-        with limit_num_open_files(1024):  # Limit the number of open files
-            for i in range(0, len(batches), chunk_size):
-                chunk = batches[i:i + chunk_size]
-                with mp.Pool(processes=self.num_workers) as pool:
-                    for result in tqdm(
-                            pool.imap(process_batch, [(batch, self.tokenizer, self.max_length) for batch in chunk]),
-                            total=len(chunk),
-                            desc=f"Preprocessing chunk {i // chunk_size + 1}/{len(batches) // chunk_size + 1}"):
-                        preprocessed_data.extend(result)
+        for chunk_start in range(0, self.num_examples, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, self.num_examples)
+            logger.info(f"Processing examples {chunk_start} to {chunk_end}")
+
+            batches = []
+            current_batch = []
+            for i, example in enumerate(tqdm(self.dataset.skip(chunk_start).take(chunk_end - chunk_start),
+                                             desc=f"Collecting data for chunk {chunk_start}-{chunk_end}",
+                                             total=chunk_end - chunk_start)):
+                current_batch.append(example)
+                if len(current_batch) == self.batch_size:
+                    batches.append(current_batch)
+                    current_batch = []
+
+            if current_batch:
+                batches.append(current_batch)
+
+            with mp.Pool(processes=self.num_workers) as pool:
+                for result in tqdm(
+                        pool.imap(process_batch, [(batch, self.tokenizer, self.max_length) for batch in batches]),
+                        total=len(batches), desc=f"Preprocessing chunk {chunk_start}-{chunk_end}"):
+                    preprocessed_data.extend(result)
+
+            # Save intermediate results
+            intermediate_file = os.path.join(self.cache_dir, f"{self.split}_intermediate_{chunk_start}_{chunk_end}.pkl")
+            with open(intermediate_file, 'wb') as f:
+                pickle.dump(preprocessed_data, f)
+            logger.info(f"Saved intermediate results for examples {chunk_start} to {chunk_end}")
+
+            # Clear preprocessed_data to free up memory
+            preprocessed_data = []
+
+        # Combine all intermediate results
+        all_data = []
+        for chunk_start in range(0, self.num_examples, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, self.num_examples)
+            intermediate_file = os.path.join(self.cache_dir, f"{self.split}_intermediate_{chunk_start}_{chunk_end}.pkl")
+            with open(intermediate_file, 'rb') as f:
+                all_data.extend(pickle.load(f))
+            os.remove(intermediate_file)  # Remove intermediate file after combining
 
         end_time = time.time()
         logger.info(f"Dataset loading and preprocessing took {end_time - start_time:.2f} seconds")
-        return preprocessed_data
+        return all_data
 
     def __iter__(self):
         return iter(self.data)
