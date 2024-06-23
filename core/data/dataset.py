@@ -1,16 +1,37 @@
+import multiprocessing as mp
 import os
 import pickle
-from typing import Optional, Dict, List
-from datasets import load_dataset
-from torch.utils.data import IterableDataset
-from loguru import logger
 import time
-from tqdm import tqdm
+from typing import Optional, Dict, List
+
 import torch
-import multiprocessing as mp
-from functools import partial
+from datasets import load_dataset
+from loguru import logger
+from torch.utils.data import IterableDataset
+from tqdm import tqdm
 
 from core.utils.tokenizer import Tokenizer
+
+
+def process_batch(args):
+    batch, tokenizer, max_length = args
+    return [preprocess_example(example, tokenizer, max_length) for example in batch]
+
+
+def preprocess_example(example: Dict[str, str], tokenizer, max_length: int) -> Dict[str, torch.Tensor]:
+    inputs = tokenizer.tokenizer(
+        example["text"],
+        truncation=True,
+        max_length=max_length,
+        padding="max_length",
+        return_tensors="pt"
+    )
+
+    return {
+        "input_ids": inputs["input_ids"].squeeze(0),
+        "attention_mask": inputs["attention_mask"].squeeze(0),
+        "labels": inputs["input_ids"].squeeze(0).clone(),
+    }
 
 
 class SlimPajamaDataset(IterableDataset):
@@ -62,46 +83,29 @@ class SlimPajamaDataset(IterableDataset):
     def load_and_preprocess_data(self) -> List[Dict[str, torch.Tensor]]:
         start_time = time.time()
 
-        def process_batch(batch):
-            return [self.preprocess_example(_example) for _example in batch]
+        batches = []
+        current_batch = []
+        for i, example in enumerate(tqdm(self.dataset, desc=f"Collecting {self.split} data", total=self.num_examples)):
+            if i >= self.num_examples:
+                break
+            current_batch.append(example)
+            if len(current_batch) == self.batch_size:
+                batches.append(current_batch)
+                current_batch = []
+
+        if current_batch:
+            batches.append(current_batch)
 
         with mp.Pool(processes=self.num_workers) as pool:
-            batches = []
-            current_batch = []
-            for i, example in enumerate(
-                    tqdm(self.dataset, desc=f"Collecting {self.split} data", total=self.num_examples)):
-                if i >= self.num_examples:
-                    break
-                current_batch.append(example)
-                if len(current_batch) == self.batch_size:
-                    batches.append(current_batch)
-                    current_batch = []
-
-            if current_batch:
-                batches.append(current_batch)
-
             preprocessed_data = []
-            for result in tqdm(pool.imap(process_batch, batches), total=len(batches), desc="Preprocessing batches"):
+            for result in tqdm(
+                    pool.imap(process_batch, [(batch, self.tokenizer, self.max_length) for batch in batches]),
+                    total=len(batches), desc="Preprocessing batches"):
                 preprocessed_data.extend(result)
 
         end_time = time.time()
         logger.info(f"Dataset loading and preprocessing took {end_time - start_time:.2f} seconds")
         return preprocessed_data
-
-    def preprocess_example(self, example: Dict[str, str]) -> Dict[str, torch.Tensor]:
-        inputs = self.tokenizer.tokenizer(
-            example["text"],
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
-            return_tensors="pt"
-        )
-
-        return {
-            "input_ids": inputs["input_ids"].squeeze(0),
-            "attention_mask": inputs["attention_mask"].squeeze(0),
-            "labels": inputs["input_ids"].squeeze(0).clone(),
-        }
 
     def __iter__(self):
         return iter(self.data)
