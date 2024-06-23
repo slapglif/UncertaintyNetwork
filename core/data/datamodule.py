@@ -1,24 +1,25 @@
 # core/data/datamodule.py
 
 from typing import Optional
+
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
-from transformers import GPT2Tokenizer
 
-from .dataset import SlimPajamaDataset
-from torch.utils.data import DataLoader
+from core.data.dataset import SlimPajamaDataset
+from core.utils.tokenizer import Tokenizer
+
 
 class SlimPajamaDataModule(LightningDataModule):
     def __init__(
-        self,
-        tokenizer: Tokenizer,
-        max_length: int = 1024,
-        batch_size: int = 32,
-        num_workers: int = 4,
-        train_size: int = 100000,
-        val_size: int = 10000,
-        test_size: int = 10000,
-        streaming: bool = False,
+            self,
+            tokenizer: Tokenizer,
+            max_length: int = 1024,
+            batch_size: int = 32,
+            num_workers: int = 4,
+            train_size: int = 100000,
+            val_size: int = 10000,
+            test_size: int = 10000,
+            streaming: bool = False,
     ):
         super().__init__()
         self.tokenizer = tokenizer
