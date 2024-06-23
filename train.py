@@ -115,7 +115,7 @@ def main():
         "max_epochs": 10,
         "pad_token_id": 50256,
         "use_stable_embedding": True,
-        "streaming": True,  # Set this to False if you don't want to use streaming
+        "streaming": True,
     }
 
     logger.info("Initializing model...")
