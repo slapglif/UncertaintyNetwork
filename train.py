@@ -360,12 +360,6 @@ def main():
         log_every_n_steps=10,
     )
 
-    logger.info("Starting learning rate finder...")
-    try:
-        model.lr_range_test(datamodule)
-    except Exception as e:
-        logger.error(f"Error during learning rate finding: {str(e)}")
-        logger.info("Proceeding with default learning rate.")
 
     logger.info("Starting training...")
     trainer.fit(model, datamodule=datamodule)
