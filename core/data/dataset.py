@@ -1,16 +1,27 @@
-import multiprocessing as mp
 import os
 import pickle
-import time
 from typing import Optional, Dict, List
-
-import torch
 from datasets import load_dataset
-from loguru import logger
 from torch.utils.data import IterableDataset
+from loguru import logger
+import time
 from tqdm import tqdm
+import torch
+import multiprocessing as mp
+from contextlib import contextmanager
 
 from core.utils.tokenizer import Tokenizer
+
+
+@contextmanager
+def limit_num_open_files(max_open):
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max_open, hard))
+    try:
+        yield
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
 def process_batch(args):
@@ -96,12 +107,18 @@ class SlimPajamaDataset(IterableDataset):
         if current_batch:
             batches.append(current_batch)
 
-        with mp.Pool(processes=self.num_workers) as pool:
-            preprocessed_data = []
-            for result in tqdm(
-                    pool.imap(process_batch, [(batch, self.tokenizer, self.max_length) for batch in batches]),
-                    total=len(batches), desc="Preprocessing batches"):
-                preprocessed_data.extend(result)
+        preprocessed_data = []
+        chunk_size = min(10, len(batches))  # Process 10 batches at a time, or fewer if there are less than 10 batches
+
+        with limit_num_open_files(4096):  # Limit the number of open files
+            for i in range(0, len(batches), chunk_size):
+                chunk = batches[i:i + chunk_size]
+                with mp.Pool(processes=self.num_workers) as pool:
+                    for result in tqdm(
+                            pool.imap(process_batch, [(batch, self.tokenizer, self.max_length) for batch in chunk]),
+                            total=len(chunk),
+                            desc=f"Preprocessing chunk {i // chunk_size + 1}/{len(batches) // chunk_size + 1}"):
+                        preprocessed_data.extend(result)
 
         end_time = time.time()
         logger.info(f"Dataset loading and preprocessing took {end_time - start_time:.2f} seconds")
