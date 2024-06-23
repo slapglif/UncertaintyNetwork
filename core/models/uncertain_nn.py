@@ -6,13 +6,13 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from transformers import LogitsProcessor
-from transformers import PreTrainedModel, PretrainedConfig
+from transformers import PreTrainedModel
+from transformers import PretrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 from transformers.utils import ModelOutput
 
-# Import necessary components for the model
 from core.models.layers import (
     TransformerEncoderLayer,
     SentenceEncoder,
@@ -24,34 +24,34 @@ class UncertainTransformerConfig(PretrainedConfig):
     model_type = "uncertain_transformer"
 
     def __init__(
-        self,
-        vocab_size=50257,
-        d_model=768,
-        n_heads=12,
-        d_ff=3072,
-        n_layers=12,
-        dropout=0.1,
-        max_position_embeddings=1024,
-        layer_norm_epsilon=1e-5,
-        initializer_range=0.02,
-        use_cache=True,
-        pad_token_id=0,
-        bos_token_id=1,
-        eos_token_id=2,
-        use_mamba=True,
-        d_state=16,
-        d_conv=4,
-        expand_factor=2.0,
-        dt_rank=None,
-        dt_min=0.001,
-        dt_max=0.1,
-        dt_init="random",
-        dt_scale=1.0,
-        dt_init_floor=1e-4,
-        use_flash_attention=False,
-        n_inducing=10,
-        use_gelu_approximation=False,  # Add this line
-        **kwargs,
+            self,
+            vocab_size=50257,
+            d_model=768,
+            n_heads=12,
+            d_ff=3072,
+            n_layers=12,
+            dropout=0.1,
+            max_position_embeddings=1024,
+            layer_norm_epsilon=1e-5,
+            initializer_range=0.02,
+            use_cache=True,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+            use_mamba=True,
+            d_state=16,
+            d_conv=4,
+            expand_factor=2.0,
+            dt_rank=None,
+            dt_min=0.001,
+            dt_max=0.1,
+            dt_init="random",
+            dt_scale=1.0,
+            dt_init_floor=1e-4,
+            use_flash_attention=False,
+            n_inducing=10,
+            use_gelu_approximation=False,  # Add this line
+            **kwargs,
     ):
         super().__init__(
             pad_token_id=pad_token_id,
@@ -89,9 +89,6 @@ class UncertainTransformerConfig(PretrainedConfig):
         return self.d_model
 
 
-# In core/models/uncertain_nn.py
-
-
 class UncertainNN(nn.Module):
     def __init__(self, config: UncertainTransformerConfig):
         super().__init__()
@@ -121,17 +118,17 @@ class UncertainNN(nn.Module):
         )
 
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            token_type_ids: Optional[torch.LongTensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Tuple[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         """
         Forward pass of the UncertainNN model.
@@ -219,8 +216,24 @@ class UncertainNN(nn.Module):
         hidden_states = self.final_layer_norm(hidden_states)
 
         # Apply SentenceEncoder
-        batch_size, seq_len, _ = hidden_states.shape
+        batch_size = hidden_states.shape[0]  # Get batch size directly
+        seq_len = hidden_states.shape[1]  # Get sequence length directly
+
+        # Calculate the number of sentences based on the sequence length and max_position_embeddings
         num_sentences = seq_len // self.config.max_position_embeddings
+        remainder = seq_len % self.config.max_position_embeddings
+
+        if remainder > 0:
+            # Pad the sequence length to be a multiple of max_position_embeddings
+            padding_needed = self.config.max_position_embeddings - remainder
+            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, padding_needed))
+            seq_len += padding_needed
+
+        # If num_sentences is 0, it means the sequence is shorter than max_position_embeddings.
+        # In this case, we treat the entire sequence as one sentence.
+        if num_sentences == 0:
+            num_sentences = 1
+
         hidden_states = hidden_states.view(
             batch_size, num_sentences, self.config.max_position_embeddings, -1
         )
@@ -232,11 +245,20 @@ class UncertainNN(nn.Module):
         )
 
         if self.training:
+            # During training, sample from the Gaussian distribution defined by sentence_mean and sentence_var
             hidden_states = sentence_mean + torch.randn_like(
                 sentence_mean
             ) * torch.sqrt(sentence_var)
         else:
+            # During evaluation, use the mean as the output
             hidden_states = sentence_mean
+
+        # Flatten hidden_states back to the original shape for compatibility with subsequent layers
+        hidden_states = hidden_states.view(batch_size, seq_len, -1)
+
+        # Remove padding if added
+        if remainder > 0:
+            hidden_states = hidden_states[:, :seq_len - padding_needed, :]
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -279,7 +301,7 @@ class TemperatureSoftmaxLogitsProcessor(LogitsProcessor):
         self.temperature = temperature
 
     def __call__(
-        self, input_ids: torch.LongTensor, scores: torch.FloatTensor
+            self, input_ids: torch.LongTensor, scores: torch.FloatTensor
     ) -> torch.Tensor:
         """
         Applies temperature scaling and softmax to the input scores.
@@ -341,18 +363,18 @@ class UncertainTransformerLMHeadModel(PreTrainedModel, GenerationMixin):
         return self.transformer.embedding
 
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            token_type_ids: Optional[torch.LongTensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithCrossAttentions]:
         """
         Forward pass of the UncertainTransformerLMHeadModel.
@@ -458,12 +480,12 @@ class UncertainTransformerLMHeadModel(PreTrainedModel, GenerationMixin):
         return tuple(layer_past.index_select(0, beam_idx) for layer_past in past)
 
     def _update_model_kwargs_for_generation(
-        self,
-        outputs: ModelOutput,
-        model_kwargs: Dict[str, Any],
-        is_encoder_decoder: bool = False,
-        standardize_cache_format: bool = False,
-        num_new_tokens: int = 1,
+            self,
+            outputs: ModelOutput,
+            model_kwargs: Dict[str, Any],
+            is_encoder_decoder: bool = False,
+            standardize_cache_format: bool = False,
+            num_new_tokens: int = 1,
     ) -> Dict[str, Any]:
         # update past_key_values
         model_kwargs["past_key_values"] = self._extract_past_from_model_output(
@@ -505,18 +527,18 @@ class UncertainTransformerLMHeadModel(PreTrainedModel, GenerationMixin):
                 )
 
         if (
-            model_kwargs.get("use_cache", True)
-            and "cache_position" in model_kwargs
-            and model_kwargs["cache_position"] is not None
+                model_kwargs.get("use_cache", True)
+                and "cache_position" in model_kwargs
+                and model_kwargs["cache_position"] is not None
         ):
             model_kwargs["cache_position"] = (
-                model_kwargs["cache_position"][-1:] + num_new_tokens
+                    model_kwargs["cache_position"][-1:] + num_new_tokens
             )
 
         return model_kwargs
 
     def _extract_past_from_model_output(
-        self, outputs: ModelOutput, standardize_cache_format: bool = False
+            self, outputs: ModelOutput, standardize_cache_format: bool = False
     ):
         past = None
         if "past_key_values" in outputs:

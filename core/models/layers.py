@@ -76,8 +76,9 @@ class MultiHeadAttention(nn.Module):
         # Weighted sum of values
         attn_output = torch.matmul(attn_probs, v)
         logger.info(f"Attention output shape before transpose: {attn_output.shape}")
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len,
-                                                                    d_model)  # combined transpose and view
+        # Transpose and reshape to correct dimensions using attn_output.shape[0] for batch size
+        attn_output = attn_output.transpose(1, 2).contiguous().view(attn_output.shape[0], seq_len,
+                                                                    self.n_heads * self.d_k)
         logger.info(f"Attention output shape after transpose: {attn_output.shape}")
 
         # Final linear projection
