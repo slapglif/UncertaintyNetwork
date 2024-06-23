@@ -115,6 +115,7 @@ def main():
         "max_epochs": 10,
         "pad_token_id": 50256,
         "use_stable_embedding": True,
+        "streaming": True,  # Set this to False if you don't want to use streaming
     }
 
     logger.info("Initializing model...")
@@ -129,6 +130,7 @@ def main():
         tokenizer=tokenizer,
         max_length=hparams["max_length"],
         batch_size=hparams["batch_size"],
+        streaming=hparams["streaming"],
     )
     logger.info("Setting up callbacks...")
     checkpoint_callback = ModelCheckpoint(

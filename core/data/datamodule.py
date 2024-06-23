@@ -5,7 +5,7 @@ from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
 from transformers import GPT2Tokenizer
 
-from core.data.dataset import SlimPajamaDataset
+from .dataset import SlimPajamaDataset
 
 class SlimPajamaDataModule(LightningDataModule):
     def __init__(
@@ -17,6 +17,7 @@ class SlimPajamaDataModule(LightningDataModule):
         train_size: int = 100000,
         val_size: int = 10000,
         test_size: int = 10000,
+        streaming: bool = False,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -26,6 +27,7 @@ class SlimPajamaDataModule(LightningDataModule):
         self.train_size = train_size
         self.val_size = val_size
         self.test_size = test_size
+        self.streaming = streaming
 
     def setup(self, stage: Optional[str] = None):
         if stage == "fit" or stage is None:
@@ -34,12 +36,14 @@ class SlimPajamaDataModule(LightningDataModule):
                 tokenizer=self.tokenizer,
                 max_length=self.max_length,
                 num_examples=self.train_size,
+                streaming=self.streaming,
             )
             self.val_dataset = SlimPajamaDataset(
                 split="validation",
                 tokenizer=self.tokenizer,
                 max_length=self.max_length,
                 num_examples=self.val_size,
+                streaming=self.streaming,
             )
 
         if stage == "test" or stage is None:
@@ -48,6 +52,7 @@ class SlimPajamaDataModule(LightningDataModule):
                 tokenizer=self.tokenizer,
                 max_length=self.max_length,
                 num_examples=self.test_size,
+                streaming=self.streaming,
             )
 
     def train_dataloader(self):
@@ -56,7 +61,8 @@ class SlimPajamaDataModule(LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
-            shuffle=True,
+            shuffle=not self.streaming,
+            persistent_workers=True
         )
 
     def val_dataloader(self):
@@ -65,6 +71,7 @@ class SlimPajamaDataModule(LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
+            persistent_workers=True
         )
 
     def test_dataloader(self):
@@ -73,4 +80,5 @@ class SlimPajamaDataModule(LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
+            persistent_workers=True
         )
