@@ -1,14 +1,13 @@
-# core/tests/evaluation_harness.py
 # core/tests/evaluation.py
 import os
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from loguru import logger
 from tqdm import tqdm
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, GenerationConfig, StoppingCriteria
 
 from core.models.uncertain_nn import UncertainTransformerLMHeadModel, UncertainTransformerConfig
 from core.utils.metrics import calculate_bleu_score, calculate_perplexity, calculate_rouge_scores
@@ -16,15 +15,46 @@ from core.utils.tokenizer import Tokenizer
 from core.utils.utils import generate_text
 
 
+class MaxLengthCriteria(StoppingCriteria):
+    """
+    Custom stopping criteria based on maximum length.
+
+    This class implements a stopping criteria that halts generation
+    when the generated sequence reaches a specified maximum length.
+
+    Args:
+        max_length (int): The maximum length of the generated sequence.
+    """
+
+    def __init__(self, max_length: int):
+        self.max_length = max_length
+
+    def __call__(
+            self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
+    ) -> bool:
+        """
+        Check if the stopping condition is met.
+
+        Args:
+            input_ids (torch.LongTensor): The generated token IDs.
+            scores (torch.FloatTensor): The scores for each token.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            bool: True if the stopping condition is met, False otherwise.
+        """
+        return input_ids.shape[-1] >= self.max_length
+
+
 def evaluate_model(
-        model: PreTrainedModel,
-        tokenizer: Tokenizer,
-        prompts: List[str],
-        checkpoint_path: Optional[str] = None,
-        max_length: int = 100,
-        num_return_sequences: int = 1,
-        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-):
+    model: PreTrainedModel,
+    tokenizer: Tokenizer,
+    prompts: List[str],
+    checkpoint_path: Optional[str] = None,
+    max_length: int = 100,
+    num_return_sequences: int = 1,
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+) -> None:
     """
     Evaluate the model's performance on a set of prompts.
 
@@ -58,6 +88,11 @@ def evaluate_model(
             device=device,
         )
 
+        # Check if text was generated:
+        if len(generated_texts) == 0:
+            logger.warning(f"No text generated for prompt: {prompt}")
+            continue
+
         for generated_text in generated_texts:
             perplexity = calculate_perplexity(model, tokenizer, generated_text, device)
             bleu_score = calculate_bleu_score([[prompt]], [generated_text])
@@ -67,9 +102,13 @@ def evaluate_model(
             bleu_scores.append(bleu_score)
             rouge_scores.append(rouge_score)
 
-    avg_perplexity = np.mean(perplexities)
-    avg_bleu_score = np.mean(bleu_scores)
-    avg_rouge_scores = {key: np.mean([score[key] for score in rouge_scores]) for key in rouge_scores[0]}
+    avg_perplexity = np.mean(perplexities) if perplexities else float("nan")
+    avg_bleu_score = np.mean(bleu_scores) if bleu_scores else float("nan")
+    avg_rouge_scores = (
+        {key: np.mean([score[key] for score in rouge_scores]) for key in rouge_scores[0]}
+        if rouge_scores
+        else {}
+    )
 
     logger.info(f"Average Perplexity: {avg_perplexity:.2f}")
     logger.info(f"Average BLEU Score: {avg_bleu_score:.2f}")
@@ -81,7 +120,9 @@ def evaluate_model(
     visualize_metrics(perplexities, bleu_scores, rouge_scores)
 
 
-def visualize_metrics(perplexities: List[float], bleu_scores: List[float], rouge_scores: List[dict]):
+def visualize_metrics(
+    perplexities: List[float], bleu_scores: List[float], rouge_scores: List[dict]
+) -> None:
     """
     Visualize the evaluation metrics.
 
@@ -124,7 +165,9 @@ def visualize_metrics(perplexities: List[float], bleu_scores: List[float], rouge
 
 def main():
     # Set up logging
-    logger.add("evaluation.log", format="{time} {level} {message}", level="INFO", rotation="10 MB")
+    logger.add(
+        "evaluation.log", format="{time} {level} {message}", level="INFO", rotation="10 MB"
+    )
 
     # Load the tokenizer
     tokenizer = Tokenizer.from_pretrained("gpt2")

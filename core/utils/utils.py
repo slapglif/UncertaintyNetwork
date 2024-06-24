@@ -49,6 +49,24 @@ def generate_text(
         num_return_sequences: int = 1,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ) -> List[str]:
+    """
+    Generates text using the specified model and tokenizer with given parameters.
+
+    Args:
+        model (PreTrainedModel): The pre-trained language model.
+        tokenizer (Tokenizer): The tokenizer for encoding and decoding text.
+        prompt (str): The input prompt to generate text from.
+        max_length (int, optional): The maximum length of the generated text (default: 100).
+        temperature (float, optional): The temperature parameter for sampling (default: 0.7).
+        top_k (int, optional): The number of top-k tokens to consider for sampling (default: 50).
+        top_p (float, optional): The probability threshold for nucleus sampling (default: 0.95).
+        repetition_penalty (float, optional): The repetition penalty (default: 1.2).
+        num_return_sequences (int, optional): The number of sequences to generate for each prompt (default: 1).
+        device (torch.device, optional): The device to run the model on (default: CUDA if available, else CPU).
+
+    Returns:
+        List[str]: A list of generated texts.
+    """
     model.to(device)
     model.eval()
 

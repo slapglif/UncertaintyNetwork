@@ -1,12 +1,13 @@
 # core/models/layers.py
-
-from typing import Optional, Tuple
+from typing import Optional
+from typing import Tuple
 from typing import Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
+from torch import Tensor
 from transformers import PretrainedConfig
 
 from core.utils.utils import _check_nan_inf
@@ -28,12 +29,12 @@ class MultiHeadAttention(nn.Module):
         self.window_size = config.sliding_window_size
 
     def forward(
-        self,
-        x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
+            self,
+            x: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_value: Optional[Tuple[torch.Tensor]] = None,
+            output_attentions: bool = False,
+            use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor]], Optional[torch.Tensor]]:
         batch_size, seq_len, _ = x.shape
         logger.debug(f"Input shape: {x.shape}")
@@ -75,7 +76,8 @@ class MultiHeadAttention(nn.Module):
         attn_probs = self.dropout(attn_probs)
 
         # Compute output
-        attn_output = torch.matmul(attn_probs, v)
+        #  <-- Change here: v.transpose(-2, -1) to align shapes for matmul
+        attn_output = torch.matmul(attn_probs, v.transpose(-2, -1))
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
         output = self.W_o(attn_output)
 
@@ -93,7 +95,8 @@ class MultiHeadAttention(nn.Module):
         logger.debug(f"Applying sliding window attention. attn_scores shape: {attn_scores.shape}")
 
         if seq_len <= self.window_size:
-            logger.warning(f"Sequence length {seq_len} is shorter than or equal to window size {self.window_size}. Applying causal mask only.")
+            logger.warning(
+                f"Sequence length {seq_len} is shorter than or equal to window size {self.window_size}. Applying causal mask only.")
             causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=attn_scores.device, dtype=torch.bool))
             return attn_scores.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
 
@@ -117,14 +120,16 @@ class MultiHeadAttention(nn.Module):
         )
 
         # Create a causal mask to prevent attending to future tokens within each window
-        causal_mask = torch.tril(torch.ones(self.window_size, self.window_size, device=attn_scores.device, dtype=torch.bool))
+        causal_mask = torch.tril(
+            torch.ones(self.window_size, self.window_size, device=attn_scores.device, dtype=torch.bool))
         causal_mask = causal_mask.view(1, 1, 1, self.window_size, 1, self.window_size)
 
         # Apply the causal mask within each window
         attn_scores = attn_scores.masked_fill(~causal_mask, float("-inf"))
 
         # Reshape the attention scores back to the original shape
-        attn_scores = attn_scores.view(batch_size, n_heads, num_windows * self.window_size, num_windows * self.window_size)
+        attn_scores = attn_scores.view(batch_size, n_heads, num_windows * self.window_size,
+                                       num_windows * self.window_size)
 
         # Remove padding if it was added
         if padding_len > 0:
@@ -135,7 +140,8 @@ class MultiHeadAttention(nn.Module):
 
     @staticmethod
     def _prepare_attention_mask(attention_mask: torch.Tensor, batch_size: int, seq_len: int) -> torch.Tensor:
-        logger.debug(f"Preparing attention mask. Input shape: {attention_mask.shape}, batch_size: {batch_size}, seq_len: {seq_len}")
+        logger.debug(
+            f"Preparing attention mask. Input shape: {attention_mask.shape}, batch_size: {batch_size}, seq_len: {seq_len}")
 
         if attention_mask.dim() == 1:
             attention_mask = attention_mask.unsqueeze(0)
@@ -150,7 +156,8 @@ class MultiHeadAttention(nn.Module):
 
         # Ensure the mask covers the entire sequence length
         if attention_mask.shape[-1] < seq_len:
-            logger.warning(f"Attention mask is shorter than sequence length. Padding mask from {attention_mask.shape[-1]} to {seq_len}")
+            logger.warning(
+                f"Attention mask is shorter than sequence length. Padding mask from {attention_mask.shape[-1]} to {seq_len}")
             padding = torch.ones(batch_size, 1, 1, seq_len - attention_mask.shape[-1], device=attention_mask.device)
             attention_mask = torch.cat([attention_mask, padding], dim=-1)
 
@@ -332,7 +339,7 @@ class CEMA(nn.Module):
 
 class MambaLayer(nn.Module):
     """
-    Mamba layer for sequence processing, inspired by the Mamba neural network architecture.
+    Mamba layer implementation with selective scan operation.
 
     This layer uses a combination of convolution, selective scan operation, and gating mechanisms
     to capture complex temporal dependencies in sequential data.
@@ -344,15 +351,6 @@ class MambaLayer(nn.Module):
         d_conv (int): Kernel size for the convolution operation.
         expand_factor (float): Expansion factor for the inner dimension.
         d_inner (int): Expanded inner dimension.
-        in_proj (nn.Linear): Linear projection for the input.
-        in_proj_bias (nn.Parameter): Bias term for the input projection.
-        conv (nn.Conv1d): 1D convolution layer.
-        activation (nn.Module): Activation function (SiLU).
-        x_proj (nn.Linear): Linear projection for the intermediate output.
-        dt (nn.Parameter): Learnable time decay parameter.
-        A (nn.Parameter): Learnable parameter for state update.
-        D (nn.Parameter): Learnable parameter for scaling.
-        out_proj (nn.Linear): Linear projection for the output.
     """
 
     def __init__(self, config):
@@ -364,13 +362,8 @@ class MambaLayer(nn.Module):
         self.expand_factor = config.expand_factor
         self.d_inner = int(self.expand_factor * self.d_model)
 
-        logger.debug(
-            f"MambaLayer init: d_model={self.d_model}, d_state={self.d_state}, d_inner={self.d_inner}"
-        )
-
         # Input projection
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2)
-        self.in_proj_bias = nn.Parameter(torch.randn(self.d_inner, self.d_state))
 
         # Convolution layer
         self.conv = nn.Conv1d(
@@ -390,23 +383,24 @@ class MambaLayer(nn.Module):
         # Learnable parameters
         self.dt = nn.Parameter(torch.randn(self.d_inner))
         self.A = nn.Parameter(torch.randn(self.d_state, self.d_state))
+        self.B = nn.Parameter(torch.zeros(self.d_inner, self.d_state))
+        self.C = nn.Parameter(torch.zeros(self.d_inner, self.d_state))
         self.D = nn.Parameter(torch.ones(self.d_inner))
 
         # Output projection
         self.out_proj = nn.Linear(self.d_inner, self.d_model)
 
-    def forward(self, x: torch.Tensor, **_) -> torch.Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         """
         Forward pass through the Mamba layer.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+            x (Tensor): Input tensor of shape (batch_size, seq_len, d_model).
 
         Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_model).
+            Tensor: Output tensor of shape (batch_size, seq_len, d_model).
         """
         batch_size, seq_len, _ = x.shape
-        logger.debug(f"MambaLayer forward: input shape = {x.shape}")
 
         # Input projection and splitting
         x_and_res = self.in_proj(x)
@@ -420,16 +414,28 @@ class MambaLayer(nn.Module):
         # Apply activation
         x = self.activation(x)
 
-        # Project x and split into B and C
+        # Project x and split into Δ and B
         x_dbl = self.x_proj(x)
-        B, C = x_dbl.chunk(2, dim=-1)
+        delta, B = x_dbl.chunk(2, dim=-1)
 
-        # Compute Δ
-        dt = torch.exp(self.dt.unsqueeze(0).unsqueeze(0))
-        logger.debug(f"MambaLayer: dt shape after exp = {dt.shape}")
+        # Compute A_bar
+        delta = torch.exp(-torch.exp(self.dt[None, None, None]) * delta.abs())
+        # Reshape delta for diag_embed
+        delta_reshaped = delta.view(batch_size * seq_len, self.d_state)
+        A_bar = torch.diag_embed(delta_reshaped) @ self.A
+        A_bar = A_bar.view(batch_size, seq_len, self.d_state, self.d_state)
 
         # Apply selective scan
-        y = self._selective_scan(x, dt, self.A, B, C, self.D)
+        x = x.unsqueeze(-1)  # (batch_size, seq_len, d_inner, 1)
+        B = B.unsqueeze(-1)  # (batch_size, seq_len, d_state, 1)
+        # Reshape A_bar for selective scan (fix here)
+        A_bar = A_bar.view(batch_size * seq_len, self.d_state, self.d_state)
+
+        # Use selective scan for all cases
+        y = self._selective_scan(A_bar, self.dt, self.A, self.B, self.C, self.D)
+
+        # Scale the output
+        y = y.squeeze(-1) * self.D
 
         # Add residual connection
         y = y + res
@@ -465,7 +471,7 @@ class MambaLayer(nn.Module):
         d_state = A.shape[0]
 
         # Ensure dt has the correct dimensions:
-        dt = dt[:, :, :d_state].repeat(1, 1, (seq_len // dt.size(2)) + 1)[:, :, :seq_len]
+        dt = dt.unsqueeze(-1).expand(-1, -1, d_state)  # <--- Change: Expand dt to match d_state
 
         logger.debug(
             f"_selective_scan: x shape = {x.shape}, dt shape = {dt.shape}, A shape = {A.shape}, B shape = {B.shape}, C shape = {C.shape}, D shape = {D.shape}"
@@ -479,12 +485,13 @@ class MambaLayer(nn.Module):
 
         hs = []
         for i in range(seq_len):
-            _ = x[:, i, :]
+            x_t = x[:, i, :]
             # Calculate A_t using dt, ensuring correct indexing and dimension alignment
-            A_t = torch.exp(dt[:, :, i] * A)  # Use i directly for indexing
+            A_t = torch.exp(dt[:, i, :] * A)  # <--- Change: Use i directly for indexing dt
 
             # Update hidden state h
-            h = torch.tanh(A_t @ h.unsqueeze(-1)).squeeze(-1) + B[:, i, :] * h + C[:, i, :]
+            h = torch.tanh(A_t @ h.unsqueeze(-1)).squeeze(-1) + B[:, i, :] * h + C[:, i,
+                                                                                 :]  # <--- Change: Use element-wise multiplication for B and h
 
             # Check for NaN or Inf values in h
             _check_nan_inf(h, "hidden state h")
