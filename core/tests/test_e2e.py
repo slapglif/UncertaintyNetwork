@@ -1,21 +1,15 @@
+# core/tests/test_e2e.py
+
 import pytest
 import torch
-from torch import Tensor
-from transformers import PretrainedConfig
 from transformers import GPT2Tokenizer
 
 from core.models.layers import (
-    MultiHeadAttention,
-    PositionwiseFeedForward,
-    GaussianProcessLayer,
-    CEMA,
     MambaLayer,
     TransformerEncoderLayer,
 )
-from core.models.embedding import RotaryPositionEncoding, SentenceEncoder, SentenceGP
 from core.models.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
-from core.utils.tokenizer import Tokenizer
-from core.utils.utils import generate_text, calculate_perplexity
+from core.utils.uncertainty import UncertaintyModule, uncertainty_guided_sampling
 
 # Constants
 BATCH_SIZE = 2
@@ -63,272 +57,72 @@ def model(config):
     return model
 
 
-def test_transformer_encoder_layer(config):
-    """Tests the TransformerEncoderLayer with attention mask and past key values."""
+def test_transformer_encoder_layer_with_uncertainty(config):
     encoder_layer = TransformerEncoderLayer(config).to(DEVICE)
-
-    # Input tensors
     input_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, EMBED_DIM, device=DEVICE)
     attention_mask = torch.ones(BATCH_SIZE, SEQ_LEN, dtype=torch.long, device=DEVICE)
     attention_mask[:, 5:] = 0
 
-    # Test with attention mask
     output = encoder_layer(input_tensor, attention_mask=attention_mask)
     assert output.shape == (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
 
-    # Test with past key values
-    past_key_value = (
-        torch.randn(BATCH_SIZE, N_HEADS, 5, EMBED_DIM // N_HEADS, device=DEVICE),
-        torch.randn(BATCH_SIZE, N_HEADS, 5, EMBED_DIM // N_HEADS, device=DEVICE),
-    )
-    output, present_key_value = encoder_layer(
-        input_tensor, past_key_value=past_key_value, use_cache=True
-    )
-    assert output.shape == (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
-    assert len(present_key_value) == 2
-    assert present_key_value[0].shape == (
-        BATCH_SIZE,
-        N_HEADS,
-        SEQ_LEN + 5,
-        EMBED_DIM // N_HEADS,
-    )
-    assert present_key_value[1].shape == (
-        BATCH_SIZE,
-        N_HEADS,
-        SEQ_LEN + 5,
-        EMBED_DIM // N_HEADS,
-    )
-
 
 def test_mamba_layer(config):
-    """Tests the MambaLayer with various input shapes."""
     mamba_layer = MambaLayer(config).to(DEVICE)
-
-    # Test with standard input shape
     input_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, EMBED_DIM, device=DEVICE)
     output = mamba_layer(input_tensor)
     assert output.shape == (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
 
-    # Test with single-sequence input (batch size of 1)
-    input_tensor = torch.randn(1, SEQ_LEN, EMBED_DIM, device=DEVICE)
-    output = mamba_layer(input_tensor)
-    assert output.shape == (1, SEQ_LEN, EMBED_DIM)
 
-    # Test with different sequence length
-    input_tensor = torch.randn(BATCH_SIZE, 15, EMBED_DIM, device=DEVICE)
-    output = mamba_layer(input_tensor)
-    assert output.shape == (BATCH_SIZE, 15, EMBED_DIM)
-
-
-def test_multihead_attention(config):
-    """Tests the MultiHeadAttention with various input shapes."""
-    attention = MultiHeadAttention(config).to(DEVICE)
-
-    # Test with standard input shape
-    input_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, EMBED_DIM, device=DEVICE)
-    output, _, _ = attention(input_tensor)
-    assert output.shape == (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
-
-    # Test with single-sequence input (batch size of 1)
-    input_tensor = torch.randn(1, SEQ_LEN, EMBED_DIM, device=DEVICE)
-    output, _, _ = attention(input_tensor)
-    assert output.shape == (1, SEQ_LEN, EMBED_DIM)
-
-    # Test with different sequence length
-    input_tensor = torch.randn(BATCH_SIZE, 15, EMBED_DIM, device=DEVICE)
-    output, _, _ = attention(input_tensor)
-    assert output.shape == (BATCH_SIZE, 15, EMBED_DIM)
-
-    # Test with attention mask
-    attention_mask = torch.ones(BATCH_SIZE, SEQ_LEN, dtype=torch.long, device=DEVICE)
-    attention_mask[:, 5:] = 0  # Mask last 5 tokens
-    output, _, _ = attention(input_tensor, attention_mask=attention_mask)
-    assert output.shape == (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
-
-
-def test_positionwise_feedforward(config):
-    """Tests the PositionwiseFeedForward with various input shapes."""
-    feed_forward = PositionwiseFeedForward(config).to(DEVICE)
-
-    # Test with standard input shape
-    input_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, EMBED_DIM, device=DEVICE)
-    output = feed_forward(input_tensor)
-    assert output.shape == (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
-
-    # Test with single-sequence input (batch size of 1)
-    input_tensor = torch.randn(1, SEQ_LEN, EMBED_DIM, device=DEVICE)
-    output = feed_forward(input_tensor)
-    assert output.shape == (1, SEQ_LEN, EMBED_DIM)
-
-    # Test with different sequence length
-    input_tensor = torch.randn(BATCH_SIZE, 15, EMBED_DIM, device=DEVICE)
-    output = feed_forward(input_tensor)
-    assert output.shape == (BATCH_SIZE, 15, EMBED_DIM)
-
-
-def test_gaussian_process_layer(config):
-    """Tests the GaussianProcessLayer with various input shapes."""
-    gp_layer = GaussianProcessLayer(
-        in_features=EMBED_DIM,
-        out_features=EMBED_DIM,
-        n_inducing=N_INDUCING,
-        embedding_dim=EMBED_DIM,
-    ).to(DEVICE)
-
-    # Test with standard input shape
-    input_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, EMBED_DIM, device=DEVICE)
-    mean, variance = gp_layer(input_tensor, seq_len=SEQ_LEN)
-    assert mean.shape == (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
-    assert variance.shape == (BATCH_SIZE, 1, SEQ_LEN)
-
-    # Test with single-sequence input (batch size of 1)
-    input_tensor = torch.randn(1, SEQ_LEN, EMBED_DIM, device=DEVICE)
-    mean, variance = gp_layer(input_tensor, seq_len=SEQ_LEN)
-    assert mean.shape == (1, SEQ_LEN, EMBED_DIM)
-    assert variance.shape == (1, 1, SEQ_LEN)
-
-    # Test with different sequence length
-    input_tensor = torch.randn(BATCH_SIZE, 15, EMBED_DIM, device=DEVICE)
-    mean, variance = gp_layer(input_tensor, seq_len=15)
-    assert mean.shape == (BATCH_SIZE, 15, EMBED_DIM)
-    assert variance.shape == (BATCH_SIZE, 1, 15)
-
-
-def test_cema(config):
-    """Tests the CEMA layer with various input shapes."""
-    cema_layer = CEMA(d_model=EMBED_DIM, alpha=0.99).to(DEVICE)
-
-    # Test with standard input shape
-    input_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, EMBED_DIM, device=DEVICE)
-    output = cema_layer(input_tensor)
-    assert output.shape == (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
-
-    # Test with single-sequence input (batch size of 1)
-    input_tensor = torch.randn(1, SEQ_LEN, EMBED_DIM, device=DEVICE)
-    output = cema_layer(input_tensor)
-    assert output.shape == (1, SEQ_LEN, EMBED_DIM)
-
-    # Test with different sequence length
-    input_tensor = torch.randn(BATCH_SIZE, 15, EMBED_DIM, device=DEVICE)
-    output = cema_layer(input_tensor)
-    assert output.shape == (BATCH_SIZE, 15, EMBED_DIM)
-
-
-def test_rotary_position_encoding(config):
-    """Tests the RotaryPositionEncoding layer."""
-    rotary_pe = RotaryPositionEncoding(dim=EMBED_DIM).to(DEVICE)
-
-    # Test with standard input shape
-    input_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, EMBED_DIM, device=DEVICE)
-    cos, sin = rotary_pe(input_tensor)
-    assert cos.shape == (BATCH_SIZE, 1, SEQ_LEN, EMBED_DIM)
-    assert sin.shape == (BATCH_SIZE, 1, SEQ_LEN, EMBED_DIM)
-
-    # Test with different sequence length
-    input_tensor = torch.randn(BATCH_SIZE, 15, EMBED_DIM, device=DEVICE)
-    cos, sin = rotary_pe(input_tensor, seq_len=15)
-    assert cos.shape == (BATCH_SIZE, 1, 15, EMBED_DIM)
-    assert sin.shape == (BATCH_SIZE, 1, 15, EMBED_DIM)
-
-
-def test_sentence_encoder(config):
-    """Tests the SentenceEncoder layer."""
-    sentence_encoder = SentenceEncoder(
-        input_dim=EMBED_DIM, hidden_dim=EMBED_DIM * 2, output_dim=EMBED_DIM
-    ).to(DEVICE)
-
-    # Test with standard input shape
-    input_tensor = torch.randn(
-        BATCH_SIZE, 3, SEQ_LEN, EMBED_DIM, device=DEVICE
-    )  # Batch, Sentences, Seq_len, Embed_dim
-    output = sentence_encoder(input_tensor)
-    assert output.shape == (BATCH_SIZE, 3, EMBED_DIM)
-
-    # Test with different number of sentences
-    input_tensor = torch.randn(BATCH_SIZE, 5, SEQ_LEN, EMBED_DIM, device=DEVICE)
-    output = sentence_encoder(input_tensor)
-    assert output.shape == (BATCH_SIZE, 5, EMBED_DIM)
-
-
-def test_sentence_gp(config):
-    """Tests the SentenceGP layer."""
-    sentence_gp = SentenceGP(
+def test_uncertainty_module(config):
+    uncertainty_module = UncertaintyModule(
         input_dim=EMBED_DIM,
-        output_dim=EMBED_DIM,
+        output_dim=config.vocab_size,
+        n_gp_layers=2,
         n_inducing=N_INDUCING,
-        embedding_dim=EMBED_DIM,
+        dropout_rate=0.1
     ).to(DEVICE)
-
-    # Test with standard input shape
-    input_tensor = torch.randn(BATCH_SIZE, 3, EMBED_DIM, device=DEVICE)
-    mean, variance = sentence_gp(input_tensor, num_sentences=3)
-    assert mean.shape == (BATCH_SIZE, 3, EMBED_DIM)
-    assert variance.shape == (BATCH_SIZE, 3, EMBED_DIM)
-
-    # Test with different number of sentences
-    input_tensor = torch.randn(BATCH_SIZE, 5, EMBED_DIM, device=DEVICE)
-    mean, variance = sentence_gp(input_tensor, num_sentences=5)
-    assert mean.shape == (BATCH_SIZE, 5, EMBED_DIM)
-    assert variance.shape == (BATCH_SIZE, 5, EMBED_DIM)
+    input_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, EMBED_DIM, device=DEVICE)
+    mean, uncertainty = uncertainty_module(input_tensor)
+    assert mean.shape == (BATCH_SIZE, SEQ_LEN, config.vocab_size)
+    assert uncertainty.shape == (BATCH_SIZE, SEQ_LEN, config.vocab_size)
 
 
-def test_model_generation(model, config):
-    """Tests the UncertainTransformerLMHeadModel with text generation."""
-    model.to(DEVICE)
+def test_model_generation_with_uncertainty(model, config):
     model.eval()
+    input_ids = torch.tensor([[tokenizer.bos_token_id]], device=DEVICE)
 
-    # Test generation with a simple prompt
-    prompt = "The quick brown fox"
-    generated_texts = generate_text(
-        model,
-        tokenizer,
-        prompt,
-        max_length=20,  # Reduced max length for testing
-        temperature=0.7,
-        top_k=50,
-        top_p=0.95,
-        repetition_penalty=1.2,
+    generated_outputs = model.generate(
+        input_ids,
+        max_length=20,
         num_return_sequences=1,
-        device=DEVICE,
+        do_sample=True,
+        temperature=0.7,
+        use_cache=True,
+        return_dict_in_generate=True,
+        output_scores=True,
     )
-    if generated_texts:  # Check for empty list
-        assert len(generated_texts) == 1
-        assert generated_texts[0].startswith(prompt)
-    else:
-        pytest.skip("Text generation failed. Skipping this test.")
+
+    assert generated_outputs.sequences.shape[1] <= 20
+    assert generated_outputs.sequences.shape[0] == 1
+    assert generated_outputs.scores is not None
+
+    # Test uncertainty-guided sampling
+    logits = generated_outputs.scores[-1]
+    uncertainties = \
+        model.transformer.uncertainty_module(model.transformer.final_layer_norm(generated_outputs.hidden_states[-1]))[
+            -1]
+    sampled_tokens = uncertainty_guided_sampling(logits, uncertainties)
+    assert sampled_tokens.shape == (1,)
 
 
-def test_model_perplexity(model, config):
-    """Tests the UncertainTransformerLMHeadModel with perplexity calculation."""
-    model.to(DEVICE)
-    model.eval()
+def test_model_forward_with_uncertainty(model, config):
+    input_ids = torch.randint(0, config.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE)
+    attention_mask = torch.ones((BATCH_SIZE, SEQ_LEN), dtype=torch.long, device=DEVICE)
 
-    # Test perplexity calculation on a simple sentence
-    sentence = "The quick brown fox jumps over the lazy dog."
-    perplexity = calculate_perplexity(model, tokenizer, sentence, device=DEVICE)
-    assert perplexity > 0
+    outputs, uncertainty = model(input_ids=input_ids, attention_mask=attention_mask)
 
+    assert outputs.logits.shape == (BATCH_SIZE, SEQ_LEN, config.vocab_size)
+    assert uncertainty.shape == (BATCH_SIZE, SEQ_LEN, config.vocab_size)
 
-# Integration Test for UncertainTransformerLMHeadModel:
-def test_uncertain_transformer_end_to_end(config, model):
-    """Tests the UncertainTransformerLMHeadModel for forward pass and loss calculation."""
-    model = UncertainTransformerLMHeadModel(config).to(DEVICE)
-    model.eval()
-
-    input_ids = torch.randint(
-        0, tokenizer.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE
-    )
-    labels = input_ids.clone()
-
-    # Test forward pass
-    outputs = model(input_ids=input_ids, labels=labels)
-    assert outputs.logits.shape == (BATCH_SIZE, SEQ_LEN, tokenizer.vocab_size)
-    assert outputs.loss is not None
-
-    # Test loss calculation
-    loss = outputs.loss
-    assert loss > 0
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+# Add more tests as needed

@@ -123,52 +123,6 @@ class KANFeedForward(nn.Module):
         return x.view(*original_shape[:-1], self.config.d_model)
 
 
-class GaussianProcessLayer(nn.Module):
-    """
-    Gaussian Process layer for uncertainty estimation.
-
-    Args:
-        input_dim (int): The input feature dimension.
-        output_dim (int): The output feature dimension.
-        num_inducing (int, optional): The number of inducing points for the Gaussian Process. Defaults to 10.
-    """
-
-    def __init__(self, input_dim, output_dim, num_inducing=10):
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.num_inducing = num_inducing
-
-        self.inducing_points = nn.Parameter(torch.randn(num_inducing, input_dim))
-        self.covar_module = nn.Linear(input_dim, num_inducing, bias=False)
-        self.mean_module = nn.Linear(input_dim, output_dim)
-
-        self.register_parameter("noise", nn.Parameter(torch.tensor(0.1)))
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass of the GaussianProcessLayer.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: The mean and variance of the GP posterior.
-        """
-        covar = F.relu(self.covar_module(x))
-        mean = self.mean_module(x)
-
-        # Compute kernel matrix
-        diff = x.unsqueeze(2) - self.inducing_points.unsqueeze(0).unsqueeze(0)
-        kernel = torch.exp(-0.5 * torch.sum(diff ** 2, dim=-1) / self.noise.exp())
-
-        # Compute GP posterior
-        weight = torch.einsum('bni,bno->bio', kernel, covar)
-        variance = torch.sum(weight * kernel, dim=1)
-
-        return mean, variance
-
-
 class CEMA(nn.Module):
     """
     Circular Exponential Moving Average (CEMA) layer.

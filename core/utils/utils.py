@@ -1,5 +1,6 @@
 # core/utils/utils.py
 
+import inspect
 from typing import Tuple, List, Union
 
 import torch
@@ -142,15 +143,11 @@ def check_shapes(tensors, expected_shapes, names):
     for tensor, expected_shape, name in zip(tensors, expected_shapes, names):
         assert tensor.shape == expected_shape, f"{name} shape mismatch: expected {expected_shape}, got {tensor.shape}"
 
-import torch
-from loguru import logger
-from typing import Tuple, List, Union, Any
-import inspect
 
 def einsum_safe(equation: str, *operands: torch.Tensor,
-                 check_shapes: bool = True,
-                 reshape_operands: bool = True,
-                 verbose: bool = False) -> torch.Tensor:
+                check_shapes: bool = True,
+                reshape_operands: bool = True,
+                verbose: bool = False) -> torch.Tensor:
     """
     A safe wrapper for torch.einsum that automatically checks for shape compatibility and attempts to
     reshape operands to resolve mismatches, even those that occur before the einsum operation.
@@ -201,7 +198,8 @@ def einsum_safe(equation: str, *operands: torch.Tensor,
     return torch.einsum(equation, *operands)
 
 
-def _reshape_operands_for_einsum(equation: str, *operands: torch.Tensor, verbose: bool = False) -> Union[Tuple[torch.Tensor], None]:
+def _reshape_operands_for_einsum(equation: str, *operands: torch.Tensor, verbose: bool = False) -> Union[
+    Tuple[torch.Tensor], None]:
     """
     Attempts to reshape operands to resolve shape mismatches in einsum.
 
@@ -273,3 +271,9 @@ def _reshape_operands_for_einsum(equation: str, *operands: torch.Tensor, verbose
                 return None
 
     return operands
+
+
+def check_shape(tensor: torch.Tensor, expected_shape: Tuple[int], name: str):
+    """Checks the shape of a tensor against the expected shape and raises a ValueError if they don't match."""
+    if tensor.shape != expected_shape:
+        raise ValueError(f"Shape mismatch for {name}: expected {expected_shape}, got {tensor.shape}")

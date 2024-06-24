@@ -302,11 +302,65 @@ class SelfAttention(nn.Module):
         return out
 
 
-class EnhancedFeatureExtractor(nn.Module):
-    """
-    An enhanced feature extractor with convolutional layers, residual blocks, and self-attention.
-    """
+import torch
+import torch.nn as nn
+from typing import List, Union, Tuple
 
+
+class FasterKANvolver(nn.Module):
+    def __init__(
+            self,
+            layers_hidden: List[int],
+            input_channels: int,
+            hidden_dim: int,
+            grid_min: float = -1.2,
+            grid_max: float = 0.2,
+            num_grids: int = 8,
+            exponent: int = 2,
+            inv_denominator: float = 0.5,
+            train_grid: bool = False,
+            train_inv_denominator: bool = False,
+            spline_weight_init_scale: float = 1.0,
+            uncertainty_output: bool = False,
+    ):
+        super(FasterKANvolver, self).__init__()
+
+        self.feature_extractor = EnhancedFeatureExtractor(input_channels, hidden_dim)
+        self.uncertainty_output = uncertainty_output
+
+        self.faster_kan_layers = nn.ModuleList([
+            FasterKANLayer(
+                in_dim,
+                out_dim,
+                grid_min=grid_min,
+                grid_max=grid_max,
+                num_grids=num_grids,
+                exponent=exponent,
+                inv_denominator=inv_denominator,
+                train_grid=train_grid,
+                train_inv_denominator=train_inv_denominator,
+                spline_weight_init_scale=spline_weight_init_scale,
+            )
+            for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])
+        ])
+
+    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        x = self.feature_extractor(x)
+
+        uncertainties = []
+        for layer in self.faster_kan_layers:
+            x = layer(x)
+            if self.uncertainty_output:
+                uncertainties.append(torch.var(x, dim=-1))
+
+        if self.uncertainty_output:
+            uncertainty = torch.stack(uncertainties).mean(dim=0)
+            return x, uncertainty
+        else:
+            return x
+
+
+class EnhancedFeatureExtractor(nn.Module):
     def __init__(self, input_channels: int, hidden_dim: int):
         super(EnhancedFeatureExtractor, self).__init__()
         self.initial_layers = nn.Sequential(
@@ -343,55 +397,4 @@ class EnhancedFeatureExtractor(nn.Module):
         x = self.avg_pool(x)
         x = x.view(batch_size, -1)
         x = self.fc(x)
-        return x
-
-
-class FasterKANvolver(nn.Module):
-    """
-    A network that combines a convolutional feature extractor with FasterKAN layers for classification.
-    """
-
-    def __init__(
-            self,
-            layers_hidden: List[int],
-            input_channels: int,
-            hidden_dim: int,
-            grid_min: float = -1.2,
-            grid_max: float = 0.2,
-            num_grids: int = 8,
-            exponent: int = 2,
-            inv_denominator: float = 0.5,
-            train_grid: bool = False,
-            train_inv_denominator: bool = False,
-            spline_weight_init_scale: float = 1.0,
-    ) -> None:
-        super(FasterKANvolver, self).__init__()
-
-        # Feature extractor with Convolutional layers
-        self.feature_extractor = EnhancedFeatureExtractor(input_channels, hidden_dim)
-
-        # Define the FasterKAN layers
-        layers_hidden = [hidden_dim] + layers_hidden  # Add hidden_dim as the first layer
-        self.faster_kan_layers = nn.ModuleList(
-            [
-                FasterKANLayer(
-                    in_dim,
-                    out_dim,
-                    grid_min=grid_min,
-                    grid_max=grid_max,
-                    num_grids=num_grids,
-                    exponent=exponent,
-                    inv_denominator=inv_denominator,
-                    train_grid=train_grid,
-                    train_inv_denominator=train_inv_denominator,
-                    spline_weight_init_scale=spline_weight_init_scale,
-                )
-                for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])
-            ]
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.feature_extractor(x)
-        for layer in self.faster_kan_layers:
-            x = layer(x)
         return x

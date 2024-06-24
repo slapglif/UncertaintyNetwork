@@ -1,5 +1,5 @@
-# .\train.py
 # train.py
+
 import os
 import sys
 from typing import Dict, Any
@@ -7,19 +7,13 @@ from typing import Dict, Any
 import pytorch_lightning as pl
 import torch
 from loguru import logger
-from pytorch_lightning.callbacks import (
-    ModelCheckpoint,
-    EarlyStopping,
-    LearningRateMonitor,
-)
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from core.data.datamodule import SlimPajamaDataModule
-from core.models.uncertain_nn import (
-    UncertainTransformerLMHeadModel,
-    UncertainTransformerConfig,
-)
+from core.models.uncertain_nn import UncertainTransformerLMHeadModel, UncertainTransformerConfig
 from core.utils.tokenizer import Tokenizer
+from core.utils.uncertainty import uncertainty_weighted_loss, total_uncertainty
 
 # Configure Loguru
 log_level = os.environ.get("LOG_LEVEL", "INFO")
@@ -35,15 +29,10 @@ torch.set_float32_matmul_precision("high")
 
 
 class UncertainTransformerLightningModule(pl.LightningModule):
-    """
-    PyTorch Lightning module for training the UncertainTransformer model.
-    """
-
     def __init__(self, hparams: Dict[str, Any]):
         super().__init__()
         self.save_hyperparameters(hparams)
 
-        # Model Configuration
         config = UncertainTransformerConfig(
             vocab_size=hparams["vocab_size"],
             d_model=hparams["d_model"],
@@ -53,7 +42,6 @@ class UncertainTransformerLightningModule(pl.LightningModule):
             dropout=hparams["dropout"],
             max_position_embeddings=hparams["max_length"],
             pad_token_id=hparams["pad_token_id"],
-            use_stable_embedding=hparams["use_stable_embedding"],
             use_mamba=hparams["use_mamba"],
             d_state=hparams["d_state"],
             d_conv=hparams["d_conv"],
@@ -61,47 +49,58 @@ class UncertainTransformerLightningModule(pl.LightningModule):
             dt_rank=hparams["dt_rank"],
             dt_min=hparams["dt_min"],
             dt_max=hparams["dt_max"],
-            sliding_window_size=hparams["sliding_window_size"],  # Add sliding window size
+            sliding_window_size=hparams["sliding_window_size"],
         )
 
-        # Instantiate the Model
         self.model = UncertainTransformerLMHeadModel(config)
         self.tokenizer = None
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         return self.model(input_ids, attention_mask=attention_mask, labels=labels)
 
-    def training_step(
-            self, batch: Dict[str, torch.Tensor], batch_idx: int
-    ) -> torch.Tensor:
-        """Training step."""
-        outputs = self(**batch)
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        outputs, uncertainty = self(**batch)
         loss = outputs.loss
+
+        # Apply uncertainty-weighted loss
+        weighted_loss = uncertainty_weighted_loss(loss, total_uncertainty(uncertainty))
+
         self.log(
             "train_loss",
-            loss,
+            weighted_loss,
             on_step=True,
             on_epoch=True,
             prog_bar=True,
             logger=True,
             sync_dist=True,
         )
-        return loss
+        return weighted_loss
 
-    def validation_step(
-            self, batch: Dict[str, torch.Tensor], batch_idx: int
-    ) -> Dict[str, torch.Tensor]:
-        """Validation step."""
-        outputs = self(**batch)
+    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
+        outputs, uncertainty = self(**batch)
         loss = outputs.loss
+
         self.log(
             "val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True
         )
 
         perplexity = torch.exp(loss)
+        # Continuing from where we left off in train.py
+
         self.log(
             "val_perplexity",
             perplexity,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+        )
+
+        # Log mean uncertainty
+        mean_uncertainty = uncertainty.mean()
+        self.log(
+            "val_mean_uncertainty",
+            mean_uncertainty,
             on_epoch=True,
             prog_bar=True,
             logger=True,
@@ -119,10 +118,9 @@ class UncertainTransformerLightningModule(pl.LightningModule):
                 "generated_text", generated_text, self.current_epoch
             )
 
-        return {"val_loss": loss, "val_perplexity": perplexity}
+        return {"val_loss": loss, "val_perplexity": perplexity, "val_uncertainty": mean_uncertainty}
 
     def configure_optimizers(self):
-        """Configure the optimizer and learning rate scheduler."""
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.hparams["learning_rate"],
@@ -142,12 +140,9 @@ class UncertainTransformerLightningModule(pl.LightningModule):
             },
         }
 
-
 def main():
-    """Main training function."""
     logger.info("Starting main function...")
 
-    # Hyperparameters
     hparams = {
         "vocab_size": 50257,
         "d_model": 512,
@@ -162,37 +157,31 @@ def main():
         "accumulate_grad_batches": 4,
         "max_epochs": 10,
         "pad_token_id": 50256,
-        "use_stable_embedding": True,
-        "streaming": True,
         "use_mamba": True,
         "d_state": 16,
         "d_conv": 4,
         "expand_factor": 2.0,
-        "dt_rank": None,
+        "dt_rank": 16,
         "dt_min": 0.001,
         "dt_max": 0.1,
-        "sliding_window_size": 512,  # Set the sliding window size
+        "sliding_window_size": 512,
     }
 
-    # Initialize Model
     logger.info("Initializing model...")
     model = UncertainTransformerLightningModule(hparams)
 
-    # Load Tokenizer
     logger.info("Loading tokenizer...")
     tokenizer = Tokenizer.from_pretrained("gpt2")
     model.tokenizer = tokenizer
 
-    # Create Data Module
     logger.info("Initializing DataModule...")
     datamodule = SlimPajamaDataModule(
         tokenizer=tokenizer,
         max_length=hparams["max_length"],
         batch_size=hparams["batch_size"],
-        streaming=hparams["streaming"],
+        streaming=True,
     )
 
-    # Callbacks
     logger.info("Setting up callbacks...")
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints",
@@ -204,11 +193,9 @@ def main():
     early_stop_callback = EarlyStopping(monitor="val_loss", patience=3, mode="min")
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
-    # Logger
     logger.info("Setting up TensorBoard logger...")
     tb_logger = TensorBoardLogger("logs", name="uncertain-transformer")
 
-    # Trainer
     logger.info("Setting up trainer...")
     trainer = pl.Trainer(
         max_epochs=hparams["max_epochs"],
@@ -221,12 +208,10 @@ def main():
         val_check_interval=0.25,
     )
 
-    # Start Training
     logger.info("Starting training...")
     trainer.fit(model, datamodule=datamodule)
 
     logger.info("Training completed.")
 
-
-if __name__ == "__main__":
-    main()
+    if __name__ == "__main__":
+        main()
