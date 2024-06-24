@@ -1,3 +1,4 @@
+# .\train.py
 # train.py
 import os
 import sys
@@ -60,6 +61,7 @@ class UncertainTransformerLightningModule(pl.LightningModule):
             dt_rank=hparams["dt_rank"],
             dt_min=hparams["dt_min"],
             dt_max=hparams["dt_max"],
+            sliding_window_size=hparams["sliding_window_size"],  # Add sliding window size
         )
 
         # Instantiate the Model
@@ -169,6 +171,7 @@ def main():
         "dt_rank": None,
         "dt_min": 0.001,
         "dt_max": 0.1,
+        "sliding_window_size": 512,  # Set the sliding window size
     }
 
     # Initialize Model

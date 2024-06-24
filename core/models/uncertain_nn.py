@@ -1,25 +1,20 @@
 # core/models/uncertain_nn.py
 
-from typing import Optional, Tuple, Union, Any
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedModel
 from transformers import PretrainedConfig
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPastAndCrossAttentions,
-    CausalLMOutputWithCrossAttentions,
-)
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
+from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-from core.models.embedding import SentenceGP, SentenceEncoder
-from core.models.layers import TransformerEncoderLayer, MambaLayer
+from core.models.embedding import RotaryPositionEncoding, SentenceEncoder, SentenceGP, apply_rotary_pos_emb
+from core.models.layers import TransformerEncoderLayer, CEMA, KANFeedForward
+from core.models.mamba import Mamba, MambaConfig
 
 
 class UncertainTransformerConfig(PretrainedConfig):
-    model_type = "uncertain_transformer"
-
     def __init__(
             self,
             vocab_size=50257,
@@ -38,8 +33,7 @@ class UncertainTransformerConfig(PretrainedConfig):
             use_mamba=True,
             d_state=16,
             d_conv=4,
-            expand_factor=2.0,
-            dt_rank=None,
+            expand_factor=2,
             dt_min=0.001,
             dt_max=0.1,
             dt_init="random",
@@ -49,6 +43,7 @@ class UncertainTransformerConfig(PretrainedConfig):
             n_inducing=10,
             use_gelu_approximation=False,
             sliding_window_size=512,
+
             **kwargs
     ):
         super().__init__(
@@ -72,7 +67,6 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.d_state = d_state
         self.d_conv = d_conv
         self.expand_factor = expand_factor
-        self.dt_rank = dt_rank
         self.dt_min = dt_min
         self.dt_max = dt_max
         self.dt_init = dt_init
@@ -83,277 +77,182 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.use_gelu_approximation = use_gelu_approximation
         self.sliding_window_size = sliding_window_size
 
-        # Initialize _no_split_modules as an empty list
         self._no_split_modules = []
 
 
 class UncertainNN(nn.Module):
-    def __init__(self, config: UncertainTransformerConfig | PretrainedConfig):
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        self.gradient_checkpointing = False
+        vocab_size = 10000
+        hidden_dim = 512
+        output_dim = 512
+        kan_config = {
+            'layers_hidden': [1024, 2048],
+            'grid_min': -1.2,
+            'grid_max': 0.2,
+            'num_grids': 8,
+            'exponent': 2,
+            'inv_denominator': 0.5,
+            'train_grid': False,
+            'train_inv_denominator': False,
+            'spline_weight_init_scale': 1.0,
+        }
 
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.position_embedding = nn.Embedding(
-            config.max_position_embeddings, config.d_model
-        )
-        self.layer_norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
-        self.dropout = nn.Dropout(config.dropout)
+        self.rotary_pos_emb = RotaryPositionEncoding(config.d_model, config.n_heads, config.max_position_embeddings)
+        self.sentence_encoder = SentenceEncoder(config.vocab_size, config.d_model, config.d_model,
+                                                kan_config=kan_config)  # Update output_dim to config.d_model
+        self.sentence_gp = SentenceGP(config.d_model, config.d_model, config.n_inducing, config.d_model)
+        self.gp_projection = nn.Linear(config.n_inducing, config.d_model)
+        self.cema = CEMA(config.d_model)
+        self.layers = nn.ModuleList([
+            nn.ModuleList([
+                Mamba(MambaConfig(
+                    d_model=config.d_model,
+                    d_state=config.d_state,
+                    expand_factor=config.expand_factor,
+                    d_conv=config.d_conv,
+                    dt_min=config.dt_min,
+                    dt_max=config.dt_max,
+                    dt_init=config.dt_init,
+                    dt_scale=config.dt_scale,
+                    dt_init_floor=config.dt_init_floor
+                )),
+                TransformerEncoderLayer(config),
+                KANFeedForward(config),
+                nn.Linear(config.d_model, config.d_model)
+            ])
+            for _ in range(config.n_layers)
+        ])
 
-        # Interleave Mamba and Transformer layers (Samba-like)
-        self.layers = nn.ModuleList(
-            [
-                MambaLayer(config) if i % 2 == 0 else TransformerEncoderLayer(config)
-                for i in range(config.n_layers)
-            ]
-        )
-
-        self.final_layer_norm = nn.LayerNorm(
-            config.d_model, eps=config.layer_norm_epsilon
-        )
-
-        # Components for uncertainty modeling
-        self.sentence_encoder = SentenceEncoder(
-            config.d_model, config.d_model * 2, config.d_model
-        )
-        self.sentence_gp = SentenceGP(
-            config.d_model, config.d_model, config.n_inducing, config.d_model
-        )
-
-        self.sliding_window_size = config.sliding_window_size
+        self.final_layer_norm = nn.LayerNorm(config.d_model)
 
     def forward(
             self,
             input_ids: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.FloatTensor] = None,
+            token_type_ids: Optional[torch.LongTensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
+            head_mask: Optional[torch.FloatTensor] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
+            encoder_hidden_states: Optional[torch.FloatTensor] = None,
+            encoder_attention_mask: Optional[torch.FloatTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-            past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-            token_type_ids: Any = None,
-            head_mask: Any = None,
-            encoder_hidden_states: Any = None,
-            encoder_attention_mask: Any = None
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
-        padding_needed = 0
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time"
-            )
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
             input_shape = input_ids.size()
-            input_ids = input_ids.view(-1, input_shape[-1])
+            batch_size, seq_length = input_shape
+            device = input_ids.device
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
+            batch_size, seq_length = input_shape
+            device = inputs_embeds.device
         else:
-            raise ValueError(
-                "You have to specify either input_ids or inputs_embeds"
-            )
-
-        seq_length = (
-            input_shape[-1] if input_ids is not None else inputs_embeds.shape[1]
-        )
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         if position_ids is None:
-            device = (
-                input_ids.device
-                if input_ids is not None
-                else inputs_embeds.device
-            )
-            position_ids = torch.arange(
-                0, seq_length, dtype=torch.long, device=device
-            )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0).expand(input_shape)
 
         if inputs_embeds is None:
             inputs_embeds = self.embedding(input_ids)
-        position_embeddings = self.position_embedding(position_ids)
 
-        hidden_states = inputs_embeds + position_embeddings
-        hidden_states = self.layer_norm(hidden_states)
-        hidden_states = self.dropout(hidden_states)
+            sentence_emb = self.sentence_encoder(input_ids)
+            sentence_emb = sentence_emb.unsqueeze(1)
+            gp_mean, gp_var = self.sentence_gp(sentence_emb)
+            gp_mean = self.gp_projection(gp_mean.squeeze(1)).unsqueeze(1)
+            sentence_emb = sentence_emb + gp_mean
+            repeated_sentence_emb = sentence_emb.repeat(1, seq_length, 1)
+            inputs_embeds = inputs_embeds + repeated_sentence_emb
 
-        if past_key_values is None:
-            past_key_values = [None] * len(self.layers)
+            cos, sin = self.rotary_pos_emb(inputs_embeds, seq_len=seq_length)
+            inputs_embeds = apply_rotary_pos_emb(inputs_embeds, cos, sin)
 
+        inputs_embeds = self.cema(inputs_embeds)
+
+        hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
+        all_self_attentions = () if output_attentions else None
+        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         next_decoder_cache = () if use_cache else None
 
-        for i, (layer, past) in enumerate(
-                zip(self.layers, past_key_values)
-        ):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        mamba_states = [None] * len(self.layers) if past_key_values is None else [
+            cache[0] for cache in past_key_values
+        ]
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    output_attentions,
-                )
-            else:
-                if isinstance(layer, MambaLayer):
-                    layer_outputs = layer(hidden_states)
-                elif isinstance(layer, TransformerEncoderLayer):
-                    layer_outputs = layer(
-                        hidden_states,
-                        attention_mask=attention_mask,
-                        output_attentions=output_attentions,
-                        past_key_value=past,
-                    )
-                else:
-                    raise ValueError(
-                        f"Unexpected layer type: {type(layer)}"
-                    )
+        for i, (mamba, transformer, kan_ff, projection) in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            mamba_state = mamba_states[i]
+
+            hidden_states, mamba_cache = mamba(hidden_states, mamba_state, use_cache=use_cache)
+            assert hidden_states.shape == (batch_size, seq_length, self.config.d_model), f"Mamba output shape mismatch: {hidden_states.shape}"
+
+            hidden_states = projection(hidden_states)
+            assert hidden_states.shape == (batch_size, seq_length, self.config.d_model), f"Projection output shape mismatch: {hidden_states.shape}"
+
+            layer_outputs = transformer(
+                hidden_states,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                past_key_value=None,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
 
             hidden_states = layer_outputs[0]
+            assert hidden_states.shape == (batch_size, seq_length, self.config.d_model), f"Transformer output shape mismatch: {hidden_states.shape}"
+
+            hidden_states = kan_ff(hidden_states)
+            assert hidden_states.shape == (batch_size, seq_length, self.config.d_model), f"KAN FF output shape mismatch: {hidden_states.shape}"
 
             if use_cache:
-                next_decoder_cache += (
-                    layer_outputs[1]
-                    if len(layer_outputs) > 1
-                    else None,
-                )
+                next_decoder_cache += ((mamba_cache, layer_outputs[1]),)
 
-            if output_attentions and isinstance(
-                    layer, TransformerEncoderLayer
-            ):
-                all_attentions += (layer_outputs[-1],)
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (layer_outputs[1],)
+                if self.config.add_cross_attention:
+                    all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
 
         hidden_states = self.final_layer_norm(hidden_states)
 
-        # Apply Sentence Encoder and Gaussian Process (for uncertainty)
-        batch_size, seq_len, _ = hidden_states.shape
-        if seq_len >= self.config.max_position_embeddings:
-            num_sentences = (
-                    seq_len // self.config.max_position_embeddings
-            )
-            remainder = (
-                    seq_len % self.config.max_position_embeddings
-            )
-
-            if remainder > 0:
-                padding_needed = (
-                        self.config.max_position_embeddings - remainder
-                )
-                hidden_states = F.pad(
-                    hidden_states, (0, 0, 0, padding_needed)
-                )
-                seq_len += padding_needed
-
-            hidden_states = hidden_states.view(
-                batch_size,
-                num_sentences,
-                self.config.max_position_embeddings,
-                -1,
-            )
-            sentence_embeddings = self.sentence_encoder(
-                hidden_states
-            )
-            sentence_mean, sentence_var = self.sentence_gp(
-                sentence_embeddings, num_sentences
-            )
-
-            if self.training:
-                hidden_states = sentence_mean + torch.randn_like(
-                    sentence_mean
-                ) * torch.sqrt(sentence_var)
-            else:
-                hidden_states = sentence_mean
-
-            hidden_states = hidden_states.view(
-                batch_size, seq_len, -1
-            )
-
-            if remainder > 0:
-                hidden_states = hidden_states[
-                                :, : seq_len - padding_needed, :
-                                ]
-
         if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+            all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(
-                v
-                for v in [
-                    hidden_states,
-                    next_decoder_cache,
-                    all_hidden_states,
-                    all_attentions,
-                ]
-                if v is not None
-            )
+            return tuple(v for v in [hidden_states, next_decoder_cache, all_hidden_states, all_self_attentions, all_cross_attentions] if v is not None)
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=next_decoder_cache,
             hidden_states=all_hidden_states,
-            attentions=all_attentions,
+            attentions=all_self_attentions,
+            cross_attentions=all_cross_attentions,
         )
-
-    def _apply_sentence_encoding(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = hidden_states.shape
-        num_sentences = seq_len // self.config.max_position_embeddings
-        remainder = seq_len % self.config.max_position_embeddings
-        padding_needed = 0
-        if remainder > 0:
-            padding_needed = self.config.max_position_embeddings - remainder
-            hidden_states = F.pad(hidden_states, (0, 0, 0, padding_needed))
-            seq_len += padding_needed
-
-        hidden_states = hidden_states.view(
-            batch_size, num_sentences, self.config.max_position_embeddings, -1
-        )
-        sentence_embeddings = self.sentence_encoder(hidden_states)
-        sentence_mean, sentence_var = self.sentence_gp(sentence_embeddings, num_sentences)
-
-        if self.training:
-            hidden_states = sentence_mean + torch.randn_like(sentence_mean) * torch.sqrt(sentence_var)
-        else:
-            hidden_states = sentence_mean
-
-        hidden_states = hidden_states.view(batch_size, seq_len, -1)
-
-        if remainder > 0:
-            hidden_states = hidden_states[:, :seq_len - padding_needed, :]
-
-        return hidden_states
-
-    @classmethod
-    def _gradient_checkpointing_func(cls, func, *args, **kwargs):
-        return checkpoint(func, *args, **kwargs)
 
 
 class UncertainTransformerLMHeadModel(PreTrainedModel):
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: 'UncertainTransformerConfig'):
         super().__init__(config)
         self.transformer = UncertainNN(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-
-        # Set the model's parameters
-        self.main_input_name = "input_ids"
-        self.config.is_decoder = True
-        self.config.tie_word_embeddings = True
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -364,26 +263,11 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
-        input_shape = input_ids.shape
-        # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
-        if attention_mask is None:
-            attention_mask = input_ids.new_ones(input_shape)
+    def get_input_embeddings(self):
+        return self.transformer.embedding
 
-        # cut decoder_input_ids if past is used
-        if past_key_values is not None:
-            input_ids = input_ids[:, -1:]
-
-        # update attention mask
-        if past_key_values is not None:
-            attention_mask = torch.cat([attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1)
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "past_key_values": past_key_values,
-            "use_cache": kwargs.get("use_cache"),
-        }
+    def set_input_embeddings(self, value):
+        self.transformer.embedding = value
 
     def forward(
             self,
@@ -421,41 +305,58 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         )
 
         hidden_states = transformer_outputs[0]
-        logits = self.lm_head(hidden_states)
+
+        # Ensure hidden_states has the correct shape
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(0)
+        batch_size, seq_length, _ = hidden_states.shape
+
+        lm_logits = self.lm_head(hidden_states)
 
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
+            shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         if not return_dict:
-            output = (logits,) + transformer_outputs[1:]
+            output = (lm_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
-            logits=logits,
+            logits=lm_logits,
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions,
         )
 
+    def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, **kwargs):
+        input_shape = input_ids.shape
+        # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
+        if attention_mask is None:
+            attention_mask = input_ids.new_ones(input_shape)
+
+        # cut decoder_input_ids if past is used
+        if past is not None:
+            input_ids = input_ids[:, -1:]
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": past,
+            "use_cache": kwargs.get("use_cache"),
+        }
+
     def _reorder_cache(self, past, beam_idx):
         reordered_past = ()
         for layer_past in past:
-            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
+            mamba_state, transformer_past = layer_past
+            reordered_mamba_state = tuple(past_state.index_select(0, beam_idx) for past_state in mamba_state)
+            reordered_transformer_past = tuple(past_state.index_select(0, beam_idx) for past_state in transformer_past)
+            reordered_past += ((reordered_mamba_state, reordered_transformer_past),)
         return reordered_past
-
-    def get_input_embeddings(self):
-        return self.transformer.embedding
-
-    def set_input_embeddings(self, value):
-        self.transformer.embedding = value
-
-    def tie_weights(self):
-        self.lm_head.weight = self.transformer.embedding.weight

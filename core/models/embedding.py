@@ -1,168 +1,143 @@
-from typing import Optional, Tuple
+# core/models/embedding.py
+
+from typing import Tuple, Optional, Dict, Any
 
 import torch
 import torch.nn as nn
+from einops import rearrange
 
-from core.utils.utils import softplus, _check_nan_inf  # Import the _check_nan_inf utility
+from core.kan import FasterKANvolver
 
 
 class RotaryPositionEncoding(nn.Module):
-    """
-    Rotary Position Encoding as described in the RoFormer paper.
-
-    This class implements rotary position encodings, which can be particularly
-    effective for capturing relative positions in transformer models.
-
-    Attributes:
-        dim (int): Dimension of the model.
-        max_position_embeddings (int): Maximum number of positions to encode.
-        base (int): Base for the angle calculation.
-        inv_freq (torch.Tensor): Inverse frequency tensor for angle calculation.
-
-    Example:
-        >>> rotary_pe = RotaryPositionEncoding(dim=512)
-        >>> x = torch.randn(1, 10, 512)  # Example input tensor
-        >>> cos, sin = rotary_pe(x)
-        >>> print(cos.shape, sin.shape)
-        torch.Size([1, 1, 10, 512]) torch.Size([1, 1, 10, 512])
-    """
-
-    def __init__(
-            self, dim: int, max_position_embeddings: int = 2048, base: int = 10000
-    ):
+    def __init__(self, dim, n_heads, max_position_embeddings=2048, base=10000):
         super().__init__()
         self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
+        self.n_heads = n_heads
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim // n_heads, 2).float() / (dim // n_heads)))
+        self.register_buffer("inv_freq", inv_freq)
 
-        # Pre-calculate inverse frequencies
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("_inv_freq", self.inv_freq)
-
-        # Initialize the cache for cosine and sine values
-        self._set_cos_sin_cache(max_position_embeddings)
-
-    def _set_cos_sin_cache(self, seq_len: int):
-        """Set up the cache for fast retrieval of position encodings."""
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, device=self.inv_freq.device).type_as(self.inv_freq)
+        self.max_seq_len_cached = max_position_embeddings
+        t = torch.arange(max_position_embeddings, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :])
 
-        # Cache the cosine and sine values
-        self.register_buffer(
-            "cos_cached", emb.cos()[None, None, :, :], persistent=False
-        )
-        self.register_buffer(
-            "sin_cached", emb.sin()[None, None, :, :], persistent=False
-        )
-
-    def forward(
-            self, x: torch.Tensor, seq_len: Optional[int] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute the rotary position encodings.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            seq_len (Optional[int]): Sequence length. If None, use x.shape[1].
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Cosine and sine of the position encodings.
-        """
+    def forward(self, x, seq_len=None):
         if seq_len is None:
-            seq_len = x.shape[1]
-
-        # Update the cache if the sequence length exceeds the cached length
+            seq_len = x.shape[-2]
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len)
 
-        # Retrieve cached cosine and sine values for the given sequence length
-        return (
-            self.cos_cached[:, :, :seq_len, ...].to(x.device),
-            self.sin_cached[:, :, :seq_len, ...].to(x.device),
-        )
+        cos = self.cos_cached[:, :, :seq_len, :]
+        sin = self.sin_cached[:, :, :seq_len, :]
+
+        return cos.repeat(x.shape[0], self.n_heads, 1, 1), sin.repeat(x.shape[0], self.n_heads, 1, 1)
+
+    def _set_cos_sin_cache(self, seq_len):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :])
+
+
+def apply_rotary_pos_emb(x, cos, sin):
+    """Applies rotary positional embeddings to the input tensor.
+
+    Args:
+        x (torch.Tensor): The input tensor of shape (batch_size, seq_len, d_model).
+        cos (torch.Tensor): The cosine component of the rotary embeddings.
+        sin (torch.Tensor): The sine component of the rotary embeddings.
+
+    Returns:
+        torch.Tensor: The input tensor with rotary embeddings applied.
+    """
+    # Reshape for head-wise operation
+    x = rearrange(x, 'b l (h d) -> b h l d', h=cos.shape[1])
+
+    # Apply rotary embeddings
+    x = (x * cos) + (rotate_half(x) * sin)
+
+    # Reshape back to original shape
+    x = rearrange(x, 'b h l d -> b l (h d)')
+    return x
+
+
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+kan_config = {
+    'layers_hidden': [1024, 2048],
+    'grid_min': -1.2,
+    'grid_max': 0.2,
+    'num_grids': 8,
+    'exponent': 2,
+    'inv_denominator': 0.5,
+    'train_grid': False,
+    'train_inv_denominator': False,
+    'spline_weight_init_scale': 1.0,
+}
 
 
 class SentenceEncoder(nn.Module):
     """
-    Sentence Encoder using a Transformer-based architecture.
+    Sentence Encoder module.
 
-    This module leverages a Transformer encoder to capture sentence-level
-    semantic information and produce richer representations of sentences.
+    This module encodes input sentences using the FasterKANvolver architecture,
+    which combines a convolutional feature extractor with KAN layers.
+
+    Args:
+        vocab_size (int): The size of the vocabulary.
+        hidden_dim (int): The dimensionality of the hidden states.
+        output_dim (int): The dimensionality of the output embeddings.
+        kan_config (Dict[str, Any]): The configuration dictionary for the KAN layers.
 
     Attributes:
-        vocab_size (int): The size of the vocabulary.
-        hidden_dim (int): The hidden dimension of the Transformer encoder.
-        output_dim (int): The output feature dimension.
-        num_layers (int): The number of Transformer encoder layers.
-        num_heads (int): The number of attention heads in each Transformer layer.
-        dropout (float): The dropout probability.
+        embedding (nn.Embedding): The word embedding layer.
+        faster_kan_volver (FasterKANvolver): The FasterKANvolver module.
+
     """
 
-    def __init__(
-            self,
-            vocab_size: int,
-            hidden_dim: int,
-            output_dim: int,
-            num_layers: int = 2,
-            num_heads: int = 4,
-            dropout: float = 0.1,
-    ):
+    def __init__(self, vocab_size: int, hidden_dim: int, output_dim: int,
+                 kan_config: Dict[str, Any] = kan_config) -> None:
         super().__init__()
-        self.vocab_size = vocab_size
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.dropout = dropout
+        self.embedding = nn.Embedding(vocab_size, hidden_dim)
 
-        # Embedding Layer
-        self.embedding = nn.Embedding(vocab_size, hidden_dim)  # Use nn.Embedding for token IDs
+        # Extract the necessary arguments for FasterKANvolver
+        layers_hidden = kan_config['layers_hidden']
+        grid_min = kan_config.get('grid_min', -1.2)
+        grid_max = kan_config.get('grid_max', 0.2)
+        num_grids = kan_config.get('num_grids', 8)
+        exponent = kan_config.get('exponent', 2)
+        inv_denominator = kan_config.get('inv_denominator', 0.5)
+        train_grid = kan_config.get('train_grid', False)
+        train_inv_denominator = kan_config.get('train_inv_denominator', False)
 
-        # Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=num_heads, dropout=dropout
+        # Ensure the last hidden dimension matches the output dimension
+        layers_hidden[-1] = output_dim
+
+        self.faster_kan_volver = FasterKANvolver(
+            layers_hidden,
+            input_channels=1,
+            hidden_dim=hidden_dim,
+            grid_min=grid_min,
+            grid_max=grid_max,
+            num_grids=num_grids,
+            exponent=exponent,
+            inv_denominator=inv_denominator,
+            train_grid=train_grid,
+            train_inv_denominator=train_inv_denominator,
         )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers
-        )
-
-        # Output Layer
-        self.output_layer = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the SentenceEncoder.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, num_sentences, sentence_len).
-                            This tensor contains token IDs.
-
-        Returns:
-            torch.Tensor: Transformed sentence embedding of shape (batch_size, num_sentences, output_dim).
-        """
-        batch_size, num_sentences, sentence_len = x.shape
-
-        # 1. Embed the input token IDs
-        x = self.embedding(x)  # (batch_size, num_sentences, sentence_len, hidden_dim)
-
-        # 2. Reshape and permute for the Transformer
-        x = x.permute(0, 2, 1, 3).reshape(sentence_len, batch_size * num_sentences, self.hidden_dim)
-
-        # 3. Apply the Transformer encoder
-        x = self.transformer_encoder(x)  # (sentence_len, batch_size * num_sentences, hidden_dim)
-
-        # 4. Reshape and permute back
-        x = x.reshape(sentence_len, batch_size, num_sentences, self.hidden_dim).permute(1, 2, 0,
-                                                                                        3)  # (batch_size, num_sentences, sentence_len, hidden_dim)
-
-        # 5. Pool across the sequence length
-        x = x.mean(dim=2)  # (batch_size, num_sentences, hidden_dim)
-
-        # 6. Apply the output layer
-        x = self.output_layer(x)  # (batch_size, num_sentences, output_dim)
-
+        x = self.embedding(x)
+        x = x.unsqueeze(1)
+        x = self.faster_kan_volver(x)
         return x
 
 
@@ -193,8 +168,8 @@ class SentenceGP(nn.Module):
         self.n_inducing = n_inducing
         self.embedding_dim = embedding_dim
 
-        # Learnable inducing points (initialize on the target device if possible)
-        self.inducing_points = nn.Parameter(torch.randn(n_inducing, input_dim, device=torch.device('cuda')))
+        # Learnable inducing points (initialize on CPU first)
+        self.inducing_points = nn.Parameter(torch.randn(n_inducing, input_dim))
 
         # Learnable length scale for RBF kernel
         self.log_lengthscale = nn.Parameter(torch.zeros(1))
@@ -204,6 +179,17 @@ class SentenceGP(nn.Module):
 
         # Output projection
         self.output_proj = nn.Linear(n_inducing, output_dim)
+
+    def to(self, *args, **kwargs):
+        """
+        Moves and/or casts the parameters and buffers.
+
+        This method overwrites the default `to` method to ensure that
+        the `inducing_points` are moved to the correct device.
+        """
+        self = super().to(*args, **kwargs)
+        self.inducing_points = nn.Parameter(self.inducing_points.to(*args, **kwargs))
+        return self
 
     def rbf_kernel(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         """
@@ -220,52 +206,48 @@ class SentenceGP(nn.Module):
         return torch.exp(-0.5 * dist / torch.exp(self.log_lengthscale).pow(2))
 
     def forward(
-            self, x: torch.Tensor, num_sentences: int
+            self, x: torch.Tensor, num_sentences: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the SentenceGP.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, num_sentences, input_dim).
-            num_sentences (int): Number of sentences in the input.
+            num_sentences (Optional[int]): Number of sentences in the input. If not provided, it will be inferred from the input tensor shape.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
                 - Mean tensor of shape (batch_size, num_sentences, output_dim).
                 - Variance tensor of shape (batch_size, num_sentences, output_dim).
         """
-        batch_size = x.shape[0]
+        batch_size, num_sentences_input, input_dim = x.shape
 
         # Input validation: Check if the input dimensions are as expected
-        if x.shape[1] != num_sentences or x.shape[2] != self.input_dim:
-            raise ValueError("Input tensor dimensions are incorrect.")
+        if num_sentences is not None and num_sentences_input != num_sentences:
+            raise ValueError(
+                f"Input tensor has {num_sentences_input} sentences, but {num_sentences} sentences were expected.")
+        if input_dim != self.input_dim:
+            raise ValueError(
+                f"Input tensor has {input_dim} input dimensions, but {self.input_dim} dimensions were expected.")
+
+        # Use the inferred num_sentences if not provided explicitly
+        if num_sentences is None:
+            num_sentences = num_sentences_input
 
         # Compute kernel matrices
         K_xx = self.rbf_kernel(x, x)
-        _check_nan_inf(K_xx, "K_xx")  # Check for NaN/Inf in K_xx
         K_xi = self.rbf_kernel(x, self.inducing_points)
-        _check_nan_inf(K_xi, "K_xi")  # Check for NaN/Inf in K_xi
         K_ii = self.rbf_kernel(self.inducing_points, self.inducing_points)
-        _check_nan_inf(K_ii, "K_ii")  # Check for NaN/Inf in K_ii
 
         # Compute predictive distribution
         K_ii_inv = torch.inverse(
-            K_ii
-            + torch.exp(self.log_noise) * torch.eye(self.n_inducing, device=x.device)
+            K_ii + torch.exp(self.log_noise) * torch.eye(self.n_inducing, device=x.device)
         )
-        _check_nan_inf(K_ii_inv, "K_ii_inv")  # Check for NaN/Inf in K_ii_inv
         mean = K_xi @ K_ii_inv @ self.output_proj.weight.T
-        _check_nan_inf(mean, "mean")  # Check for NaN/Inf in mean
         var = K_xx - K_xi @ K_ii_inv @ K_xi.transpose(-1, -2)
-        _check_nan_inf(var, "var")  # Check for NaN/Inf in var
 
-        # Reshape outputs
-        mean = mean.view(batch_size, num_sentences, self.output_dim)
-        var = var.view(batch_size, num_sentences, num_sentences)
-        var = (
-            torch.diagonal(var, dim1=-2, dim2=-1)
-            .unsqueeze(-1)
-            .expand(-1, -1, self.output_dim)
-        )
+        # Reshape outputs using einsum
+        mean = torch.einsum("bni,io->bno", mean, self.output_proj.weight)
+        var = torch.diagonal(var, dim1=-2, dim2=-1)
 
-        return mean, softplus(var)  # Ensure positive variance using softplus
+        return mean, torch.nn.functional.softplus(var)

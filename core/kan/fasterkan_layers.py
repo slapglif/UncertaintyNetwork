@@ -1,3 +1,4 @@
+# .\core\kan\fasterkan_layers.py
 from typing import *
 
 import torch
@@ -8,63 +9,94 @@ from core.kan.fasterkan_basis import ReflectionalSwitchFunction, SplineLinear
 
 
 class FasterKANLayer(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        grid_min: float = -1.2,
-        grid_max: float = 0.2,
-        num_grids: int = 8,
-        exponent: int = 2,
-        inv_denominator: float = 0.5,
-        train_grid: bool = False,
-        train_inv_denominator: bool = False,
-        # use_base_update: bool = True,
-        base_activation=F.silu,
-        spline_weight_init_scale: float = 0.667,
-    ) -> None:
+    def __init__(self, input_dim: int, output_dim: int, num_grids: int = 8, *_, **kwargs):
         super().__init__()
         self.layernorm = nn.LayerNorm(input_dim)
-        self.rbf = ReflectionalSwitchFunction(
-            grid_min,
-            grid_max,
-            num_grids,
-            exponent,
-            inv_denominator,
-            train_grid,
-            train_inv_denominator,
-        )
-        self.spline_linear = SplineLinear(
-            input_dim * num_grids, output_dim, spline_weight_init_scale
-        )
-        # self.use_base_update = use_base_update
-        # if use_base_update:
-        #    self.base_activation = base_activation
-        #    self.base_linear = nn.Linear(input_dim, output_dim)
+        self.rbf = ReflectionalSwitchFunction(num_grids=num_grids, **kwargs)
+        self.spline_linear = SplineLinear(input_dim * num_grids, output_dim)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the FasterKANLayer.
+
+        This method can handle both 2D and 3D input tensors. If a 2D tensor is provided,
+        it is treated as a single sequence (batch_size=1).
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_dim)
+                              or (seq_len, input_dim).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, output_dim)
+                          or (seq_len, output_dim).
+
+        Raises:
+            ValueError: If the input tensor has an invalid number of dimensions.
+        """
+        # Apply layer normalization
         x = self.layernorm(x)
 
-        spline_basis = self.rbf(x).view(x.shape[0], -1)
-        return self.spline_linear(spline_basis)
+        # Handle different input shapes
+        if x.dim() == 2:
+            # If input is 2D, add a batch dimension
+            x = x.unsqueeze(0)
+            squeeze_output = True
+        elif x.dim() == 3:
+            squeeze_output = False
+        else:
+            raise ValueError(f"Invalid input dimension. Expected 2D or 3D tensor, got {x.dim()}D.")
 
-        # spline_basis = spline_basis.reshape(x.shape[0], -1)  # Reshape to [batch_size, input_dim * num_grids]
+        batch_size, seq_len, input_dim = x.shape
+
+        # Apply RBF layer
+        spline_basis = self.rbf(x)
+
+        # Reshape for spline linear layer
+        spline_basis = spline_basis.view(batch_size * seq_len, -1)
+
+        # Apply spline linear layer
+        output = self.spline_linear(spline_basis)
+
+        # Reshape output to match input shape
+        output = output.view(batch_size, seq_len, -1)
+
+        # Remove batch dimension if input was 2D
+        if squeeze_output:
+            output = output.squeeze(0)
+
+        return output
 
 
 class FasterKAN(nn.Module):
+    """
+    A network composed of multiple FasterKAN layers.
+
+    Args:
+        layers_hidden (List[int]): A list of hidden layer dimensions.
+        grid_min (float, optional): The minimum value of the grid for the reflectional switch function. Defaults to -1.2.
+        grid_max (float, optional): The maximum value of the grid for the reflectional switch function. Defaults to 0.2.
+        num_grids (int, optional): The number of grid points for the reflectional switch function. Defaults to 8.
+        exponent (int, optional): The exponent for the reflectional switch function. Defaults to 2.
+        inv_denominator (float, optional): The inverse of the denominator for the reflectional switch function. Defaults to 0.5.
+        train_grid (bool, optional): Whether to train the grid points of the reflectional switch function. Defaults to False.
+        train_inv_denominator (bool, optional): Whether to train the inverse of the denominator for the reflectional switch function. Defaults to False.
+        base_activation (Callable, optional): The activation function to apply in the base update path. Defaults to None.
+        spline_weight_init_scale (float, optional): The scaling factor for initializing the weights of the spline linear transformation. Defaults to 1.0.
+    """
+
     def __init__(
-        self,
-        layers_hidden: List[int],
-        grid_min: float = -1.2,
-        grid_max: float = 0.2,
-        num_grids: int = 8,
-        exponent: int = 2,
-        inv_denominator: float = 0.5,
-        train_grid: bool = False,
-        train_inv_denominator: bool = False,
-        # use_base_update: bool = True,
-        base_activation=None,
-        spline_weight_init_scale: float = 1.0,
+            self,
+            layers_hidden: List[int],
+            grid_min: float = -1.2,
+            grid_max: float = 0.2,
+            num_grids: int = 8,
+            exponent: int = 2,
+            inv_denominator: float = 0.5,
+            train_grid: bool = False,
+            train_inv_denominator: bool = False,
+            # use_base_update: bool = True,
+            base_activation=None,
+            spline_weight_init_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
@@ -87,13 +119,31 @@ class FasterKAN(nn.Module):
             ]
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the FasterKAN network.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
         for layer in self.layers:
             x = layer(x)
         return x
 
 
 class BasicResBlock(nn.Module):
+    """
+    A basic residual block with two convolutional layers and batch normalization.
+
+    Args:
+        in_channels (int): The number of input channels.
+        out_channels (int): The number of output channels.
+        stride (int, optional): The stride of the convolutional layers. Defaults to 1.
+    """
+
     def __init__(self, in_channels, out_channels, stride=1):
         super(BasicResBlock, self).__init__()
         self.conv1 = nn.Conv2d(
@@ -119,7 +169,16 @@ class BasicResBlock(nn.Module):
                 nn.BatchNorm2d(out_channels),
             )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the BasicResBlock.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
         identity = self.downsample(x)
 
         out = F.relu(self.bn1(self.conv1(x)))
@@ -131,6 +190,14 @@ class BasicResBlock(nn.Module):
 
 
 class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation block for channel attention.
+
+    Args:
+        channel (int): The number of input channels.
+        reduction (int, optional): The reduction factor for the squeeze operation. Defaults to 16.
+    """
+
     def __init__(self, channel, reduction=16):
         super(SEBlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -141,7 +208,16 @@ class SEBlock(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the SEBlock.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
         b, c, _, _ = x.size()
         y = self.avg_pool(x).view(b, c)
         y = self.fc(y).view(b, c, 1, 1)
@@ -149,6 +225,17 @@ class SEBlock(nn.Module):
 
 
 class DepthwiseSeparableConv(nn.Module):
+    """
+    Depthwise Separable Convolution.
+
+    Args:
+        in_channels (int): The number of input channels.
+        out_channels (int): The number of output channels.
+        kernel_size (int): The size of the kernel.
+        stride (int, optional): The stride of the convolution. Defaults to 1.
+        padding (int, optional): The padding of the convolution. Defaults to 0.
+    """
+
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
         super(DepthwiseSeparableConv, self).__init__()
         self.depthwise = nn.Conv2d(
@@ -161,13 +248,29 @@ class DepthwiseSeparableConv(nn.Module):
         )
         self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the DepthwiseSeparableConv.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
         x = self.depthwise(x)
         x = self.pointwise(x)
         return x
 
 
 class SelfAttention(nn.Module):
+    """
+    Self-attention layer.
+
+    Args:
+        in_channels (int): The number of input channels.
+    """
+
     def __init__(self, in_channels):
         super(SelfAttention, self).__init__()
         self.query_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
@@ -175,7 +278,16 @@ class SelfAttention(nn.Module):
         self.value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         self.gamma = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the SelfAttention layer.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
         batch_size, C, width, height = x.size()
         proj_query = (
             self.query_conv(x).view(batch_size, -1, width * height).permute(0, 2, 1)
@@ -191,76 +303,75 @@ class SelfAttention(nn.Module):
 
 
 class EnhancedFeatureExtractor(nn.Module):
-    def __init__(self):
+    """
+    An enhanced feature extractor with convolutional layers, residual blocks, and self-attention.
+    """
+
+    def __init__(self, input_channels: int, hidden_dim: int):
         super(EnhancedFeatureExtractor, self).__init__()
         self.initial_layers = nn.Sequential(
-            nn.Conv2d(
-                3, 32, kernel_size=3, stride=1, padding=1
-            ),  # Increased number of filters
+            nn.Conv2d(input_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.BatchNorm2d(32),  # Added Batch Normalization
-            nn.MaxPool2d(2, 2),
-            nn.Dropout(0.25),  # Added Dropout
-            BasicResBlock(32, 64),
-            SEBlock(64, reduction=16),  # Squeeze-and-Excitation block
-            nn.MaxPool2d(2, 2),
-            nn.Dropout(0.25),  # Added Dropout
-            DepthwiseSeparableConv(
-                64, 128, kernel_size=3
-            ),  # Increased number of filters
+            nn.BatchNorm2d(32),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            BasicResBlock(128, 256),
-            SEBlock(256, reduction=16),
+            nn.BatchNorm2d(64),
             nn.MaxPool2d(2, 2),
-            nn.Dropout(0.25),  # Added Dropout
-            SelfAttention(256),  # Added Self-Attention layer
+            nn.Dropout(0.25),
+            BasicResBlock(64, 128),
+            SEBlock(128, reduction=16),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(256),
+            nn.MaxPool2d(2, 2),
+            nn.Dropout(0.25),
+            DepthwiseSeparableConv(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(512),
+            BasicResBlock(512, 512),
+            SEBlock(512, reduction=16),
+            nn.MaxPool2d(2, 2),
+            nn.Dropout(0.25),
+            SelfAttention(512),
         )
-        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)  # Global Average Pooling
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(512, hidden_dim)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size = x.size(0)
         x = self.initial_layers(x)
-        x = self.global_avg_pool(x)
-        x = x.view(x.size(0), -1)  # Flatten the output for fully connected layers
+        x = self.avg_pool(x)
+        x = x.view(batch_size, -1)
+        x = self.fc(x)
         return x
 
 
 class FasterKANvolver(nn.Module):
+    """
+    A network that combines a convolutional feature extractor with FasterKAN layers for classification.
+    """
+
     def __init__(
-        self,
-        layers_hidden: List[int],
-        grid_min: float = -1.2,
-        grid_max: float = 0.2,
-        num_grids: int = 8,
-        exponent: int = 2,
-        inv_denominator: float = 0.5,
-        train_grid: bool = False,
-        train_inv_denominator: bool = False,
-        # use_base_update: bool = True,
-        base_activation=None,
-        spline_weight_init_scale: float = 1.0,
+            self,
+            layers_hidden: List[int],
+            input_channels: int,
+            hidden_dim: int,
+            grid_min: float = -1.2,
+            grid_max: float = 0.2,
+            num_grids: int = 8,
+            exponent: int = 2,
+            inv_denominator: float = 0.5,
+            train_grid: bool = False,
+            train_inv_denominator: bool = False,
+            spline_weight_init_scale: float = 1.0,
     ) -> None:
         super(FasterKANvolver, self).__init__()
 
         # Feature extractor with Convolutional layers
-        self.feature_extractor = EnhancedFeatureExtractor()
-        """
-        nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),  # 1 input channel (grayscale), 16 output channels
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2)
-        )
-        """
-
-        # Calculate the flattened feature size after convolutional layers
-        flat_features = 256  # XX channels, image size reduced to YxY
-
-        # Update layers_hidden with the correct input size from conv layers
-        layers_hidden = [flat_features] + layers_hidden
+        self.feature_extractor = EnhancedFeatureExtractor(input_channels, hidden_dim)
 
         # Define the FasterKAN layers
+        layers_hidden = [hidden_dim] + layers_hidden  # Add hidden_dim as the first layer
         self.faster_kan_layers = nn.ModuleList(
             [
                 FasterKANLayer(
@@ -270,30 +381,17 @@ class FasterKANvolver(nn.Module):
                     grid_max=grid_max,
                     num_grids=num_grids,
                     exponent=exponent,
-                    inv_denominator=0.5,
-                    train_grid=False,
-                    train_inv_denominator=False,
-                    # use_base_update=use_base_update,
-                    base_activation=base_activation,
+                    inv_denominator=inv_denominator,
+                    train_grid=train_grid,
+                    train_inv_denominator=train_inv_denominator,
                     spline_weight_init_scale=spline_weight_init_scale,
                 )
                 for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])
             ]
         )
 
-    def forward(self, x):
-        # Reshape input from [batch_size, 784] to [batch_size, 1, 28, 28] for MNIST [batch_size, 1, 32, 32] for C
-
-        x = x.view(-1, 3, 32, 32)
-
-        # Apply convolutional layers
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.feature_extractor(x)
-
-        x = x.view(x.size(0), -1)  # Flatten the output from the conv layers
-
-        # Pass through FasterKAN layers
         for layer in self.faster_kan_layers:
             x = layer(x)
-
         return x
