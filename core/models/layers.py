@@ -7,8 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from core.kan.fasterkan_layers import FasterKANLayer
-from core.models.mamba import MambaConfig, Mamba
+from core.models.kan import SplineNetLayer
 
 
 class MultiHeadAttention(nn.Module):
@@ -62,10 +61,7 @@ class MultiHeadAttention(nn.Module):
         output = rearrange(attn_output, 'b h l d -> b l (h d)')
         output = self.W_o(output)
 
-        if use_cache:
-            return output, attn_probs
-        else:
-            return output, None
+        return (output, attn_probs) if use_cache else (output, None)
 
     def _apply_sliding_window_attention(self, attn_scores: torch.Tensor) -> torch.Tensor:
         """
@@ -110,8 +106,8 @@ class KANFeedForward(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.kan1 = FasterKANLayer(config.d_model, config.d_ff)
-        self.kan2 = FasterKANLayer(config.d_ff, config.d_model)
+        self.kan1 = SplineNetLayer(config.d_model, config.d_ff)
+        self.kan2 = SplineNetLayer(config.d_ff, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -156,45 +152,6 @@ class CEMA(nn.Module):
         return torch.stack(output, dim=1)
 
 
-class MambaLayer(nn.Module):
-    """
-    A Mamba layer, a novel recurrent neural network architecture with a state-space model.
-
-    Args:
-        config (UncertainTransformerConfig): The configuration for the model.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.mamba = Mamba(MambaConfig(
-            d_model=config.d_model,
-            d_state=config.d_state,
-            expand_factor=config.expand_factor,
-            d_conv=config.d_conv,
-            dt_min=config.dt_min,
-            dt_max=config.dt_max,
-            dt_init=config.dt_init,
-            dt_scale=config.dt_scale,
-            dt_init_floor=config.dt_init_floor,
-        ))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the MambaLayer.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The output tensor.
-        """
-        # Reshape the Mamba output to match the expected shape before projection
-        output, _ = self.mamba(x)
-        output = output.view(output.size(0), output.size(1),
-                             self.mamba.config.d_model)  # Reshape to (BATCH_SIZE, SEQ_LEN, D_MODEL)
-        return output
-
-
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -222,7 +179,4 @@ class TransformerEncoderLayer(nn.Module):
         # Ensure output shape matches input shape
         assert x.shape == original_shape, f"Shape mismatch in TransformerEncoderLayer: input {original_shape}, output {x.shape}"
 
-        if use_cache:
-            return x, (attn_weights, ff_output)
-        else:
-            return x, None
+        return (x, (attn_weights, ff_output)) if use_cache else (x, None)

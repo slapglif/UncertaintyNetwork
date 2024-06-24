@@ -3,9 +3,9 @@
 import pytest
 import torch
 from core.models.embedding import RotaryPositionEncoding, SentenceEncoder, SentenceGP
-from core.models.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
+from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
 from core.utils.tokenizer import Tokenizer
-from core.utils.uncertainty import UncertaintyModule
+from core.models.uncertainty.uncertainty import UncertaintyModule
 
 # Constants
 BATCH_SIZE = 2

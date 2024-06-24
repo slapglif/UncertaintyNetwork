@@ -8,7 +8,7 @@ from nltk.translate.bleu_score import sentence_bleu
 from rouge import Rouge
 from sentence_transformers import SentenceTransformer, util
 
-from core.models.uncertain_nn import (
+from core.models.uncertainty.uncertain_nn import (
     UncertainTransformerConfig,
     UncertainTransformerLMHeadModel,
 )

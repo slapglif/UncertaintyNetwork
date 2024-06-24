@@ -6,13 +6,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 
-from core.kan.fasterkan_basis import ReflectionalSwitchFunction, SplineLinear
+from core.models.kan.spline_basis import ReflectionalSwitchFunction, SplineLinear
 
 
-class FasterKANLayer(nn.Module):
+class SplineNetLayer(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, num_grids: int = 8, *_, **kwargs):
         super().__init__()
-        self.layernorm = nn.LayerNorm(input_dim)  # Correctly set normalized_shape
+        # LayerNorm now uses the correct normalized_shape
+        self.layernorm = nn.LayerNorm(input_dim)
         self.rbf = ReflectionalSwitchFunction(num_grids=num_grids, **kwargs)
         self.spline_linear = SplineLinear(input_dim * num_grids, output_dim)
 
@@ -23,9 +24,9 @@ class FasterKANLayer(nn.Module):
         return self.spline_linear(spline_basis)
 
 
-class FasterKAN(nn.Module):
+class SplineNet(nn.Module):
     """
-    A network composed of multiple FasterKAN layers.
+    A network composed of multiple SplineNet layers.
 
     Args:
         layers_hidden (List[int]): A list of hidden layer dimensions.
@@ -57,7 +58,7 @@ class FasterKAN(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList(
             [
-                FasterKANLayer(
+                SplineNetLayer(
                     in_dim,
                     out_dim,
                     grid_min=grid_min,
@@ -77,7 +78,7 @@ class FasterKAN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass of the FasterKAN network.
+        Forward pass of the SplineNet network.
 
         Args:
             x (torch.Tensor): The input tensor.
@@ -90,7 +91,7 @@ class FasterKAN(nn.Module):
         return x
 
 
-class BasicResBlock(nn.Module):
+class ResidualConnectionBlock(nn.Module):
     """
     A basic residual block with two convolutional layers and batch normalization.
 
@@ -101,7 +102,7 @@ class BasicResBlock(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, stride=1):
-        super(BasicResBlock, self).__init__()
+        super(ResidualConnectionBlock, self).__init__()
         self.conv1 = nn.Conv2d(
             in_channels,
             out_channels,
@@ -127,7 +128,7 @@ class BasicResBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass of the BasicResBlock.
+        Forward pass of the ResidualConnectionBlock.
 
         Args:
             x (torch.Tensor): The input tensor.
@@ -145,9 +146,9 @@ class BasicResBlock(nn.Module):
         return out
 
 
-class SEBlock(nn.Module):
+class AttentionGateBlock(nn.Module):
     """
-    Squeeze-and-Excitation block for channel attention.
+    Attention Gating block for channel attention.
 
     Args:
         channel (int): The number of input channels.
@@ -155,7 +156,7 @@ class SEBlock(nn.Module):
     """
 
     def __init__(self, channel, reduction=16):
-        super(SEBlock, self).__init__()
+        super(AttentionGateBlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
             nn.Linear(channel, channel // reduction, bias=False),
@@ -166,7 +167,7 @@ class SEBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass of the SEBlock.
+        Forward pass of the AttentionGateBlock.
 
         Args:
             x (torch.Tensor): The input tensor.
@@ -258,7 +259,7 @@ class SelfAttention(nn.Module):
         return out
 
 
-class FasterKANvolver(nn.Module):
+class SplineNetConv(nn.Module):
     def __init__(
             self,
             layers_hidden: List[int],
@@ -274,13 +275,13 @@ class FasterKANvolver(nn.Module):
             spline_weight_init_scale: float = 1.0,
             uncertainty_output: bool = False,
     ):
-        super(FasterKANvolver, self).__init__()
+        super(SplineNetConv, self).__init__()
 
-        self.feature_extractor = EnhancedFeatureExtractor(input_channels, hidden_dim)
+        self.feature_extractor = Classification(input_channels, hidden_dim)
         self.uncertainty_output = uncertainty_output
 
         self.faster_kan_layers = nn.ModuleList([
-            FasterKANLayer(
+            SplineNetLayer(
                 in_dim,
                 out_dim,
                 grid_min=grid_min,
@@ -300,6 +301,7 @@ class FasterKANvolver(nn.Module):
 
         uncertainties = []
         for layer in self.faster_kan_layers:
+            # Pass the correct input_dim to SplineNetLayer
             x = layer(x)
             if self.uncertainty_output:
                 uncertainties.append(torch.var(x, dim=-1))
@@ -311,7 +313,7 @@ class FasterKANvolver(nn.Module):
             return x
 
 
-class EnhancedFeatureExtractor(nn.Module):
+class Classification(nn.Module):
     def __init__(self, input_channels: int, hidden_dim: int):
         super().__init__()
         self.initial_layers = nn.Sequential(
@@ -323,8 +325,8 @@ class EnhancedFeatureExtractor(nn.Module):
             nn.BatchNorm2d(64),
             nn.MaxPool2d(2, 2),  # Reduce pooling size
             nn.Dropout(0.25),
-            BasicResBlock(64, 128),
-            SEBlock(128, reduction=16),
+            ResidualConnectionBlock(64, 128),
+            AttentionGateBlock(128, reduction=16),
             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.BatchNorm2d(256),
@@ -333,13 +335,13 @@ class EnhancedFeatureExtractor(nn.Module):
             DepthwiseSeparableConv(256, 512, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.BatchNorm2d(512),
-            BasicResBlock(512, 512),
-            SEBlock(512, reduction=16),
+            ResidualConnectionBlock(512, 512),
+            AttentionGateBlock(512, reduction=16),
             nn.AdaptiveAvgPool2d(1),  # Use adaptive pooling instead
             nn.Dropout(0.25),
             SelfAttention(512),
         )
-        self.fc = nn.Linear(512, hidden_dim).to("cuda") # Move fc to GPU
+        self.fc = nn.Linear(512, hidden_dim).to("cuda")  # Move fc to GPU
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Check for NaN and Inf values

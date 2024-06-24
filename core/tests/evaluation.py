@@ -1,15 +1,15 @@
 # core/tests/evaluation.py
 import os
-from typing import List, Optional, Dict
+from typing import List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from loguru import logger
 from tqdm import tqdm
-from transformers import PreTrainedModel, GenerationConfig, StoppingCriteria
+from transformers import PreTrainedModel, StoppingCriteria
 
-from core.models.uncertain_nn import UncertainTransformerLMHeadModel, UncertainTransformerConfig
+from core.models.uncertainty.uncertain_nn import UncertainTransformerLMHeadModel, UncertainTransformerConfig
 from core.utils.metrics import calculate_bleu_score, calculate_perplexity, calculate_rouge_scores
 from core.utils.tokenizer import Tokenizer
 from core.utils.utils import generate_text

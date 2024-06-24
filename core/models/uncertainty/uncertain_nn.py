@@ -8,10 +8,10 @@ from transformers import PreTrainedModel
 from transformers import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-from core.models.embedding import RotaryPositionEncoding, SentenceEncoder, SentenceGP, apply_rotary_pos_emb
+from core.models.embedding import RotaryPositionEncoding, SentenceGP, apply_rotary_pos_emb
 from core.models.layers import TransformerEncoderLayer, CEMA, KANFeedForward
-from core.models.mamba import Mamba, MambaConfig
-from core.utils.uncertainty import UncertaintyModule
+from core.models.statespace import Mamba, MambaConfig
+from core.models.uncertainty.uncertainty import UncertaintyModule
 from core.utils.utils import TimestepNorm
 
 
@@ -85,23 +85,23 @@ class UncertainNN(nn.Module):
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.rotary_pos_emb = RotaryPositionEncoding(config.d_model, config.n_heads, config.max_position_embeddings)
-        self.sentence_encoder = SentenceEncoder(
-            vocab_size=config.vocab_size,
-            hidden_dim=config.d_model,
-            output_dim=config.d_model,
-            kan_config={
-                'layers_hidden': [1024, 2048],
-                'grid_min': -1.2,
-                'grid_max': 0.2,
-                'num_grids': 8,
-                'exponent': 2,
-                'inv_denominator': 0.5,
-                'train_grid': False,
-                'train_inv_denominator': False,
-                'spline_weight_init_scale': 1.0,
-                'uncertainty_output': True,
-            }
-        )
+        # self.sentence_encoder = SentenceEncoder(
+        #     vocab_size=config.vocab_size,
+        #     hidden_dim=config.d_model,
+        #     output_dim=config.d_model,
+        #     kan_config={
+        #         'layers_hidden': [1024, 2048],
+        #         'grid_min': -1.2,
+        #         'grid_max': 0.2,
+        #         'num_grids': 8,
+        #         'exponent': 2,
+        #         'inv_denominator': 0.5,
+        #         'train_grid': False,
+        #         'train_inv_denominator': False,
+        #         'spline_weight_init_scale': 1.0,
+        #         'uncertainty_output': True,
+        #     }
+        # )
         self.sentence_gp = SentenceGP(config.d_model, config.d_model, config.n_inducing, config.d_model)
         self.gp_projection = nn.Linear(config.n_inducing, config.d_model)
         self.cema = CEMA(config.d_model)

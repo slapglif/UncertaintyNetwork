@@ -1,5 +1,5 @@
 # core/models/embedding.py
-from typing import Optional, Tuple
+from typing import Optional
 from typing import Tuple, Dict, Any
 
 import torch
@@ -7,7 +7,7 @@ import torch.nn as nn
 from einops import rearrange
 from torch import Tensor
 
-from core.kan.fasterkan_layers import FasterKANvolver
+from core.models.kan import SplineNetConv
 
 
 class RotaryPositionEncoding(nn.Module):
@@ -85,48 +85,48 @@ kan_config = {
 }
 
 
-class SentenceEncoder(nn.Module):
-    """
-    Sentence Encoder module using FasterKANvolver for processing embedded sentences.
-    """
-
-    def __init__(self, vocab_size: int, hidden_dim: int, output_dim: int,
-                 kan_config: Dict[str, Any]) -> None:
-        """
-        Initialize the SentenceEncoder.
-
-        Args:
-            vocab_size (int): Size of the vocabulary.
-            hidden_dim (int): Dimension of the hidden layers.
-            output_dim (int): Dimension of the output.
-            kan_config (Dict[str, Any]): Configuration for the FasterKANvolver.
-        """
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.faster_kan_volver = FasterKANvolver(
-            kan_config['layers_hidden'],
-            input_channels=1,
-            hidden_dim=hidden_dim,
-            grid_min=kan_config.get('grid_min', -1.2),
-            grid_max=kan_config.get('grid_max', 0.2),
-            num_grids=kan_config.get('num_grids', 8),
-            exponent=kan_config.get('exponent', 2),
-            inv_denominator=kan_config.get('inv_denominator', 0.5),
-            train_grid=kan_config.get('train_grid', False),
-            train_inv_denominator=kan_config.get('train_inv_denominator', False),
-            uncertainty_output=kan_config.get('uncertainty_output', True),
-        )
-        self.output_proj = nn.Linear(kan_config['layers_hidden'][-1], output_dim)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = self.embedding(x)  # Shape: (batch_size, seq_len, hidden_dim)
-        x = x.unsqueeze(1)  # Shape: (batch_size, 1, seq_len, hidden_dim)
-        x, uncertainty = self.faster_kan_volver(x)
-        x = x.squeeze(-1).transpose(1, 2)
-        uncertainty = uncertainty.squeeze(-1).transpose(1, 2)
-        x = self.output_proj(x)
-        uncertainty = self.output_proj(uncertainty)
-        return x, uncertainty
+# class SentenceEncoder(nn.Module):
+#     """
+#     Sentence Encoder module using SplineNetConv for processing embedded sentences.
+#     """
+#
+#     def __init__(self, vocab_size: int, hidden_dim: int, output_dim: int,
+#                  kan_config: Dict[str, Any]) -> None:
+#         """
+#         Initialize the SentenceEncoder.
+#
+#         Args:
+#             vocab_size (int): Size of the vocabulary.
+#             hidden_dim (int): Dimension of the hidden layers.
+#             output_dim (int): Dimension of the output.
+#             kan_config (Dict[str, Any]): Configuration for the SplineNetConv.
+#         """
+#         super().__init__()
+#         self.embedding = nn.Embedding(vocab_size, hidden_dim)
+#         self.faster_kan_volver = SplineNetConv(
+#             kan_config['layers_hidden'],
+#             input_channels=1,
+#             hidden_dim=hidden_dim,
+#             grid_min=kan_config.get('grid_min', -1.2),
+#             grid_max=kan_config.get('grid_max', 0.2),
+#             num_grids=kan_config.get('num_grids', 8),
+#             exponent=kan_config.get('exponent', 2),
+#             inv_denominator=kan_config.get('inv_denominator', 0.5),
+#             train_grid=kan_config.get('train_grid', False),
+#             train_inv_denominator=kan_config.get('train_inv_denominator', False),
+#             uncertainty_output=kan_config.get('uncertainty_output', True),
+#         )
+#         self.output_proj = nn.Linear(kan_config['layers_hidden'][-1], output_dim)
+#
+#     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+#         x = self.embedding(x)  # Shape: (batch_size, seq_len, hidden_dim)
+#         x = x.unsqueeze(1)  # Shape: (batch_size, 1, seq_len, hidden_dim)
+#         x, uncertainty = self.faster_kan_volver(x)
+#         x = x.squeeze(-1).transpose(1, 2)
+#         uncertainty = uncertainty.squeeze(-1).transpose(1, 2)
+#         x = self.output_proj(x)
+#         uncertainty = self.output_proj(uncertainty)
+#         return x, uncertainty
 
 
 class SentenceGP(nn.Module):

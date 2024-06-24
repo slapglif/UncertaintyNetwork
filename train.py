@@ -11,9 +11,9 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Learning
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from core.data.datamodule import SlimPajamaDataModule
-from core.models.uncertain_nn import UncertainTransformerLMHeadModel, UncertainTransformerConfig
+from core.models.uncertainty.uncertain_nn import UncertainTransformerLMHeadModel, UncertainTransformerConfig
 from core.utils.tokenizer import Tokenizer
-from core.utils.uncertainty import uncertainty_weighted_loss, total_uncertainty
+from core.models.uncertainty import uncertainty_weighted_loss, total_uncertainty
 
 # Configure Loguru
 log_level = os.environ.get("LOG_LEVEL", "INFO")

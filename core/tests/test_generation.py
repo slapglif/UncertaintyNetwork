@@ -5,9 +5,9 @@ import torch
 from loguru import logger
 from transformers import StoppingCriteria
 
-from core.models.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
+from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
 from core.utils.tokenizer import Tokenizer
-from core.utils.uncertainty import uncertainty_guided_sampling
+from core.models.uncertainty.uncertainty import uncertainty_guided_sampling
 from core.utils.utils import calculate_perplexity
 
 MAX_LENGTH = 50

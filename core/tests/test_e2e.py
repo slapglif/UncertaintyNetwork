@@ -8,8 +8,8 @@ from core.models.layers import (
     MambaLayer,
     TransformerEncoderLayer,
 )
-from core.models.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
-from core.utils.uncertainty import UncertaintyModule, uncertainty_guided_sampling
+from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
+from core.models.uncertainty.uncertainty import UncertaintyModule, uncertainty_guided_sampling
 
 # Constants
 BATCH_SIZE = 2

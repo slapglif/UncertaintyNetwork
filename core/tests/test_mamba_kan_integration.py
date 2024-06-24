@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from core.models.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
+from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
 from core.utils.tokenizer import Tokenizer
-from core.utils.uncertainty import total_uncertainty, epistemic_uncertainty, aleatoric_uncertainty
+from core.models.uncertainty.uncertainty import total_uncertainty, epistemic_uncertainty, aleatoric_uncertainty
 
 # Constants
 BATCH_SIZE = 2
@@ -120,7 +120,7 @@ def test_uncertainty_guided_sampling(model: UncertainTransformerLMHeadModel, con
     """
     Tests the uncertainty-guided sampling function for text generation.
     """
-    from core.utils.uncertainty import uncertainty_guided_sampling
+    from core.models.uncertainty.uncertainty import uncertainty_guided_sampling
 
     input_ids = torch.randint(0, config.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE)
     attention_mask = torch.ones((BATCH_SIZE, SEQ_LEN), dtype=torch.long, device=DEVICE)
