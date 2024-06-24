@@ -7,8 +7,10 @@ from transformers import GPT2Tokenizer
 class Tokenizer:
     def __init__(self, pretrained_tokenizer: str = "gpt2"):
         self.tokenizer = GPT2Tokenizer.from_pretrained(pretrained_tokenizer)
+        # Set pad_token to eos_token (important)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.vocab_size = self.tokenizer.vocab_size
+        # Now set pad_token_id after setting pad_token
         self.pad_token_id = self.tokenizer.pad_token_id
         self.eos_token_id = self.tokenizer.eos_token_id
         self.bos_token_id = self.tokenizer.bos_token_id

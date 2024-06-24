@@ -1,11 +1,11 @@
 # core/utils/utils.py
+
 from typing import List
 
 import torch
 from loguru import logger
 from torch import Tensor
-from transformers import GenerationConfig
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, GenerationConfig
 
 from core.utils.tokenizer import Tokenizer
 
@@ -35,10 +35,11 @@ def softplus(x: torch.Tensor) -> torch.Tensor:
     return torch.log(1 + torch.exp(x))
 
 
+# noinspection PyTypeChecker
 @torch.inference_mode()
 def generate_text(
         model: PreTrainedModel,
-        tokenizer: Tokenizer,
+        tokenizer: "Tokenizer",
         prompt: str,
         max_length: int = 100,
         temperature: float = 0.7,
@@ -48,24 +49,6 @@ def generate_text(
         num_return_sequences: int = 1,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ) -> List[str]:
-    """
-    Generate text using the given model and tokenizer.
-
-    Args:
-        model (PreTrainedModel): The pre-trained language model.
-        tokenizer (Tokenizer): The tokenizer for encoding and decoding text.
-        prompt (str): The input prompt to generate text from.
-        max_length (int): The maximum length of the generated text.
-        temperature (float): The sampling temperature for controlling randomness.
-        top_k (int): The number of top tokens to consider for top-k sampling.
-        top_p (float): The cumulative probability threshold for nucleus sampling.
-        repetition_penalty (float): The penalty factor for discouraging repetition.
-        num_return_sequences (int): The number of sequences to generate.
-        device (torch.device): The device to run the model on (default: CUDA if available, else CPU).
-
-    Returns:
-        List[str]: The list of generated texts.
-    """
     model.to(device)
     model.eval()
 
@@ -73,6 +56,8 @@ def generate_text(
         logger.info(f"Encoding prompt: {prompt}")
         input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
         logger.debug(f"Input IDs shape: {input_ids.shape}, device: {input_ids.device}")
+
+        attention_mask = torch.ones_like(input_ids)
 
         generation_config = GenerationConfig(
             max_length=max_length,
@@ -82,21 +67,22 @@ def generate_text(
             repetition_penalty=repetition_penalty,
             num_return_sequences=num_return_sequences,
             pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            do_sample=True,
         )
 
         logger.info(f"Starting text generation with generation config: {generation_config}")
 
-        generated_sequences = model.generate(
-            input_ids,
-            generation_config=generation_config,
-        )
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                generation_config=generation_config,
+            )
 
         logger.info("Text generation completed")
 
-        generated_texts = tokenizer.batch_decode(generated_sequences, skip_special_tokens=True)
-
-        return generated_texts
-
+        return tokenizer.batch_decode(outputs, skip_special_tokens=True)
     except Exception as e:
         logger.exception(f"Error during text generation: {str(e)}")
         return []
@@ -108,11 +94,23 @@ def calculate_perplexity(
         text: str,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ) -> float:
+    """
+    Calculate the perplexity of the given text using the specified model and tokenizer.
+
+    Args:
+        model (PreTrainedModel): The pre-trained language model.
+        tokenizer (Tokenizer): The tokenizer for encoding the text.
+        text (str): The input text to calculate perplexity for.
+        device (torch.device): The device to run the model on (default: CUDA if available, else CPU).
+
+    Returns:
+        float: The perplexity of the text.
+    """
     model.to(device)
     model.eval()
 
     tokens = tokenizer.encode(text)
-    input_ids = tokens.unsqueeze(0).to(device)
+    input_ids = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)  # Convert to tensor
     num_tokens = input_ids.shape[1]
 
     with torch.no_grad():

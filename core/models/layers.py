@@ -1,11 +1,15 @@
 # core/models/layers.py
-from typing import Optional, Tuple, Union
+
+from typing import Optional, Tuple
+from typing import Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 from transformers import PretrainedConfig
+
+from core.utils.utils import _check_nan_inf
 
 
 class MultiHeadAttention(nn.Module):
@@ -24,29 +28,42 @@ class MultiHeadAttention(nn.Module):
         self.window_size = config.sliding_window_size
 
     def forward(
-            self,
-            x: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
-            past_key_value: Optional[Tuple[torch.Tensor]] = None,
-            output_attentions: bool = False,
-            use_cache: bool = False,
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor]], Optional[torch.Tensor]]:
         batch_size, seq_len, _ = x.shape
+        logger.debug(f"Input shape: {x.shape}")
 
         # Linear transformations
-        q = self.W_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        k = self.W_k(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        v = self.W_v(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        q = self.W_q(x)
+        k = self.W_k(x)
+        v = self.W_v(x)
 
+        # Handle past key/value states
         if past_key_value is not None:
-            k = torch.cat([past_key_value[0], k], dim=2)
-            v = torch.cat([past_key_value[1], v], dim=2)
+            past_k, past_v = past_key_value
+            k = torch.cat([past_k, k], dim=1)
+            v = torch.cat([past_v, v], dim=1)
+            seq_len = k.size(1)
+
+        # Reshape for multi-head attention
+        q = q.view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
+        k = k.view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
+        v = v.view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2)
+
+        logger.debug(f"Query shape: {q.shape}, Key shape: {k.shape}, Value shape: {v.shape}")
 
         # Compute attention scores
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k ** 0.5)
+        logger.debug(f"Attention scores shape: {attn_scores.shape}")
 
-        # Apply sliding window attention
-        attn_scores = self._apply_sliding_window_attention(attn_scores)
+        # Apply sliding window attention if window_size is set
+        if self.window_size is not None:
+            attn_scores = self._apply_sliding_window_attention(attn_scores)
 
         # Apply attention mask if provided
         if attention_mask is not None:
@@ -59,8 +76,10 @@ class MultiHeadAttention(nn.Module):
 
         # Compute output
         attn_output = torch.matmul(attn_probs, v)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
         output = self.W_o(attn_output)
+
+        logger.debug(f"Output shape: {output.shape}")
 
         # Prepare outputs
         present_key_value = (k, v) if use_cache else None
@@ -71,61 +90,75 @@ class MultiHeadAttention(nn.Module):
 
     def _apply_sliding_window_attention(self, attn_scores: torch.Tensor) -> torch.Tensor:
         batch_size, n_heads, seq_len, _ = attn_scores.shape
+        logger.debug(f"Applying sliding window attention. attn_scores shape: {attn_scores.shape}")
 
-        # If sequence length is less than or equal to window size, no need to apply sliding window
         if seq_len <= self.window_size:
-            return attn_scores
+            logger.warning(f"Sequence length {seq_len} is shorter than or equal to window size {self.window_size}. Applying causal mask only.")
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=attn_scores.device, dtype=torch.bool))
+            return attn_scores.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
 
-        # Create causal mask
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=attn_scores.device)).bool()
+        # Calculate the number of windows and padding
+        num_windows = (seq_len + self.window_size - 1) // self.window_size
+        padding_len = num_windows * self.window_size - seq_len
 
-        # Reshape attention scores and causal mask for sliding window
+        # Pad the attention scores if necessary
+        if padding_len > 0:
+            logger.debug(f"Padding attention scores with {padding_len} zeros")
+            attn_scores = F.pad(attn_scores, (0, padding_len, 0, padding_len))
+
+        # Reshape the attention scores to group by windows
         attn_scores = attn_scores.view(
             batch_size,
             n_heads,
-            seq_len // self.window_size,
+            num_windows,
             self.window_size,
-            seq_len // self.window_size,
-            self.window_size,
-        )
-        causal_mask = causal_mask.view(
-            seq_len // self.window_size,
-            self.window_size,
-            seq_len // self.window_size,
-            self.window_size,
+            num_windows,
+            self.window_size
         )
 
-        # Apply causal mask
-        attn_scores = attn_scores.masked_fill(
-            ~causal_mask.unsqueeze(0).unsqueeze(0),
-            float("-inf"),
-        )
+        # Create a causal mask to prevent attending to future tokens within each window
+        causal_mask = torch.tril(torch.ones(self.window_size, self.window_size, device=attn_scores.device, dtype=torch.bool))
+        causal_mask = causal_mask.view(1, 1, 1, self.window_size, 1, self.window_size)
 
-        # Reshape back
-        attn_scores = attn_scores.view(batch_size, n_heads, seq_len, seq_len)
+        # Apply the causal mask within each window
+        attn_scores = attn_scores.masked_fill(~causal_mask, float("-inf"))
 
+        # Reshape the attention scores back to the original shape
+        attn_scores = attn_scores.view(batch_size, n_heads, num_windows * self.window_size, num_windows * self.window_size)
+
+        # Remove padding if it was added
+        if padding_len > 0:
+            attn_scores = attn_scores[:, :, :seq_len, :seq_len]
+
+        logger.debug(f"Sliding window attention applied. Output shape: {attn_scores.shape}")
         return attn_scores
 
     @staticmethod
     def _prepare_attention_mask(attention_mask: torch.Tensor, batch_size: int, seq_len: int) -> torch.Tensor:
-        """
-        Prepare the attention mask for multi-head attention.
+        logger.debug(f"Preparing attention mask. Input shape: {attention_mask.shape}, batch_size: {batch_size}, seq_len: {seq_len}")
 
-        Args:
-            attention_mask (torch.Tensor): The attention mask tensor.
-            batch_size (int): The batch size.
-            seq_len (int): The sequence length.
+        if attention_mask.dim() == 1:
+            attention_mask = attention_mask.unsqueeze(0)
 
-        Returns:
-            torch.Tensor: The prepared attention mask.
-        """
         if attention_mask.dim() == 2:
-            # Resize the attention mask to have dimensions [batch_size, 1, 1, seq_len]
-            attention_mask = attention_mask.view(batch_size, 1, 1, seq_len)
+            if attention_mask.shape[1] == 1:
+                # Broadcast single token mask across sequence length
+                attention_mask = attention_mask.expand(batch_size, seq_len)
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         elif attention_mask.dim() == 3:
-            # Resize the attention mask to have dimensions [batch_size, 1, seq_len, seq_len]
-            attention_mask = attention_mask.view(batch_size, 1, seq_len, seq_len)
+            attention_mask = attention_mask.unsqueeze(1)
 
+        # Ensure the mask covers the entire sequence length
+        if attention_mask.shape[-1] < seq_len:
+            logger.warning(f"Attention mask is shorter than sequence length. Padding mask from {attention_mask.shape[-1]} to {seq_len}")
+            padding = torch.ones(batch_size, 1, 1, seq_len - attention_mask.shape[-1], device=attention_mask.device)
+            attention_mask = torch.cat([attention_mask, padding], dim=-1)
+
+        # Ensure the mask is properly broadcastable
+        if attention_mask.shape[2] == 1:
+            attention_mask = attention_mask.expand(-1, -1, seq_len, -1)
+
+        logger.debug(f"Attention mask prepared. Output shape: {attention_mask.shape}")
         return attention_mask
 
 
@@ -134,7 +167,6 @@ class PositionwiseFeedForward(nn.Module):
     Position-wise Feedforward Network.
 
     This module applies a two-layer feedforward network to each position in the sequence.
-
 
     Example:
         >>> config = PretrainedConfig(d_model=512, d_ff=2048, ...)
@@ -155,6 +187,15 @@ class PositionwiseFeedForward(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the position-wise feedforward network.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_model).
+        """
         return self.fc2(self.dropout(self.activation(self.fc1(x))))
 
 
@@ -265,9 +306,7 @@ class CEMA(nn.Module):
         self.ema = None
         self.d_model = d_model
         self.alpha = alpha
-        self.register_buffer(
-            "ema", torch.zeros(d_model)
-        )  # Buffer to store the EMA state
+        self.register_buffer("ema", torch.zeros(d_model))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -292,6 +331,30 @@ class CEMA(nn.Module):
 
 
 class MambaLayer(nn.Module):
+    """
+    Mamba layer for sequence processing, inspired by the Mamba neural network architecture.
+
+    This layer uses a combination of convolution, selective scan operation, and gating mechanisms
+    to capture complex temporal dependencies in sequential data.
+
+    Attributes:
+        config (PretrainedConfig): Configuration object containing hyperparameters.
+        d_model (int): Dimension of the input and output features.
+        d_state (int): Dimension of the internal state.
+        d_conv (int): Kernel size for the convolution operation.
+        expand_factor (float): Expansion factor for the inner dimension.
+        d_inner (int): Expanded inner dimension.
+        in_proj (nn.Linear): Linear projection for the input.
+        in_proj_bias (nn.Parameter): Bias term for the input projection.
+        conv (nn.Conv1d): 1D convolution layer.
+        activation (nn.Module): Activation function (SiLU).
+        x_proj (nn.Linear): Linear projection for the intermediate output.
+        dt (nn.Parameter): Learnable time decay parameter.
+        A (nn.Parameter): Learnable parameter for state update.
+        D (nn.Parameter): Learnable parameter for scaling.
+        out_proj (nn.Linear): Linear projection for the output.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -307,9 +370,7 @@ class MambaLayer(nn.Module):
 
         # Input projection
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2)
-        self.in_proj_bias = nn.Parameter(
-            torch.randn(self.d_inner, self.d_state)
-        )  # This is 'B' in the paper
+        self.in_proj_bias = nn.Parameter(torch.randn(self.d_inner, self.d_state))
 
         # Convolution layer
         self.conv = nn.Conv1d(
@@ -335,6 +396,15 @@ class MambaLayer(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, self.d_model)
 
     def forward(self, x: torch.Tensor, **_) -> torch.Tensor:
+        """
+        Forward pass through the Mamba layer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_model).
+        """
         batch_size, seq_len, _ = x.shape
         logger.debug(f"MambaLayer forward: input shape = {x.shape}")
 
@@ -355,7 +425,7 @@ class MambaLayer(nn.Module):
         B, C = x_dbl.chunk(2, dim=-1)
 
         # Compute Δ
-        dt = torch.exp(self.dt.unsqueeze(0).unsqueeze(0))  # Shape: (1, 1, d_inner)
+        dt = torch.exp(self.dt.unsqueeze(0).unsqueeze(0))
         logger.debug(f"MambaLayer: dt shape after exp = {dt.shape}")
 
         # Apply selective scan
@@ -377,31 +447,74 @@ class MambaLayer(nn.Module):
             C: torch.Tensor,
             D: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Performs the selective scan operation, a core component of the Mamba layer.
+
+        Args:
+            x (torch.Tensor): Intermediate tensor after convolution and activation.
+            dt (torch.Tensor): Time decay parameter.
+            A (torch.Tensor): Parameter for state update.
+            B (torch.Tensor): Parameter for state gating.
+            C (torch.Tensor): Parameter for state bias.
+            D (torch.Tensor): Parameter for input scaling.
+
+        Returns:
+            torch.Tensor: Output tensor after the selective scan operation.
+        """
         batch_size, seq_len, d_inner = x.shape
         d_state = A.shape[0]
 
-        # Ensure dt has the correct dimensions
-        dt = dt[:, :, :d_state]
+        # Ensure dt has the correct dimensions:
+        dt = dt[:, :, :d_state].repeat(1, 1, (seq_len // dt.size(2)) + 1)[:, :, :seq_len]
 
         logger.debug(
-            f"_selective_scan: x shape = {x.shape}, dt shape = {dt.shape}, A shape = {A.shape}, B shape = {B.shape}, C shape = {C.shape}, D shape = {D.shape}")
+            f"_selective_scan: x shape = {x.shape}, dt shape = {dt.shape}, A shape = {A.shape}, B shape = {B.shape}, C shape = {C.shape}, D shape = {D.shape}"
+        )
 
+        # Scale the input
         x = x * D.unsqueeze(0).unsqueeze(0)
 
+        # Initialize hidden state
         h = torch.zeros(batch_size, d_state, device=x.device)
 
         hs = []
         for i in range(seq_len):
-            u = x[:, i, :]
-            A_t = torch.exp(dt[:, :, i % dt.size(2)] * A)
+            _ = x[:, i, :]
+            # Calculate A_t using dt, ensuring correct indexing and dimension alignment
+            A_t = torch.exp(dt[:, :, i] * A)  # Use i directly for indexing
+
+            # Update hidden state h
             h = torch.tanh(A_t @ h.unsqueeze(-1)).squeeze(-1) + B[:, i, :] * h + C[:, i, :]
+
+            # Check for NaN or Inf values in h
+            _check_nan_inf(h, "hidden state h")
+
             hs.append(h)
 
         hs = torch.stack(hs, dim=1)
+
+        # Repeat the hidden states to match the inner dimension
         return hs.repeat_interleave(d_inner // d_state, dim=-1)
 
 
 class TransformerEncoderLayer(nn.Module):
+    """
+    Transformer Encoder Layer.
+
+    This module combines multi-head attention, a Mamba layer (optional), and a position-wise
+    feedforward network to form a single encoder layer in a Transformer architecture.
+
+    Attributes:
+        config (PretrainedConfig): Configuration object containing hyperparameters.
+        attention (MultiHeadAttention): Multi-head attention module.
+        mamba_layer (MambaLayer): Mamba layer (optional, used if config.use_mamba is True).
+        feed_forward (PositionwiseFeedForward): Position-wise feedforward network.
+        layer_norm1 (nn.LayerNorm): Layer normalization applied before attention.
+        layer_norm2 (nn.LayerNorm): Layer normalization applied before Mamba layer.
+        layer_norm3 (nn.LayerNorm): Layer normalization applied before feedforward network.
+        dropout (nn.Dropout): Dropout layer for regularization.
+    """
+
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
@@ -420,21 +533,37 @@ class TransformerEncoderLayer(nn.Module):
             output_attentions: Optional[bool] = False,
             past_key_value: Optional[Tuple[torch.Tensor]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple[torch.Tensor]]]:
+        """
+        Forward pass through the Transformer encoder layer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+            attention_mask (Optional[torch.Tensor]): Attention mask to prevent attending to padded tokens.
+            output_attentions (Optional[bool]): Whether to output attention probabilities.
+            past_key_value (Optional[Tuple[torch.Tensor]]): Past key and value tensors for cached attention.
+
+        Returns:
+            Union[torch.Tensor, Tuple[torch.Tensor, Tuple[torch.Tensor]]]:
+                - Output tensor of shape (batch_size, seq_len, d_model).
+                - Tuple containing output tensor and present key/value tuple (if use_cache is True in config).
+        """
         logger.debug(f"TransformerEncoderLayer input shape: {x.shape}")
 
         if x.dim() == 2:
-            x = x.unsqueeze(0)  # Add batch dimension
+            x = x.unsqueeze(0)  # Add batch dimension if missing
 
+        # Apply attention sub-layer
         residual = x
         x = self.layer_norm1(x)
         attention_output, present_key_value, attention_probs = self.attention(
             x,
             attention_mask=attention_mask,
             past_key_value=past_key_value,
-            output_attentions=output_attentions
+            output_attentions=output_attentions,
         )
         x = residual + self.dropout(attention_output)
 
+        # Apply Mamba sub-layer (if enabled)
         residual = x
         x = self.layer_norm2(x)
         mamba_outputs = self.mamba_layer(x)
@@ -445,13 +574,11 @@ class TransformerEncoderLayer(nn.Module):
         )
         x = residual + self.dropout(x)
 
+        # Apply feedforward sub-layer
         residual = x
         x = self.layer_norm3(x)
         x = self.feed_forward(x)
         x = residual + self.dropout(x)
 
-        # Return present_key_value if use_cache is True
-        if self.config.use_cache:
-            return x, present_key_value
-        else:
-            return x
+        # Return output and present key/value tuple (if caching is enabled)
+        return (x, present_key_value) if self.config.use_cache else x
