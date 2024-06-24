@@ -1,11 +1,13 @@
 # core/utils/uncertainty.py
 
+import math
+from typing import Tuple, List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, List, Optional, Dict, Any
-import math
 from loguru import logger
+
 
 class UncertaintyModule(nn.Module):
     def __init__(
@@ -48,7 +50,7 @@ class UncertaintyModule(nn.Module):
         batch_size, seq_len, _ = x.shape
         device = x.device
 
-        total_uncertainty = torch.zeros(batch_size, seq_len, self.output_dim, device=device)
+        total_uncertainty = torch.zeros(batch_size, seq_len, self.input_dim, device=device)
 
         outputs = []
         try:
@@ -76,42 +78,6 @@ class UncertaintyModule(nn.Module):
             logger.error(f"Error in UncertaintyModule forward pass: {str(e)}")
             raise
 
-    def calibrate(self, val_loader: torch.utils.data.DataLoader, device: torch.device):
-        logger.info("Calibrating UncertaintyModule")
-        self.eval()
-        all_outputs = []
-        all_labels = []
-
-        with torch.no_grad():
-            for batch in val_loader:
-                inputs, labels = batch
-                inputs = inputs.to(device)
-                labels = labels.to(device)
-
-                mean, _ = self(inputs)
-                all_outputs.append(mean)
-                all_labels.append(labels)
-
-        all_outputs = torch.cat(all_outputs, dim=0)
-        all_labels = torch.cat(all_labels, dim=0)
-
-        self.temperature.data = self._optimize_temperature(all_outputs, all_labels)
-        logger.info(f"Calibration complete. New temperature: {self.temperature.item():.4f}")
-
-    def _optimize_temperature(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        nll_criterion = nn.CrossEntropyLoss()
-        ece_criterion = ECELoss()
-
-        def eval_temperature(t):
-            scaled_logits = logits / t
-            nll = nll_criterion(scaled_logits, labels)
-            ece = ece_criterion(scaled_logits, labels)
-            return nll + ece
-
-        optimizer = torch.optim.LBFGS([self.temperature], lr=0.01, max_iter=50)
-        optimizer.step(lambda: eval_temperature(self.temperature))
-
-        return self.temperature.data
 
 class GaussianProcessLayer(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, num_inducing: int = 10):
@@ -132,18 +98,15 @@ class GaussianProcessLayer(nn.Module):
         return self.log_variance.exp() * torch.exp(-0.5 * dist / self.log_lengthscale.exp().pow(2))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        try:
-            covar = F.relu(self.covar_module(x))
-            mean = self.mean_module(x)
+        covar = F.relu(self.covar_module(x))
+        mean = self.mean_module(x)
 
-            kernel = self.kernel(x, self.inducing_points)
-            weight = torch.einsum('bni,bno->bio', kernel, covar)
-            variance = torch.sum(weight * kernel, dim=1)
+        kernel = self.kernel(x, self.inducing_points)
+        weight = torch.einsum('bni,bno->bio', kernel, covar)
+        variance = torch.sum(weight * kernel, dim=1)
 
-            return mean, variance
-        except Exception as e:
-            logger.error(f"Error in GaussianProcessLayer forward pass: {str(e)}")
-            raise
+        return mean, variance.unsqueeze(-1).expand_as(mean)
+
 
 class MCDropout(nn.Module):
     def __init__(self, p: float = 0.5):
@@ -152,6 +115,7 @@ class MCDropout(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.dropout(x, p=self.p, training=True)
+
 
 class HeteroscedasticOutput(nn.Module):
     def __init__(self, input_dim: int, output_dim: int):
@@ -163,6 +127,7 @@ class HeteroscedasticOutput(nn.Module):
         mean = self.mean_output(x)
         log_var = self.var_output(x)
         return mean, torch.exp(log_var)
+
 
 class ECELoss(nn.Module):
     def __init__(self, n_bins: int = 15):
@@ -185,11 +150,14 @@ class ECELoss(nn.Module):
 
         return ece
 
+
 def epistemic_uncertainty(predictions: torch.Tensor) -> torch.Tensor:
     return torch.var(predictions, dim=0)
 
+
 def aleatoric_uncertainty(variances: torch.Tensor) -> torch.Tensor:
     return torch.mean(variances, dim=0)
+
 
 def total_uncertainty(epistemic: torch.Tensor, aleatoric: torch.Tensor) -> torch.Tensor:
     return epistemic + aleatoric

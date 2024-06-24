@@ -1,9 +1,10 @@
 # .\core\kan\fasterkan_layers.py
-from typing import *
+from typing import List, Union, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from loguru import logger
 
 from core.kan.fasterkan_basis import ReflectionalSwitchFunction, SplineLinear
 
@@ -11,60 +12,15 @@ from core.kan.fasterkan_basis import ReflectionalSwitchFunction, SplineLinear
 class FasterKANLayer(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, num_grids: int = 8, *_, **kwargs):
         super().__init__()
-        self.layernorm = nn.LayerNorm(input_dim)
+        self.layernorm = nn.LayerNorm(input_dim)  # Correctly set normalized_shape
         self.rbf = ReflectionalSwitchFunction(num_grids=num_grids, **kwargs)
         self.spline_linear = SplineLinear(input_dim * num_grids, output_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the FasterKANLayer.
-
-        This method can handle both 2D and 3D input tensors. If a 2D tensor is provided,
-        it is treated as a single sequence (batch_size=1).
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_dim)
-                              or (seq_len, input_dim).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, output_dim)
-                          or (seq_len, output_dim).
-
-        Raises:
-            ValueError: If the input tensor has an invalid number of dimensions.
-        """
-        # Apply layer normalization
         x = self.layernorm(x)
-
-        # Handle different input shapes
-        if x.dim() == 2:
-            # If input is 2D, add a batch dimension
-            x = x.unsqueeze(0)
-            squeeze_output = True
-        elif x.dim() == 3:
-            squeeze_output = False
-        else:
-            raise ValueError(f"Invalid input dimension. Expected 2D or 3D tensor, got {x.dim()}D.")
-
-        batch_size, seq_len, input_dim = x.shape
-
-        # Apply RBF layer
         spline_basis = self.rbf(x)
-
-        # Reshape for spline linear layer
-        spline_basis = spline_basis.view(batch_size * seq_len, -1)
-
-        # Apply spline linear layer
-        output = self.spline_linear(spline_basis)
-
-        # Reshape output to match input shape
-        output = output.view(batch_size, seq_len, -1)
-
-        # Remove batch dimension if input was 2D
-        if squeeze_output:
-            output = output.squeeze(0)
-
-        return output
+        spline_basis = spline_basis.view(x.size(0), -1)
+        return self.spline_linear(spline_basis)
 
 
 class FasterKAN(nn.Module):
@@ -302,11 +258,6 @@ class SelfAttention(nn.Module):
         return out
 
 
-import torch
-import torch.nn as nn
-from typing import List, Union, Tuple
-
-
 class FasterKANvolver(nn.Module):
     def __init__(
             self,
@@ -362,7 +313,7 @@ class FasterKANvolver(nn.Module):
 
 class EnhancedFeatureExtractor(nn.Module):
     def __init__(self, input_channels: int, hidden_dim: int):
-        super(EnhancedFeatureExtractor, self).__init__()
+        super().__init__()
         self.initial_layers = nn.Sequential(
             nn.Conv2d(input_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
@@ -370,31 +321,34 @@ class EnhancedFeatureExtractor(nn.Module):
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.BatchNorm2d(64),
-            nn.MaxPool2d(2, 2),
+            nn.MaxPool2d(2, 2),  # Reduce pooling size
             nn.Dropout(0.25),
             BasicResBlock(64, 128),
             SEBlock(128, reduction=16),
             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.BatchNorm2d(256),
-            nn.MaxPool2d(2, 2),
+            nn.MaxPool2d(2, 2),  # Reduce pooling size
             nn.Dropout(0.25),
             DepthwiseSeparableConv(256, 512, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.BatchNorm2d(512),
             BasicResBlock(512, 512),
             SEBlock(512, reduction=16),
-            nn.MaxPool2d(2, 2),
+            nn.AdaptiveAvgPool2d(1),  # Use adaptive pooling instead
             nn.Dropout(0.25),
             SelfAttention(512),
         )
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(512, hidden_dim)
+        self.fc = nn.Linear(512, hidden_dim).to("cuda") # Move fc to GPU
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Check for NaN and Inf values
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            logger.error(f"NaN or Inf values found in the input tensor: {x.shape}")
+            return x
+
         batch_size = x.size(0)
         x = self.initial_layers(x)
-        x = self.avg_pool(x)
         x = x.view(batch_size, -1)
         x = self.fc(x)
         return x

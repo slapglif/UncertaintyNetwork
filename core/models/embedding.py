@@ -1,11 +1,11 @@
 # core/models/embedding.py
-from typing import Dict, Any
-from typing import Optional
-from typing import Tuple
+from typing import Optional, Tuple
+from typing import Tuple, Dict, Any
 
 import torch
 import torch.nn as nn
 from einops import rearrange
+from torch import Tensor
 
 from core.kan.fasterkan_layers import FasterKANvolver
 
@@ -114,41 +114,19 @@ class SentenceEncoder(nn.Module):
             inv_denominator=kan_config.get('inv_denominator', 0.5),
             train_grid=kan_config.get('train_grid', False),
             train_inv_denominator=kan_config.get('train_inv_denominator', False),
+            uncertainty_output=kan_config.get('uncertainty_output', True),
         )
+        self.output_proj = nn.Linear(kan_config['layers_hidden'][-1], output_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the SentenceEncoder.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len) or (batch_size, num_sentences, seq_len).
-
-        Returns:
-            torch.Tensor: Encoded sentences of shape (batch_size, seq_len, output_dim) or (batch_size, num_sentences, seq_len, output_dim).
-        """
-        original_shape = x.shape
-
-        # Reshape input if it's 3D (batch_size, num_sentences, seq_len)
-        if len(original_shape) == 3:
-            x = x.view(-1, original_shape[-1])
-
-        # Embed the input
-        x = self.embedding(x)  # Shape: (..., seq_len, hidden_dim)
-
-        # Add channel dimension for FasterKANvolver
-        x = x.unsqueeze(1)  # Shape: (..., 1, seq_len, hidden_dim)
-
-        # Process with FasterKANvolver
-        x = self.faster_kan_volver(x)  # Shape: (..., output_dim, seq_len, 1)
-
-        # Remove extra dimensions and transpose to get the correct output shape
-        x = x.squeeze(-1).permute(0, 2, 1)  # Shape: (..., seq_len, output_dim)
-
-        # Reshape back to original shape if input was 3D
-        if len(original_shape) == 3:
-            x = x.view(original_shape[0], original_shape[1], original_shape[2], -1)
-
-        return x
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.embedding(x)  # Shape: (batch_size, seq_len, hidden_dim)
+        x = x.unsqueeze(1)  # Shape: (batch_size, 1, seq_len, hidden_dim)
+        x, uncertainty = self.faster_kan_volver(x)
+        x = x.squeeze(-1).transpose(1, 2)
+        uncertainty = uncertainty.squeeze(-1).transpose(1, 2)
+        x = self.output_proj(x)
+        uncertainty = self.output_proj(uncertainty)
+        return x, uncertainty
 
 
 class SentenceGP(nn.Module):
@@ -173,8 +151,7 @@ class SentenceGP(nn.Module):
         dist = torch.cdist(x1, x2, p=2).pow(2)
         return torch.exp(-0.5 * dist / torch.exp(self.log_lengthscale).pow(2))
 
-    def forward(self, x: torch.Tensor, num_sentences: Optional[int] = None) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, num_sentences: Optional[int] = None) -> tuple[Tensor, Tensor]:
         batch_size, num_sentences_input, input_dim = x.shape
 
         if num_sentences is not None and num_sentences_input != num_sentences:
@@ -198,4 +175,4 @@ class SentenceGP(nn.Module):
         mean = torch.einsum("bni,io->bno", mean, self.output_proj.weight)
         var = torch.diagonal(var, dim1=-2, dim2=-1)
 
-        return mean, torch.nn.functional.softplus(var), x  # Returning x as the state
+        return mean, torch.nn.functional.softplus(var)  # Remove the third return value

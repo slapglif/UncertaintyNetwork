@@ -1,5 +1,7 @@
 # core/utils/utils.py
 
+import torch
+import torch.nn as nn
 import inspect
 from typing import Tuple, List, Union
 
@@ -277,3 +279,28 @@ def check_shape(tensor: torch.Tensor, expected_shape: Tuple[int], name: str):
     """Checks the shape of a tensor against the expected shape and raises a ValueError if they don't match."""
     if tensor.shape != expected_shape:
         raise ValueError(f"Shape mismatch for {name}: expected {expected_shape}, got {tensor.shape}")
+
+
+
+
+class TimestepNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Timestep Normalization to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
+
+        Returns:
+            torch.Tensor: Normalized output tensor of shape (batch_size, seq_len, dim).
+        """
+        # Calculate the mean and standard deviation across the sequence (axis=1)
+        mean = x.mean(dim=1, keepdim=True)
+        std = x.std(dim=1, keepdim=True)
+
+        return (x - mean) / (std + self.eps)

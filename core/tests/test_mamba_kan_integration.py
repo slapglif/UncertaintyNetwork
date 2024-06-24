@@ -56,6 +56,9 @@ def tokenizer():
 
 
 def test_model_forward_with_uncertainty(model: UncertainTransformerLMHeadModel, config: UncertainTransformerConfig):
+    """
+    Tests the model's forward pass with uncertainty estimation.
+    """
     input_ids = torch.randint(0, config.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE)
     attention_mask = torch.ones((BATCH_SIZE, SEQ_LEN), dtype=torch.long, device=DEVICE)
 
@@ -68,6 +71,9 @@ def test_model_forward_with_uncertainty(model: UncertainTransformerLMHeadModel, 
 
 
 def test_model_generation_with_uncertainty(model, tokenizer):
+    """
+    Tests the model's text generation with uncertainty.
+    """
     input_ids = torch.tensor([[tokenizer.bos_token_id]], device=DEVICE)
 
     output_sequences = model.generate(
@@ -89,6 +95,9 @@ def test_model_generation_with_uncertainty(model, tokenizer):
 
 
 def test_model_uncertainty_decomposition(model: UncertainTransformerLMHeadModel, config: UncertainTransformerConfig):
+    """
+    Tests the decomposition of the model's uncertainty into epistemic and aleatoric components.
+    """
     input_ids = torch.randint(0, config.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE)
     attention_mask = torch.ones((BATCH_SIZE, SEQ_LEN), dtype=torch.long, device=DEVICE)
 
@@ -108,6 +117,9 @@ def test_model_uncertainty_decomposition(model: UncertainTransformerLMHeadModel,
 
 
 def test_uncertainty_guided_sampling(model: UncertainTransformerLMHeadModel, config: UncertainTransformerConfig):
+    """
+    Tests the uncertainty-guided sampling function for text generation.
+    """
     from core.utils.uncertainty import uncertainty_guided_sampling
 
     input_ids = torch.randint(0, config.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE)
