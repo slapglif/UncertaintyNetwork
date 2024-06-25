@@ -12,8 +12,8 @@ from pytorch_lightning.loggers import TensorBoardLogger
 
 from core.data.datamodule import SlimPajamaDataModule
 from core.models.uncertainty.uncertain_nn import UncertainTransformerLMHeadModel, UncertainTransformerConfig
+from core.models.uncertainty.uncertainty_utils import uncertainty_weighted_loss, total_uncertainty
 from core.utils.tokenizer import Tokenizer
-from core.models.uncertainty import uncertainty_weighted_loss, total_uncertainty
 
 # Configure Loguru
 log_level = os.environ.get("LOG_LEVEL", "INFO")
@@ -85,7 +85,6 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         )
 
         perplexity = torch.exp(loss)
-        # Continuing from where we left off in train.py
 
         self.log(
             "val_perplexity",
@@ -139,6 +138,7 @@ class UncertainTransformerLightningModule(pl.LightningModule):
                 "frequency": 1,
             },
         }
+
 
 def main():
     logger.info("Starting main function...")

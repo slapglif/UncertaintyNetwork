@@ -12,8 +12,8 @@ from core.models.uncertainty.uncertain_nn import (
     UncertainTransformerConfig,
     UncertainTransformerLMHeadModel,
 )
-from core.tests.test_generation import generate_text
 from core.utils.tokenizer import Tokenizer
+from core.utils.utils import generate_text
 
 # Configure Loguru
 logger.remove()  # Remove default logger

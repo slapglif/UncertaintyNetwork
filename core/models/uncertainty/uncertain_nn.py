@@ -1,17 +1,19 @@
-# core/models/uncertain_nn.py
+# core/models/uncertainty/uncertain_nn.py
 
 from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from sentence_transformers import SentenceTransformer
 from transformers import PreTrainedModel
 from transformers import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-from core.models.embedding import RotaryPositionEncoding, SentenceGP, apply_rotary_pos_emb
+from core.models.embedding import RotaryPositionEncoding, apply_rotary_pos_emb
 from core.models.layers import TransformerEncoderLayer, CEMA, KANFeedForward
 from core.models.statespace import Mamba, MambaConfig
-from core.models.uncertainty.uncertainty import UncertaintyModule
+from core.models.uncertainty.uncertainty_utils import UncertaintyModule
+from core.utils.tokenizer import Tokenizer
 from core.utils.utils import TimestepNorm
 
 
@@ -45,6 +47,7 @@ class UncertainTransformerConfig(PretrainedConfig):
             n_inducing=10,
             use_gelu_approximation=False,
             sliding_window_size=512,
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
             **kwargs
     ):
         super().__init__(
@@ -53,6 +56,7 @@ class UncertainTransformerConfig(PretrainedConfig):
             eos_token_id=eos_token_id,
             **kwargs
         )
+        self.device = device
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_heads = n_heads
@@ -82,28 +86,16 @@ class UncertainTransformerConfig(PretrainedConfig):
 class UncertainNN(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.tokenizer = Tokenizer()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.rotary_pos_emb = RotaryPositionEncoding(config.d_model, config.n_heads, config.max_position_embeddings)
-        # self.sentence_encoder = SentenceEncoder(
-        #     vocab_size=config.vocab_size,
-        #     hidden_dim=config.d_model,
-        #     output_dim=config.d_model,
-        #     kan_config={
-        #         'layers_hidden': [1024, 2048],
-        #         'grid_min': -1.2,
-        #         'grid_max': 0.2,
-        #         'num_grids': 8,
-        #         'exponent': 2,
-        #         'inv_denominator': 0.5,
-        #         'train_grid': False,
-        #         'train_inv_denominator': False,
-        #         'spline_weight_init_scale': 1.0,
-        #         'uncertainty_output': True,
-        #     }
-        # )
-        self.sentence_gp = SentenceGP(config.d_model, config.d_model, config.n_inducing, config.d_model)
-        self.gp_projection = nn.Linear(config.n_inducing, config.d_model)
+
+        # Using pre-trained SentenceTransformer for sentence embedding
+        self.sentence_transformer = SentenceTransformer("tomaarsen/mpnet-base-nli-matryoshka", device=config.device)
+        # Projection layer for SentenceTransformer output
+        self.sentence_proj = nn.Linear(768, config.d_model)
+
         self.cema = CEMA(config.d_model)
         self.layers = nn.ModuleList([
             nn.ModuleList([
@@ -128,7 +120,7 @@ class UncertainNN(nn.Module):
 
         self.uncertainty_module = UncertaintyModule(
             input_dim=config.d_model,
-            output_dim=config.d_model,  # Change this to match the model's hidden size
+            output_dim=config.vocab_size, # changed from d_model to vocab_size
             n_gp_layers=2,
             n_inducing=config.n_inducing,
             dropout_rate=config.dropout
@@ -139,17 +131,37 @@ class UncertainNN(nn.Module):
             attention_mask = torch.ones_like(input_ids)
 
         inputs_embeds = self.embedding(input_ids)
-        sentence_emb, sentence_uncertainty = self.sentence_encoder(input_ids)
-        gp_mean, gp_var, _ = self.sentence_gp(sentence_emb)
-        gp_mean = self.gp_projection(gp_mean)
 
-        inputs_embeds = inputs_embeds + sentence_emb + gp_mean
+        # Sentence embedding using SentenceTransformer
+        try:
+            input_ids_cpu = input_ids.cpu() if input_ids.is_cuda else input_ids
+        except RuntimeError as e:
+            if "CUDA error: device-side assert triggered" in str(e):
+                # Handle the CUDA error gracefully
+                input_ids_cpu = input_ids.detach().cpu()  # Detach and move to CPU
+            else:
+                raise e
+
+        sentence_emb = self.sentence_transformer.encode(
+            self.tokenizer.batch_decode(input_ids_cpu, skip_special_tokens=True), convert_to_tensor=True
+        )
+
+        # Project sentence embeddings to match the dimension of inputs_embeds
+        sentence_emb = self.sentence_proj(sentence_emb)
+
+        if input_ids.is_cuda:
+            sentence_emb = sentence_emb.to(input_ids.device)
+
+        # Reshape sentence_emb to match the shape of inputs_embeds
+        sentence_emb = sentence_emb.unsqueeze(1).repeat(1, inputs_embeds.size(1), 1)
+
+        inputs_embeds = inputs_embeds + sentence_emb  # Add sentence embeddings
 
         cos, sin = self.rotary_pos_emb(inputs_embeds, seq_len=input_ids.size(1))
         inputs_embeds = apply_rotary_pos_emb(inputs_embeds, cos, sin)
 
         inputs_embeds = self.cema(inputs_embeds)
-        inputs_embeds = TimestepNorm(self.config.d_model)(inputs_embeds)  # Add TimestepNorm here
+        inputs_embeds = TimestepNorm(self.config.d_model)(inputs_embeds)
 
         hidden_states = inputs_embeds
         for mamba, transformer, kan_ff, projection in self.layers:
@@ -169,8 +181,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
     def __init__(self, config: 'UncertainTransformerConfig'):
         super().__init__(config)
         self.transformer = UncertainNN(config)
-        # Ensure lm_head weight is float32 to avoid CUDA errors
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False).to("cuda")
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -222,7 +233,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             return_dict=return_dict,
         )
 
-        hidden_states = transformer_outputs[0]
+        hidden_states = transformer_outputs
 
         lm_logits = self.lm_head(hidden_states)
 
@@ -236,16 +247,16 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         if not return_dict:
-            output = (lm_logits,) + transformer_outputs[1:]
+            output = (lm_logits,) + (hidden_states,)
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
+            past_key_values=None,  # Set to None since it's not available
+            hidden_states=[hidden_states],  # Wrap hidden_states in a list
+            attentions=None,  # Set to None since it's not available
+            cross_attentions=None,  # Set to None since it's not available
         ), uncertainty
 
     def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, **kwargs):

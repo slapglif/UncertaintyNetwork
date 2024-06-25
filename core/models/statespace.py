@@ -107,6 +107,7 @@ class Mamba(nn.Module):
             x = x.unsqueeze(0)
 
         batch_size, seq_len, _ = x.shape
+        device = x.device
 
         # Input projection and splitting
         xz = self.in_proj(x)
@@ -122,10 +123,10 @@ class Mamba(nn.Module):
         delta = F.softplus(dt)
 
         # Selective scan
-        A = -torch.exp(self.A_log.float())
-        B = self.B.float()
-        C = self.C.float()
-        D = self.D.float()
+        A = -torch.exp(self.A_log.float().to(device))
+        B = self.B.float().to(device)
+        C = self.C.float().to(device)
+        D = self.D.float().to(device)
 
         if self.config.pscan:
             y = self.parallel_scan(x, delta, A, B, C, D)

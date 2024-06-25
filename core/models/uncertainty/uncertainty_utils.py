@@ -1,4 +1,4 @@
-# core/utils/uncertainty.py
+# core/models/uncertainty/uncertainty_utils.py
 
 import math
 from typing import Tuple, List
@@ -11,14 +11,14 @@ from loguru import logger
 
 class UncertaintyModule(nn.Module):
     def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        n_gp_layers: int = 2,
-        n_inducing: int = 10,
-        dropout_rate: float = 0.1,
-        mc_samples: int = 5,
-        temperature: float = 1.0,
+            self,
+            input_dim: int,
+            output_dim: int,
+            n_gp_layers: int = 2,
+            n_inducing: int = 10,
+            dropout_rate: float = 0.1,
+            mc_samples: int = 5,
+            temperature: float = 1.0,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -37,7 +37,7 @@ class UncertaintyModule(nn.Module):
                 for _ in range(n_gp_layers)
             ])
             self.mc_dropout = MCDropout(p=dropout_rate)
-            self.output_layer = HeteroscedasticOutput(input_dim, output_dim)
+            self.output_layer = HeteroscedasticOutput(input_dim, output_dim)  # Update output_dim to match logits
         except Exception as e:
             logger.error(f"Error initializing UncertaintyModule components: {str(e)}")
             raise
@@ -50,14 +50,16 @@ class UncertaintyModule(nn.Module):
         batch_size, seq_len, _ = x.shape
         device = x.device
 
-        total_uncertainty = torch.zeros(batch_size, seq_len, self.input_dim, device=device)
+        total_uncertainty = torch.zeros(batch_size, seq_len, self.output_dim,
+                                        device=device)  # Change from input_dim to output_dim
 
         outputs = []
         try:
             for _ in range(self.mc_samples):
                 h = self.mc_dropout(x)
 
-                gp_uncertainty = torch.zeros_like(h)
+                gp_uncertainty = torch.zeros(batch_size, seq_len, self.output_dim,
+                                             device=device)  # Match shape of output
                 for gp_layer in self.gp_layers:
                     h, uncertainty = gp_layer(h)
                     gp_uncertainty += uncertainty
@@ -65,7 +67,7 @@ class UncertaintyModule(nn.Module):
                 mean, het_uncertainty = self.output_layer(h)
 
                 outputs.append(mean)
-                total_uncertainty += gp_uncertainty + het_uncertainty
+                total_uncertainty += gp_uncertainty + het_uncertainty  # Correctly accumulate uncertainty over output dimensions
 
             mean_output = torch.stack(outputs).mean(dim=0)
             mean_uncertainty = total_uncertainty / self.mc_samples
@@ -105,7 +107,7 @@ class GaussianProcessLayer(nn.Module):
         weight = torch.einsum('bni,bno->bio', kernel, covar)
         variance = torch.sum(weight * kernel, dim=1)
 
-        return mean, variance.unsqueeze(-1).expand_as(mean)
+        return mean, variance.unsqueeze(-1).expand_as(mean)  # Ensure variance has the same shape as mean
 
 
 class MCDropout(nn.Module):
@@ -162,8 +164,6 @@ def aleatoric_uncertainty(variances: torch.Tensor) -> torch.Tensor:
 def total_uncertainty(epistemic: torch.Tensor, aleatoric: torch.Tensor) -> torch.Tensor:
     return epistemic + aleatoric
 
-
-# Continuing from where we left off in uncertainty.py
 
 def entropy(probs: torch.Tensor) -> torch.Tensor:
     return -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
@@ -271,7 +271,8 @@ def uncertainty_guided_sampling(logits: torch.Tensor, uncertainties: torch.Tenso
     """
     scaled_logits = logits / temperature
     uncertainty_weight = F.softmax(-alpha * uncertainties, dim=-1)
-    weighted_logits = scaled_logits * uncertainty_weight
+    weighted_logits = scaled_logits * uncertainty_weight  # Removed expand_as
+
     return torch.multinomial(F.softmax(weighted_logits, dim=-1), num_samples=1).squeeze(-1)
 
 
@@ -341,5 +342,3 @@ class BayesianLinear(nn.Module):
     def _kl_divergence(mu: torch.Tensor, std: torch.Tensor, prior_std: float) -> torch.Tensor:
         kl = 0.5 * (2 * torch.log(prior_std / std) - 1 + (std / prior_std).pow(2) + (mu / prior_std).pow(2))
         return kl.sum()
-
-# Add any additional utility functions or classes as needed for uncertainty analysis

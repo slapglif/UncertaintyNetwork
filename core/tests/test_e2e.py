@@ -9,7 +9,7 @@ from core.models.layers import (
     TransformerEncoderLayer,
 )
 from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
-from core.models.uncertainty.uncertainty import UncertaintyModule, uncertainty_guided_sampling
+from core.models.uncertainty.uncertainty_utils import UncertaintyModule, uncertainty_guided_sampling
 
 # Constants
 BATCH_SIZE = 2

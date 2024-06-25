@@ -20,7 +20,8 @@ class SplineNetLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.layernorm(x)
         spline_basis = self.rbf(x)
-        spline_basis = spline_basis.view(x.size(0), -1)
+        # Reshape to (batch_size, seq_len, input_dim * num_grids) instead of flattening
+        spline_basis = spline_basis.view(x.size(0), x.size(1), -1)
         return self.spline_linear(spline_basis)
 
 

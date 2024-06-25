@@ -5,7 +5,7 @@ import torch
 from core.models.embedding import RotaryPositionEncoding, SentenceEncoder, SentenceGP
 from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
 from core.utils.tokenizer import Tokenizer
-from core.models.uncertainty.uncertainty import UncertaintyModule
+from core.models.uncertainty.uncertainty_utils import UncertaintyModule
 
 # Constants
 BATCH_SIZE = 2
