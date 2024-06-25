@@ -1,15 +1,30 @@
-# core/models/uncertainty/uncertainty_utils.py
+# .\core\models\uncertainty\uncertainty_utils.py
 
 import math
-from typing import Tuple, List
+from typing import List, Tuple
 
+import gpytorch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
+from torch_mist.estimators import MINE
 
 
 class UncertaintyModule(nn.Module):
+    """
+    Module for estimating uncertainty using Monte Carlo dropout and Gaussian Processes.
+
+    Args:
+        input_dim (int): The dimension of the input features.
+        output_dim (int): The dimension of the output.
+        n_gp_layers (int, optional): Number of Gaussian Process layers. Defaults to 2.
+        n_inducing (int, optional): Number of inducing points for each GP layer. Defaults to 10.
+        dropout_rate (float, optional): Dropout rate for MC dropout. Defaults to 0.1.
+        mc_samples (int, optional): Number of MC samples to draw. Defaults to 5.
+        temperature (float, optional): Temperature scaling factor for logits. Defaults to 1.0.
+    """
+
     def __init__(
             self,
             input_dim: int,
@@ -31,18 +46,26 @@ class UncertaintyModule(nn.Module):
 
         logger.info(f"Initializing UncertaintyModule with {n_gp_layers} GP layers and {mc_samples} MC samples")
 
-        try:
-            self.gp_layers = nn.ModuleList([
-                GaussianProcessLayer(input_dim, input_dim, n_inducing)
-                for _ in range(n_gp_layers)
-            ])
-            self.mc_dropout = MCDropout(p=dropout_rate)
-            self.output_layer = HeteroscedasticOutput(input_dim, output_dim)  # Update output_dim to match logits
-        except Exception as e:
-            logger.error(f"Error initializing UncertaintyModule components: {str(e)}")
-            raise
+        self.gp_layers = nn.ModuleList([
+            GaussianProcessLayer(input_dim, input_dim, n_inducing)
+            for _ in range(n_gp_layers)
+        ])
+        self.mc_dropout = nn.Dropout(p=dropout_rate)
+        self.output_layer = nn.Linear(input_dim, output_dim)
+        self.uncertainty_layer = nn.Linear(input_dim, output_dim)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass of the UncertaintyModule.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_dim).
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - Scaled mean output of shape (batch_size, seq_len, output_dim)
+                - Scaled uncertainty of shape (batch_size, seq_len, output_dim)
+        """
         if x.dim() != 3 or x.size(2) != self.input_dim:
             logger.error(f"Invalid input shape. Expected (batch_size, seq_len, {self.input_dim}), got {x.shape}")
             raise ValueError(f"Invalid input shape. Expected (batch_size, seq_len, {self.input_dim}), got {x.shape}")
@@ -50,24 +73,18 @@ class UncertaintyModule(nn.Module):
         batch_size, seq_len, _ = x.shape
         device = x.device
 
-        total_uncertainty = torch.zeros(batch_size, seq_len, self.output_dim,
-                                        device=device)  # Change from input_dim to output_dim
-
+        total_uncertainty = torch.zeros(batch_size, seq_len, self.output_dim, device=device)
         outputs = []
+
         try:
             for _ in range(self.mc_samples):
                 h = self.mc_dropout(x)
 
-                gp_uncertainty = torch.zeros(batch_size, seq_len, self.output_dim,
-                                             device=device)  # Match shape of output
                 for gp_layer in self.gp_layers:
-                    h, uncertainty = gp_layer(h)
-                    gp_uncertainty += uncertainty
+                    h, variance = gp_layer(h)
+                    total_uncertainty += variance
 
-                mean, het_uncertainty = self.output_layer(h)
-
-                outputs.append(mean)
-                total_uncertainty += gp_uncertainty + het_uncertainty  # Correctly accumulate uncertainty over output dimensions
+                outputs.append(self.output_layer(h))
 
             mean_output = torch.stack(outputs).mean(dim=0)
             mean_uncertainty = total_uncertainty / self.mc_samples
@@ -82,6 +99,15 @@ class UncertaintyModule(nn.Module):
 
 
 class GaussianProcessLayer(nn.Module):
+    """
+    A single Gaussian Process layer using a quantum-inspired kernel combined with a Matern kernel.
+
+    Args:
+        input_dim (int): The dimension of the input features.
+        output_dim (int): The dimension of the output.
+        num_inducing (int, optional): Number of inducing points. Defaults to 10.
+    """
+
     def __init__(self, input_dim: int, output_dim: int, num_inducing: int = 10):
         super().__init__()
         self.input_dim = input_dim
@@ -89,25 +115,186 @@ class GaussianProcessLayer(nn.Module):
         self.num_inducing = num_inducing
 
         self.inducing_points = nn.Parameter(torch.randn(num_inducing, input_dim))
-        self.covar_module = nn.Linear(input_dim, num_inducing, bias=False)
-        self.mean_module = nn.Linear(input_dim, output_dim)
 
-        self.log_lengthscale = nn.Parameter(torch.zeros(1))
-        self.log_variance = nn.Parameter(torch.zeros(1))
+        # Robust Kernel Combination with Individual Lengthscales (managed by gpytorch)
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.AdditiveKernel(
+                QuantumWalkKernel(input_dim, n_steps=3),  # No lengthscale here
+                gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=input_dim)
+            )
+        )
 
-    def kernel(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        dist = torch.cdist(x1, x2, p=2).pow(2)
-        return self.log_variance.exp() * torch.exp(-0.5 * dist / self.log_lengthscale.exp().pow(2))
+        self.mean_module = gpytorch.means.ZeroMean()
+
+        # Initialize variational distribution without a fixed batch shape
+        self.variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(
+            num_inducing_points=self.num_inducing
+        )
+
+        self.variational_strategy = gpytorch.variational.VariationalStrategy(
+            self,
+            self.inducing_points,
+            self.variational_distribution,
+            learn_inducing_locations=True
+        )
+
+        self.likelihood = gpytorch.likelihoods.GaussianLikelihood()
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        covar = F.relu(self.covar_module(x))
-        mean = self.mean_module(x)
+        """
+        Forward pass of the GaussianProcessLayer.
 
-        kernel = self.kernel(x, self.inducing_points)
-        weight = torch.einsum('bni,bno->bio', kernel, covar)
-        variance = torch.sum(weight * kernel, dim=1)
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_dim).
 
-        return mean, variance.unsqueeze(-1).expand_as(mean)  # Ensure variance has the same shape as mean
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - Mean output of shape (batch_size, seq_len, output_dim).
+                - Variance of shape (batch_size, seq_len, output_dim).
+        """
+        variational_dist_f = self.variational_strategy(x)
+        variational_dist_y = self.likelihood(variational_dist_f)
+
+        mean = variational_dist_y.mean
+        variance = variational_dist_y.variance
+
+        return mean, variance
+
+
+class QuantumWalkKernel(gpytorch.kernels.Kernel):
+    """
+    A stateless quantum walk-inspired kernel for Gaussian Processes.
+
+    This kernel is not based on true quantum computation but uses concepts from quantum walks
+    to define the similarity between data points. It can capture complex non-linear relationships
+    in the data.
+
+    Args:
+        input_dim (int): The dimension of the input features.
+        coin_param (float, optional): Parameter controlling the 'coin flip' probability in the walk.
+            Defaults to 0.5.
+        n_steps (int, optional): Number of steps in the quantum walk. Defaults to 5.
+    """
+
+    def __init__(self, input_dim: int, coin_param: float = 0.5, n_steps: int = 5):
+        super().__init__()
+        self.input_dim = input_dim
+        self.coin_param = coin_param
+        self.n_steps = n_steps
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor, **params) -> torch.Tensor:
+        """
+        Computes the covariance matrix between two sets of input points.
+
+        Args:
+            x1 (torch.Tensor): First set of input points (batch_size, seq_len, input_dim).
+            x2 (torch.Tensor): Second set of input points (batch_size, seq_len, input_dim).
+            **params: Additional parameters for the kernel (including lengthscale from gpytorch).
+
+        Returns:
+            torch.Tensor: Covariance matrix of shape (batch_size, seq_len, seq_len).
+        """
+        # Handle the last_dim_is_batch argument correctly
+        if params.get('last_dim_is_batch', False):
+            x1 = x1.transpose(-1, -2)
+            x2 = x2.transpose(-1, -2)
+
+        # Calculate pairwise squared distances directly, avoiding cdist
+        diff = x1.unsqueeze(-2) - x2.unsqueeze(-3)
+        dist = diff.pow(2).sum(dim=-1)
+
+        # Simulate quantum walk without in-place modification
+        walk_dist = dist.clone()  # Create a copy for the walk
+        for _ in range(self.n_steps):
+            coin_flip = (torch.rand(walk_dist.shape, device=walk_dist.device) < self.coin_param).float()
+
+            # Correct the distance update using broadcasting:
+            walk_dist = walk_dist * coin_flip + walk_dist.transpose(-1, -2) * (1 - coin_flip)
+
+        # Ensure walk_dist has the same shape as dist
+        walk_dist = walk_dist.expand_as(dist)
+
+        # Return the kernel value (the lengthscale will be applied by gpytorch)
+        if params.get('last_dim_is_batch', False):
+            return torch.exp(-walk_dist).transpose(-1, -2)
+        else:
+            return torch.exp(-walk_dist)
+
+
+class TSPEnergyFunction(nn.Module):
+    """
+    Computes the energy between two sequences of word embeddings based on the Traveling
+    Salesman Problem (TSP) with dual Information Bottleneck (IB) regularization and
+    Neural Tangent Kernel (NTK) inspiration.
+
+    Args:
+        embedding_dim (int): The dimension of the word embeddings.
+        compression_dim (int, optional): The dimension of the compressed representation for dual IB.
+            If None, dual IB is not applied. Defaults to None.
+        lambda_ib (float, optional): Regularization strength for the dual IB term. Defaults to 0.01.
+    """
+
+    def __init__(self, embedding_dim: int, compression_dim: int = None, lambda_ib: float = 0.01):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.compression_dim = compression_dim
+        self.lambda_ib = lambda_ib
+
+        if compression_dim is not None:
+            self.compressor = nn.Linear(embedding_dim, compression_dim)
+            self.mine_estimator = MINE()  # Initialize the MINE estimator
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the TSP-inspired energy between two sequences of word embeddings.
+
+        Args:
+            x1 (torch.Tensor): First sequence of embeddings (batch_size, seq_len1, embedding_dim).
+            x2 (torch.Tensor): Second sequence of embeddings (batch_size, seq_len2, embedding_dim).
+
+        Returns:
+            torch.Tensor: Energy matrix of shape (batch_size, seq_len1, seq_len2).
+        """
+        # 1. Compute Pairwise Distances (Cosine)
+        distances = 1 - torch.nn.functional.cosine_similarity(x1.unsqueeze(2), x2.unsqueeze(1), dim=-1)
+
+        # 2. Apply Positional Weighting (NTK-inspired)
+        seq_len1, seq_len2 = distances.shape[-2:]
+        pos_matrix1 = torch.arange(seq_len1, device=distances.device).unsqueeze(1)
+        pos_matrix2 = torch.arange(seq_len2, device=distances.device).unsqueeze(0)
+        pos_diff = (pos_matrix1 - pos_matrix2).abs()
+        decay_factor = 0.8  # Control decay rate (hyperparameter)
+        positional_weights = torch.exp(-decay_factor * pos_diff)
+        weighted_distances = distances * positional_weights
+
+        # 3. Apply Dual IB Compression and Regularization (if enabled)
+        if self.compression_dim is not None:
+            x1_compressed = self.compressor(x1)
+            x2_compressed = self.compressor(x2)
+            ib_regularizer = self.lambda_ib * self.mine_estimator(x1_compressed, x2_compressed)
+        else:
+            ib_regularizer = 0.0
+
+        return weighted_distances.sum(dim=-1) + ib_regularizer
+
+
+class TSPKernel(gpytorch.kernels.Kernel):
+    """
+    A kernel based on the TSP energy function for Gaussian Processes.
+
+    Args:
+        energy_function (TSPEnergyFunction): The TSP-inspired energy function.
+        lengthscale (float, optional): Initial lengthscale value for the kernel. Defaults to 1.0.
+    """
+
+    def __init__(self, energy_function: TSPEnergyFunction, lengthscale: float = 1.0):
+        super().__init__()
+        self.energy_function = energy_function
+        self.lengthscale = nn.Parameter(torch.tensor(lengthscale))
+
+    def forward(self, x1, x2, **params):
+        energy = self.energy_function(x1, x2)
+        return torch.exp(-energy / self.lengthscale ** 2)
 
 
 class MCDropout(nn.Module):
@@ -158,7 +345,16 @@ def epistemic_uncertainty(predictions: torch.Tensor) -> torch.Tensor:
 
 
 def aleatoric_uncertainty(variances: torch.Tensor) -> torch.Tensor:
-    return torch.mean(variances, dim=0)
+    """
+    Compute aleatoric uncertainty from model variances.
+
+    Args:
+        variances (torch.Tensor): Variance estimates from the model.
+
+    Returns:
+        torch.Tensor: Aleatoric uncertainty (always non-negative).
+    """
+    return F.softplus(torch.mean(variances, dim=0))
 
 
 def total_uncertainty(epistemic: torch.Tensor, aleatoric: torch.Tensor) -> torch.Tensor:
@@ -255,24 +451,30 @@ def out_of_distribution_detection(in_dist_uncertainties: torch.Tensor,
     return auroc, auprc
 
 
-def uncertainty_guided_sampling(logits: torch.Tensor, uncertainties: torch.Tensor,
-                                temperature: float = 1.0, alpha: float = 1.0) -> torch.Tensor:
+def uncertainty_guided_sampling(
+        logits: torch.Tensor,
+        uncertainties: torch.Tensor,
+        temperature: float = 1.0,
+        alpha: float = 1.0
+) -> torch.Tensor:
     """
     Perform uncertainty-guided sampling for text generation.
 
     Args:
-        logits (torch.Tensor): Logits from the model
-        uncertainties (torch.Tensor): Uncertainties associated with the logits
+        logits (torch.Tensor): Logits from the model of shape (batch_size, vocab_size)
+        uncertainties (torch.Tensor): Uncertainties associated with the logits of shape (batch_size, vocab_size)
         temperature (float): Temperature for softmax
         alpha (float): Weight for uncertainty influence
 
     Returns:
-        torch.Tensor: Sampled token indices
+        torch.Tensor: Sampled token indices of shape (batch_size,)
     """
+    if logits.shape != uncertainties.shape:
+        raise ValueError(f"Shape mismatch: logits {logits.shape} != uncertainties {uncertainties.shape}")
+
     scaled_logits = logits / temperature
     uncertainty_weight = F.softmax(-alpha * uncertainties, dim=-1)
-    weighted_logits = scaled_logits * uncertainty_weight  # Removed expand_as
-
+    weighted_logits = scaled_logits * uncertainty_weight
     return torch.multinomial(F.softmax(weighted_logits, dim=-1), num_samples=1).squeeze(-1)
 
 

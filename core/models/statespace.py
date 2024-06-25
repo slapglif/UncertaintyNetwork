@@ -14,7 +14,7 @@ class MambaConfig:
             d_model: int,
             d_state: int = 16,
             d_conv: int = 4,
-            expand_factor: int = 2,
+            expand_factor: float = 2.0,
             dt_rank: Optional[int] = None,
             dt_min: float = 0.001,
             dt_max: float = 0.1,

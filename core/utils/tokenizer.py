@@ -5,27 +5,34 @@ from transformers import GPT2Tokenizer
 
 
 class Tokenizer:
-    def __init__(self, pretrained_tokenizer: str = "gpt2", vocab_size: int = 1000):
+    def __init__(self, pretrained_tokenizer: str = "gpt2", vocab_size: int = 50257):
         self.tokenizer = GPT2Tokenizer.from_pretrained(pretrained_tokenizer)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.vocab_size = vocab_size
-        self.pad_token_id = 0
-        self.eos_token_id = vocab_size - 2
-        self.bos_token_id = vocab_size - 1
+        self.pad_token_id = self.tokenizer.pad_token_id
+        self.eos_token_id = self.tokenizer.eos_token_id
+        self.bos_token_id = self.tokenizer.bos_token_id
 
-    def encode(self, text: str, **kwargs):
+    def encode(self, text: str, return_tensors: str = None, **kwargs):
         """
         Encode the given text into token IDs.
 
         Args:
             text (str): The text to encode.
+            return_tensors (str, optional): The type of tensors to return. Can be 'pt' for PyTorch tensors.
             **kwargs: Additional arguments to pass to the tokenizer's encode method.
 
         Returns:
-            torch.Tensor: The encoded token IDs as a tensor.
+            torch.Tensor or List[int]: The encoded token IDs as a tensor or list.
         """
         encoded = self.tokenizer.encode(text, add_special_tokens=True, **kwargs)
-        return torch.tensor(encoded, dtype=torch.long)
+
+        # Ensure all token IDs are within the valid range
+        encoded = [min(token_id, self.vocab_size - 1) for token_id in encoded]
+
+        if return_tensors == 'pt':
+            return torch.tensor([encoded], dtype=torch.long)
+        return encoded
 
     def decode(self, token_ids: torch.Tensor, **kwargs):
         """
@@ -52,7 +59,6 @@ class Tokenizer:
             List[str]: The list of decoded texts.
         """
         return self.tokenizer.batch_decode([ids.tolist() for ids in token_ids_batch], **kwargs)
-
 
     @property
     def pad_token(self):

@@ -120,35 +120,18 @@ class KANFeedForward(nn.Module):
 
 
 class CEMA(nn.Module):
-    """
-    Circular Exponential Moving Average (CEMA) layer.
-
-    Args:
-        d_model (int): The dimensionality of the input.
-        alpha (float, optional): The decay factor for the EMA. Defaults to 0.99.
-    """
-
     def __init__(self, d_model, alpha=0.99):
         super().__init__()
         self.d_model = d_model
         self.alpha = alpha
-        self.register_buffer("ema", torch.zeros(d_model))
+        self.register_buffer("ema", torch.zeros(1, d_model))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the CEMA layer.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The output tensor with CEMA applied.
-        """
         batch_size, seq_len, _ = x.shape
         output = []
         for i in range(seq_len):
-            self.ema = self.alpha * self.ema + (1 - self.alpha) * x[:, i, :]
-            output.append(self.ema)
+            self.ema = self.alpha * self.ema + (1 - self.alpha) * x[:, i, :].mean(dim=0, keepdim=True)
+            output.append(self.ema.expand(batch_size, -1))
         return torch.stack(output, dim=1)
 
 
