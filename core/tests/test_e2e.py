@@ -1,15 +1,21 @@
-# core/tests/test_e2e.py
+# .\core\tests\test_e2e.py
 
 import pytest
 import torch
 from transformers import GPT2Tokenizer
 
 from core.models.layers import (
-    MambaLayer,
     TransformerEncoderLayer,
 )
-from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
-from core.models.uncertainty.uncertainty_utils import UncertaintyModule, uncertainty_guided_sampling
+from core.models.uncertainty.uncertain_nn import (
+    UncertainTransformerConfig,
+    UncertainTransformerLMHeadModel,
+)
+from core.models.uncertainty.uncertainty_utils import (
+    UncertaintyModule,
+    uncertainty_guided_sampling,
+)
+from core.models.statespace import Mamba
 
 # Constants
 BATCH_SIZE = 2
@@ -68,7 +74,7 @@ def test_transformer_encoder_layer_with_uncertainty(config):
 
 
 def test_mamba_layer(config):
-    mamba_layer = MambaLayer(config).to(DEVICE)
+    mamba_layer = Mamba().to(DEVICE)
     input_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, EMBED_DIM, device=DEVICE)
     output = mamba_layer(input_tensor)
     assert output.shape == (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
@@ -80,7 +86,7 @@ def test_uncertainty_module(config):
         output_dim=config.vocab_size,
         n_gp_layers=2,
         n_inducing=N_INDUCING,
-        dropout_rate=0.1
+        dropout_rate=0.1,
     ).to(DEVICE)
     input_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, EMBED_DIM, device=DEVICE)
     mean, uncertainty = uncertainty_module(input_tensor)
@@ -109,20 +115,20 @@ def test_model_generation_with_uncertainty(model, config):
 
     # Test uncertainty-guided sampling
     logits = generated_outputs.scores[-1]
-    uncertainties = \
-        model.transformer.uncertainty_module(model.transformer.final_layer_norm(generated_outputs.hidden_states[-1]))[
-            -1]
+    uncertainties = model.transformer.uncertainty_module(
+        model.transformer.final_layer_norm(generated_outputs.hidden_states[-1])
+    )[-1]
     sampled_tokens = uncertainty_guided_sampling(logits, uncertainties)
     assert sampled_tokens.shape == (1,)
 
 
 def test_model_forward_with_uncertainty(model, config):
-    input_ids = torch.randint(0, config.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE)
+    input_ids = torch.randint(
+        0, config.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE
+    )
     attention_mask = torch.ones((BATCH_SIZE, SEQ_LEN), dtype=torch.long, device=DEVICE)
 
     outputs, uncertainty = model(input_ids=input_ids, attention_mask=attention_mask)
 
     assert outputs.logits.shape == (BATCH_SIZE, SEQ_LEN, config.vocab_size)
     assert uncertainty.shape == (BATCH_SIZE, SEQ_LEN, config.vocab_size)
-
-# Add more tests as needed

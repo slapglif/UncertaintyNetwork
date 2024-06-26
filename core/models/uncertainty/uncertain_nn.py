@@ -1,4 +1,5 @@
-# core/models/uncertainty/uncertain_nn.py
+# .\core\models\uncertainty\uncertain_nn.py
+from dataclasses import dataclass
 from typing import Optional, Any, Tuple
 
 import torch
@@ -6,7 +7,7 @@ import torch.nn as nn
 from sentence_transformers import SentenceTransformer
 from transformers import PreTrainedModel
 from transformers import PretrainedConfig
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+from transformers.modeling_outputs import ModelOutput
 
 from core.models.embedding import RotaryPositionEncoding, apply_rotary_pos_emb
 from core.models.layers import TransformerEncoderLayer, CEMA, KANFeedForward
@@ -28,7 +29,7 @@ class UncertainTransformerConfig(PretrainedConfig):
             max_position_embeddings: int = 1024,
             layer_norm_epsilon: float = 1e-5,
             initializer_range: float = 0.02,
-            use_cache: bool = True,
+            use_cache: bool = False,
             pad_token_id: int = 50256,  # Set to match GPT-2's pad token ID
             bos_token_id: int = 50256,  # Set to match GPT-2's BOS token ID
             eos_token_id: int = 50256,  # Set to match GPT-2's EOS token ID
@@ -46,7 +47,9 @@ class UncertainTransformerConfig(PretrainedConfig):
             n_inducing: int = 10,
             use_gelu_approximation: bool = False,
             sliding_window_size: int = 512,
-            device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            device: torch.device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            ),
             **kwargs
     ):
         super().__init__(
@@ -88,45 +91,56 @@ class UncertainNN(nn.Module):
         self.tokenizer = Tokenizer()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.rotary_pos_emb = RotaryPositionEncoding(config.d_model, config.n_heads, config.max_position_embeddings)
-        self.sentence_transformer = SentenceTransformer("tomaarsen/mpnet-base-nli-matryoshka", device='cuda')
-        self.sentence_proj = nn.Linear(768, config.d_model)
+        self.rotary_pos_emb = RotaryPositionEncoding(
+            config.d_model, config.n_heads, config.max_position_embeddings
+        )
+        self.sentence_transformer = SentenceTransformer(
+            "tomaarsen/mpnet-base-nli-matryoshka", device="cuda"
+        )
+        self.sentence_proj = nn.Linear(768, config.d_model).to(config.device)
         self.cema = CEMA(config.d_model)
-        self.layers = nn.ModuleList([
-            nn.ModuleList([
-                Mamba(MambaConfig(
-                    d_model=config.d_model,
-                    d_state=config.d_state,
-                    expand_factor=config.expand_factor,
-                    d_conv=config.d_conv,
-                    dt_min=config.dt_min,
-                    dt_max=config.dt_max,
-                    dt_init=config.dt_init,
-                    dt_scale=config.dt_scale,
-                    dt_init_floor=config.dt_init_floor
-                )),
-                TransformerEncoderLayer(config),
-                KANFeedForward(config),
-                nn.Linear(config.d_model, config.d_model)
-            ])
-            for _ in range(config.n_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                nn.ModuleList(
+                    [
+                        Mamba(
+                            MambaConfig(
+                                d_model=config.d_model,
+                                d_state=config.d_state,
+                                expand_factor=config.expand_factor,
+                                d_conv=config.d_conv,
+                                dt_min=config.dt_min,
+                                dt_max=config.dt_max,
+                                dt_init=config.dt_init,
+                                dt_scale=config.dt_scale,
+                                dt_init_floor=config.dt_init_floor,
+                            )
+                        ),
+                        TransformerEncoderLayer(config),
+                        KANFeedForward(config),
+                        nn.Linear(config.d_model, config.d_model).to(config.device),
+                    ]
+                )
+                for _ in range(config.n_layers)
+            ]
+        )
         self.final_layer_norm = nn.LayerNorm(config.d_model)
         self.uncertainty_module = UncertaintyModule(
             input_dim=config.d_model,
             output_dim=config.vocab_size,
             n_gp_layers=2,
             n_inducing=config.n_inducing,
-            dropout_rate=config.dropout
-        )
-        self.use_cache = config.use_cache  # Add use_cache attribute
+            dropout_rate=config.dropout,
+        ).to(config.device)
+        self.use_cache = False # config.use_cache  # Add use_cache attribute
+        self.dropout = nn.Dropout(config.dropout)  # Add dropout layer
 
     def forward(
-        self,
-        input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        use_cache: bool = False,
-        **kwargs: Any
+            self,
+            input_ids: torch.LongTensor,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            use_cache: bool = False,
+            **kwargs: Any
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, ...]], torch.Tensor]:
         """
         Forward pass of the UncertainNN module.
@@ -149,10 +163,15 @@ class UncertainNN(nn.Module):
         with torch.no_grad():
             sentence_emb = self.sentence_transformer.encode(
                 self.tokenizer.batch_decode(input_ids.cpu(), skip_special_tokens=True),
-                convert_to_tensor=True
+                convert_to_tensor=True,
             )
         sentence_emb = self.sentence_proj(sentence_emb)
-        sentence_emb = sentence_emb.unsqueeze(1).repeat(1, inputs_embeds.size(1), 1).to(inputs_embeds.device)
+        sentence_emb = self.dropout(sentence_emb)  # Apply dropout after projection
+        sentence_emb = (
+            sentence_emb.unsqueeze(1)
+            .repeat(1, inputs_embeds.size(1), 1)
+            .to(inputs_embeds.device)
+        )
 
         inputs_embeds = inputs_embeds + sentence_emb
 
@@ -160,6 +179,7 @@ class UncertainNN(nn.Module):
         inputs_embeds = apply_rotary_pos_emb(inputs_embeds, cos, sin)
 
         inputs_embeds = self.cema(inputs_embeds)
+        inputs_embeds = self.dropout(inputs_embeds)  # Apply dropout after CEMA
         inputs_embeds = TimestepNorm(self.config.d_model)(inputs_embeds)
 
         hidden_states = inputs_embeds
@@ -169,20 +189,39 @@ class UncertainNN(nn.Module):
             mamba_outputs = mamba(hidden_states, use_cache=use_cache)
             hidden_states = mamba_outputs[0]  # Extract hidden states from Mamba output
             if use_cache:
-                cache += mamba_outputs[1:]  # Collect Mamba cache outputs
+                cache += (mamba_outputs[1],)  # Collect Mamba cache outputs
 
             hidden_states = projection(hidden_states)
-            transformer_outputs = transformer(hidden_states, attention_mask=attention_mask, use_cache=use_cache)
-            hidden_states = transformer_outputs[0]  # Extract hidden states from Transformer output
+            transformer_outputs = transformer(
+                hidden_states, attention_mask=attention_mask, use_cache=use_cache
+            )
+            hidden_states = transformer_outputs[
+                0
+            ]  # Extract hidden states from Transformer output
             if use_cache:
                 cache += transformer_outputs[1:]  # Collect Transformer cache outputs
 
             hidden_states = kan_ff(hidden_states)
 
         hidden_states = self.final_layer_norm(hidden_states)
-        _, uncertainty = self.uncertainty_module(hidden_states)  # Extract uncertainty from UncertaintyModule output
+
+        # No need to reshape here: hidden_states is (batch_size, input_dim)
+        _, uncertainty = self.uncertainty_module(
+            hidden_states
+        )  # Extract uncertainty from UncertaintyModule output
 
         return hidden_states, cache, uncertainty
+
+
+@dataclass
+class UncertainCausalLMOutputWithCrossAttentions(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    uncertainty: Optional[torch.FloatTensor] = None
 
 
 class UncertainTransformerLMHeadModel(PreTrainedModel):
@@ -190,14 +229,14 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         super().__init__(config)
         self.config = config
         self.transformer = UncertainNN(config)
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False).to(config.device)
         self.uncertainty_module = UncertaintyModule(
             input_dim=config.d_model,
             output_dim=config.vocab_size,
             n_gp_layers=2,
             n_inducing=config.n_inducing,
-            dropout_rate=config.dropout
-        )
+            dropout_rate=config.dropout,
+        ).to(config.device)
         self.post_init()
 
     def forward(
@@ -207,62 +246,40 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             labels: Optional[torch.LongTensor] = None,
             use_cache: bool = False,
             **kwargs: Any
-    ) -> CausalLMOutputWithCrossAttentions:
-        """
-        Forward pass of the UncertainTransformerLMHeadModel.
-
-        Args:
-            input_ids (torch.LongTensor): Input token IDs of shape (batch_size, seq_len).
-            attention_mask (Optional[torch.FloatTensor]): Attention mask of shape (batch_size, seq_len).
-            labels (Optional[torch.LongTensor]): Labels for language modeling of shape (batch_size, seq_len).
-            use_cache (bool): Whether to use the past key/values attentions for faster decoding. Defaults to False.
-            **kwargs: Additional keyword arguments.
-
-        Returns:
-            CausalLMOutputWithCrossAttentions: Output containing logits, hidden states, and other information.
-        """
+    ) -> UncertainCausalLMOutputWithCrossAttentions:
         transformer_outputs = self.transformer(
-            input_ids,
-            attention_mask=attention_mask,
-            use_cache=use_cache,
-            **kwargs
+            input_ids, attention_mask=attention_mask, use_cache=use_cache, **kwargs
         )
 
-        hidden_states = transformer_outputs[0]  # Extract hidden states from the transformer output
-        cache = transformer_outputs[1]  # Extract cache from the transformer output
+        hidden_states = transformer_outputs[0]
+        cache = transformer_outputs[1]
 
-        # Apply language model head to get logits
         lm_logits = self.lm_head(hidden_states)
 
-        # Project the hidden states to the model dimension (d_model)
-        hidden_states_projected = nn.Linear(hidden_states.size(-1), self.config.d_model)(hidden_states).to(
-            hidden_states.device)
-
-        # Apply uncertainty module
-        mean_logits, uncertainty = self.uncertainty_module(hidden_states_projected)
-
-        # Combine the language model logits with the uncertainty-aware logits
-        combined_logits = lm_logits + mean_logits
+        # Calculate uncertainty
+        _, uncertainty = self.uncertainty_module(hidden_states)
 
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
-            shift_logits = combined_logits[..., :-1, :].contiguous()
+            shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
-        return CausalLMOutputWithCrossAttentions(
+        return UncertainCausalLMOutputWithCrossAttentions(
             loss=loss,
-            logits=combined_logits,
-            past_key_values=cache,  # Correctly include cache
+            logits=lm_logits,
+            past_key_values=cache,
             hidden_states=hidden_states,
             attentions=None,
             cross_attentions=None,
+            uncertainty=uncertainty,
         )
 
-
-    def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, **kwargs):
+    def prepare_inputs_for_generation(
+            self, input_ids, past=None, attention_mask=None, **kwargs
+    ):
         input_shape = input_ids.shape
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_shape)
@@ -292,5 +309,9 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
     def _reorder_cache(self, past, beam_idx):
         reordered_past = ()
         for layer_past in past:
-            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
+            reordered_past += (
+                tuple(
+                    past_state.index_select(0, beam_idx) for past_state in layer_past
+                ),
+            )
         return reordered_past

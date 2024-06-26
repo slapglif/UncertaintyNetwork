@@ -13,7 +13,7 @@ class RSWAFFunction(Function):
         diff_mul = diff.mul(inv_denominator)
         tanh_diff = torch.tanh(diff)
         tanh_diff_deriviative = (
-                -tanh_diff.mul(tanh_diff) + 1
+            -tanh_diff.mul(tanh_diff) + 1
         )  # sech^2(x) = 1 - tanh^2(x)
 
         # Save tensors for backward pass
@@ -48,7 +48,7 @@ class RSWAFFunction(Function):
         # Compute the backward pass for inv_denominator
         if ctx.train_inv_denominator:
             grad_inv_denominator = (
-                    grad_output * diff
+                grad_output * diff
             ).sum()  # (grad_output * diff * tanh_diff_deriviative).sum() #(grad_output* diff).sum()
 
         return (
@@ -62,16 +62,16 @@ class RSWAFFunction(Function):
 
 class ReflectionalSwitchFunction(nn.Module):
     def __init__(
-            self,
-            grid_min: float = -1.2,
-            grid_max: float = 0.2,
-            num_grids: int = 8,
-            exponent: int = 2,
-            inv_denominator: float = 0.5,
-            train_grid: bool = False,
-            train_inv_denominator: bool = False,
-            *args,
-            **kwargs
+        self,
+        grid_min: float = -1.2,
+        grid_max: float = 0.2,
+        num_grids: int = 8,
+        exponent: int = 2,
+        inv_denominator: float = 0.5,
+        train_grid: bool = False,
+        train_inv_denominator: bool = False,
+        *args,
+        **kwargs
     ):
         super().__init__()
         grid = torch.linspace(grid_min, grid_max, num_grids)
@@ -98,7 +98,7 @@ class ReflectionalSwitchFunction(nn.Module):
 
 class SplineLinear(nn.Linear):
     def __init__(
-            self, in_features: int, out_features: int, init_scale: float = 0.1, **kw
+        self, in_features: int, out_features: int, init_scale: float = 0.1, **kw
     ) -> None:
         self.init_scale = init_scale
         super().__init__(in_features, out_features, bias=False, **kw)

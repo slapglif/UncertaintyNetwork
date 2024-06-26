@@ -30,7 +30,7 @@ class Tokenizer:
         # Ensure all token IDs are within the valid range
         encoded = [min(token_id, self.vocab_size - 1) for token_id in encoded]
 
-        if return_tensors == 'pt':
+        if return_tensors == "pt":
             return torch.tensor([encoded], dtype=torch.long)
         return encoded
 
@@ -58,7 +58,9 @@ class Tokenizer:
         Returns:
             List[str]: The list of decoded texts.
         """
-        return self.tokenizer.batch_decode([ids.tolist() for ids in token_ids_batch], **kwargs)
+        return self.tokenizer.batch_decode(
+            [ids.tolist() for ids in token_ids_batch], **kwargs
+        )
 
     @property
     def pad_token(self):

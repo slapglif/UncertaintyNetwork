@@ -1,9 +1,12 @@
-# core/tests/test_encoder.py
+# .\core\tests\test_encoder.py
 
 import pytest
 import torch
 from core.models.embedding import RotaryPositionEncoding, SentenceEncoder, SentenceGP
-from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
+from core.models.uncertainty.uncertain_nn import (
+    UncertainTransformerConfig,
+    UncertainTransformerLMHeadModel,
+)
 from core.utils.tokenizer import Tokenizer
 from core.models.uncertainty.uncertainty_utils import UncertaintyModule
 
@@ -64,19 +67,21 @@ def test_sentence_encoder_shape(tokenizer, config):
         hidden_dim=EMBED_DIM,
         output_dim=EMBED_DIM,
         kan_config={
-            'layers_hidden': [1024, 2048],
-            'grid_min': -1.2,
-            'grid_max': 0.2,
-            'num_grids': 8,
-            'exponent': 2,
-            'inv_denominator': 0.5,
-            'train_grid': False,
-            'train_inv_denominator': False,
-            'spline_weight_init_scale': 1.0,
-        }
+            "layers_hidden": [1024, 2048],
+            "grid_min": -1.2,
+            "grid_max": 0.2,
+            "num_grids": 8,
+            "exponent": 2,
+            "inv_denominator": 0.5,
+            "train_grid": False,
+            "train_inv_denominator": False,
+            "spline_weight_init_scale": 1.0,
+        },
     ).to(DEVICE)
 
-    input_tensor = torch.randint(0, config.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE)
+    input_tensor = torch.randint(
+        0, config.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE
+    )
     output = sentence_encoder(input_tensor)
     assert output.shape == (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
 
@@ -100,7 +105,7 @@ def test_uncertainty_module(config):
         output_dim=config.vocab_size,
         n_gp_layers=2,
         n_inducing=N_INDUCING,
-        dropout_rate=0.1
+        dropout_rate=0.1,
     ).to(DEVICE)
 
     input_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, EMBED_DIM, device=DEVICE)
@@ -112,11 +117,12 @@ def test_uncertainty_module(config):
 
 def test_model_with_uncertainty(config):
     model = UncertainTransformerLMHeadModel(config).to(DEVICE)
-    input_ids = torch.randint(0, config.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE)
+    input_ids = torch.randint(
+        0, config.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE
+    )
     attention_mask = torch.ones((BATCH_SIZE, SEQ_LEN), dtype=torch.long, device=DEVICE)
 
     outputs, uncertainty = model(input_ids=input_ids, attention_mask=attention_mask)
 
     assert outputs.logits.shape == (BATCH_SIZE, SEQ_LEN, config.vocab_size)
     assert uncertainty.shape == (BATCH_SIZE, SEQ_LEN, config.vocab_size)
-

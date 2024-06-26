@@ -2,10 +2,11 @@
 
 import os
 import sys
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 import pytorch_lightning as pl
 import torch
+from datasets import load_dataset, Dataset
 from loguru import logger
 from pytorch_lightning.callbacks import (
     ModelCheckpoint,
@@ -13,8 +14,8 @@ from pytorch_lightning.callbacks import (
     LearningRateMonitor,
 )
 from pytorch_lightning.loggers import TensorBoardLogger
+from torch.utils.data import DataLoader
 
-from core.data.datamodule import SlimPajamaDataModule
 from core.models.uncertainty.uncertain_nn import (
     UncertainTransformerLMHeadModel,
     UncertainTransformerConfig,
@@ -158,28 +159,196 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         }
 
 
+class TinyShakespeareDataModule(pl.LightningDataModule):
+    def __init__(
+            self,
+            tokenizer: Tokenizer,
+            max_length: int = 1024,
+            batch_size: int = 32,
+            num_workers: int = 4,
+    ):
+        """
+        Initialize the TinyShakespeareDataModule.
+
+        Args:
+            tokenizer (Tokenizer): The tokenizer to use for processing text.
+            max_length (int): Maximum sequence length for tokenization.
+            batch_size (int): Batch size for DataLoaders.
+            num_workers (int): Number of workers for DataLoaders.
+        """
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+        self.train_dataset: Optional[Dataset] = None
+        self.val_dataset: Optional[Dataset] = None
+        self.test_dataset: Optional[Dataset] = None
+
+    def setup(self, stage: Optional[str] = None):
+        """
+        Set up the datasets for each stage (fit, validate, test).
+
+        Args:
+            stage (Optional[str]): The stage to set up. Can be 'fit', 'validate', or 'test'.
+        """
+        if stage == "fit" or stage is None:
+            self.train_dataset = TinyShakespeareDataset(
+                tokenizer=self.tokenizer,
+                max_length=self.max_length,
+            )
+            self.val_dataset = TinyShakespeareDataset(
+                tokenizer=self.tokenizer,
+                max_length=self.max_length,
+            )
+
+        if stage == "test" or stage is None:
+            self.test_dataset = TinyShakespeareDataset(
+                tokenizer=self.tokenizer,
+                max_length=self.max_length,
+            )
+
+    def train_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            shuffle=True,
+            collate_fn=self._collate_fn,
+            persistent_workers=True,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            collate_fn=self._collate_fn,
+            persistent_workers=True,
+        )
+
+    def test_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            collate_fn=self._collate_fn,
+            persistent_workers=True,
+        )
+
+    @staticmethod
+    def _collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        input_ids = [item["input_ids"] for item in batch]
+        attention_mask = [item["attention_mask"] for item in batch]
+        labels = [item["labels"] for item in batch]
+
+        max_len = max(ids.size(0) for ids in input_ids)
+
+        input_ids_padded = torch.stack(
+            [
+                torch.cat(
+                    [
+                        ids,
+                        torch.full(
+                            (max_len - ids.size(0),),
+                            50256,
+                            dtype=ids.dtype,
+                            device=ids.device,
+                        ),
+                    ]
+                )
+                for ids in input_ids
+            ]
+        )
+        attention_mask_padded = torch.stack(
+            [
+                torch.cat(
+                    [
+                        mask,
+                        torch.zeros(
+                            max_len - mask.size(0), dtype=mask.dtype, device=mask.device
+                        ),
+                    ]
+                )
+                for mask in attention_mask
+            ]
+        )
+        labels_padded = torch.stack(
+            [
+                torch.cat(
+                    [
+                        label,
+                        torch.full(
+                            (max_len - label.size(0),),
+                            -100,
+                            dtype=label.dtype,
+                            device=label.device,
+                        ),
+                    ]
+                )
+                for label in labels
+            ]
+        )
+
+        return {
+            "input_ids": input_ids_padded,
+            "attention_mask": attention_mask_padded,
+            "labels": labels_padded,
+        }
+
+
+class TinyShakespeareDataset(torch.utils.data.Dataset):
+    def __init__(self, tokenizer: Tokenizer, max_length: int = 1024):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.dataset = load_dataset("tiny_shakespeare", split="train")
+        self.text = self.dataset["text"]
+
+    def __len__(self):
+        return len(self.text)
+
+    def __getitem__(self, idx):
+        text = self.text[idx]
+        tokenized = self.tokenizer.tokenizer(
+            text,
+            truncation=True,
+            max_length=self.max_length,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        return {
+            "input_ids": tokenized["input_ids"].squeeze(0),
+            "attention_mask": tokenized["attention_mask"].squeeze(0),
+            "labels": tokenized["input_ids"].squeeze(0).clone(),
+        }
+
+
 def main():
     logger.info("Starting main function...")
 
     hparams = {
         "vocab_size": 50257,
-        "d_model": 256,
+        "d_model": 512,
         "n_heads": 8,
-        "d_ff": 256,
-        "n_layers": 2,
+        "d_ff": 2048,
+        "n_layers": 6,
         "dropout": 0.1,
         "learning_rate": 3e-4,
         "weight_decay": 0.01,
         "max_length": 1024,
-        "batch_size": 8,
-        "accumulate_grad_batches": 32,
+        "batch_size": 32,
+        "accumulate_grad_batches": 4,
         "max_epochs": 10,
         "pad_token_id": 50256,
         "use_mamba": True,
-        "d_state": 8,
-        "d_conv": 2,
-        "expand_factor": 1.1,
-        "dt_rank": 8,
+        "d_state": 16,
+        "d_conv": 4,
+        "expand_factor": 2.0,
+        "dt_rank": 16,
         "dt_min": 0.001,
         "dt_max": 0.1,
         "sliding_window_size": 512,
@@ -193,11 +362,10 @@ def main():
     model.tokenizer = tokenizer
 
     logger.info("Initializing DataModule...")
-    datamodule = SlimPajamaDataModule(
+    datamodule = TinyShakespeareDataModule(
         tokenizer=tokenizer,
         max_length=hparams["max_length"],
         batch_size=hparams["batch_size"],
-        streaming=True,
     )
 
     logger.info("Setting up callbacks...")

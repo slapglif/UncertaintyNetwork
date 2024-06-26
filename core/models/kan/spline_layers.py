@@ -5,24 +5,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
+from torch import Tensor
 
 from core.models.kan.spline_basis import ReflectionalSwitchFunction, SplineLinear
 
 
 class SplineNetLayer(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, num_grids: int = 8, *_, **kwargs):
+    def __init__(self, input_dim: int, output_dim: int, num_grids: int = 8):
         super().__init__()
-        # LayerNorm now uses the correct normalized_shape
         self.layernorm = nn.LayerNorm(input_dim)
-        self.rbf = ReflectionalSwitchFunction(num_grids=num_grids, **kwargs)
+        self.rbf = ReflectionalSwitchFunction(num_grids=num_grids)
         self.spline_linear = SplineLinear(input_dim * num_grids, output_dim)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_grids = num_grids
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor) -> Tensor:
+        original_shape = x.shape
+
+        # Apply layer norm
         x = self.layernorm(x)
+
+        # Apply RBF
         spline_basis = self.rbf(x)
-        # Reshape to (batch_size, seq_len, input_dim * num_grids) instead of flattening
-        spline_basis = spline_basis.view(x.size(0), x.size(1), -1)
-        return self.spline_linear(spline_basis)
+
+        # Flatten the output of RBF (only the last dimension)
+        spline_basis_flat = spline_basis.view(
+            x.shape[0], -1, self.input_dim * self.num_grids
+        )
+
+        # Apply linear layer
+        output = self.spline_linear(spline_basis_flat)
+
+        # Reshape output to match input batch size and sequence length, but with output_dim as last dimension
+        return output.view(*original_shape[:-1], self.output_dim)
 
 
 class SplineNet(nn.Module):
@@ -43,18 +59,18 @@ class SplineNet(nn.Module):
     """
 
     def __init__(
-            self,
-            layers_hidden: List[int],
-            grid_min: float = -1.2,
-            grid_max: float = 0.2,
-            num_grids: int = 8,
-            exponent: int = 2,
-            inv_denominator: float = 0.5,
-            train_grid: bool = False,
-            train_inv_denominator: bool = False,
-            # use_base_update: bool = True,
-            base_activation=None,
-            spline_weight_init_scale: float = 1.0,
+        self,
+        layers_hidden: List[int],
+        grid_min: float = -1.2,
+        grid_max: float = 0.2,
+        num_grids: int = 8,
+        exponent: int = 2,
+        inv_denominator: float = 0.5,
+        train_grid: bool = False,
+        train_inv_denominator: bool = False,
+        # use_base_update: bool = True,
+        base_activation=None,
+        spline_weight_init_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
@@ -262,42 +278,46 @@ class SelfAttention(nn.Module):
 
 class SplineNetConv(nn.Module):
     def __init__(
-            self,
-            layers_hidden: List[int],
-            input_channels: int,
-            hidden_dim: int,
-            grid_min: float = -1.2,
-            grid_max: float = 0.2,
-            num_grids: int = 8,
-            exponent: int = 2,
-            inv_denominator: float = 0.5,
-            train_grid: bool = False,
-            train_inv_denominator: bool = False,
-            spline_weight_init_scale: float = 1.0,
-            uncertainty_output: bool = False,
+        self,
+        layers_hidden: List[int],
+        input_channels: int,
+        hidden_dim: int,
+        grid_min: float = -1.2,
+        grid_max: float = 0.2,
+        num_grids: int = 8,
+        exponent: int = 2,
+        inv_denominator: float = 0.5,
+        train_grid: bool = False,
+        train_inv_denominator: bool = False,
+        spline_weight_init_scale: float = 1.0,
+        uncertainty_output: bool = False,
     ):
         super(SplineNetConv, self).__init__()
 
         self.feature_extractor = Classification(input_channels, hidden_dim)
         self.uncertainty_output = uncertainty_output
 
-        self.faster_kan_layers = nn.ModuleList([
-            SplineNetLayer(
-                in_dim,
-                out_dim,
-                grid_min=grid_min,
-                grid_max=grid_max,
-                num_grids=num_grids,
-                exponent=exponent,
-                inv_denominator=inv_denominator,
-                train_grid=train_grid,
-                train_inv_denominator=train_inv_denominator,
-                spline_weight_init_scale=spline_weight_init_scale,
-            )
-            for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])
-        ])
+        self.faster_kan_layers = nn.ModuleList(
+            [
+                SplineNetLayer(
+                    in_dim,
+                    out_dim,
+                    grid_min=grid_min,
+                    grid_max=grid_max,
+                    num_grids=num_grids,
+                    exponent=exponent,
+                    inv_denominator=inv_denominator,
+                    train_grid=train_grid,
+                    train_inv_denominator=train_inv_denominator,
+                    spline_weight_init_scale=spline_weight_init_scale,
+                )
+                for in_dim, out_dim in zip(layers_hidden[:-1], layers_hidden[1:])
+            ]
+        )
 
-    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         x = self.feature_extractor(x)
 
         uncertainties = []

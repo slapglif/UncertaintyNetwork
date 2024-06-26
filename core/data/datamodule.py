@@ -85,8 +85,7 @@ class SlimPajamaDataModule(pl.LightningDataModule):
             pin_memory=True,
             shuffle=not self.streaming,
             collate_fn=self._collate_fn,
-            persistent_workers=True
-
+            persistent_workers=True,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -96,7 +95,7 @@ class SlimPajamaDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             collate_fn=self._collate_fn,
-            persistent_workers=True
+            persistent_workers=True,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -106,7 +105,7 @@ class SlimPajamaDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             collate_fn=self._collate_fn,
-            persistent_workers=True
+            persistent_workers=True,
         )
 
     @staticmethod

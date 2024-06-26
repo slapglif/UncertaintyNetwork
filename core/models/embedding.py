@@ -15,7 +15,9 @@ class RotaryPositionEncoding(nn.Module):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim // n_heads, 2).float() / (dim // n_heads)))
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim // n_heads, 2).float() / (dim // n_heads))
+        )
         self.register_buffer("inv_freq", inv_freq)
 
         self.max_seq_len_cached = max_position_embeddings
@@ -34,11 +36,15 @@ class RotaryPositionEncoding(nn.Module):
         cos = self.cos_cached[:, :, :seq_len, :]
         sin = self.sin_cached[:, :, :seq_len, :]
 
-        return cos.repeat(x.shape[0], self.n_heads, 1, 1), sin.repeat(x.shape[0], self.n_heads, 1, 1)
+        return cos.repeat(x.shape[0], self.n_heads, 1, 1), sin.repeat(
+            x.shape[0], self.n_heads, 1, 1
+        )
 
     def _set_cos_sin_cache(self, seq_len):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        t = torch.arange(
+            seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype
+        )
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
@@ -57,31 +63,31 @@ def apply_rotary_pos_emb(x, cos, sin):
         torch.Tensor: The input tensor with rotary embeddings applied.
     """
     # Reshape for head-wise operation
-    x = rearrange(x, 'b l (h d) -> b h l d', h=cos.shape[1])
+    x = rearrange(x, "b l (h d) -> b h l d", h=cos.shape[1])
 
     # Apply rotary embeddings
     x = (x * cos) + (rotate_half(x) * sin)
 
     # Reshape back to original shape
-    x = rearrange(x, 'b h l d -> b l (h d)')
+    x = rearrange(x, "b h l d -> b l (h d)")
     return x
 
 
 def rotate_half(x):
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
 kan_config = {
-    'layers_hidden': [1024, 2048],
-    'grid_min': -1.2,
-    'grid_max': 0.2,
-    'num_grids': 8,
-    'exponent': 2,
-    'inv_denominator': 0.5,
-    'train_grid': False,
-    'train_inv_denominator': False,
-    'spline_weight_init_scale': 1.0,
+    "layers_hidden": [1024, 2048],
+    "grid_min": -1.2,
+    "grid_max": 0.2,
+    "num_grids": 8,
+    "exponent": 2,
+    "inv_denominator": 0.5,
+    "train_grid": False,
+    "train_inv_denominator": False,
+    "spline_weight_init_scale": 1.0,
 }
 
 
@@ -130,7 +136,9 @@ kan_config = {
 
 
 class SentenceGP(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, n_inducing: int, embedding_dim: int):
+    def __init__(
+        self, input_dim: int, output_dim: int, n_inducing: int, embedding_dim: int
+    ):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -151,15 +159,19 @@ class SentenceGP(nn.Module):
         dist = torch.cdist(x1, x2, p=2).pow(2)
         return torch.exp(-0.5 * dist / torch.exp(self.log_lengthscale).pow(2))
 
-    def forward(self, x: torch.Tensor, num_sentences: Optional[int] = None) -> tuple[Tensor, Tensor]:
+    def forward(
+        self, x: torch.Tensor, num_sentences: Optional[int] = None
+    ) -> tuple[Tensor, Tensor]:
         batch_size, num_sentences_input, input_dim = x.shape
 
         if num_sentences is not None and num_sentences_input != num_sentences:
             raise ValueError(
-                f"Input tensor has {num_sentences_input} sentences, but {num_sentences} sentences were expected.")
+                f"Input tensor has {num_sentences_input} sentences, but {num_sentences} sentences were expected."
+            )
         if input_dim != self.input_dim:
             raise ValueError(
-                f"Input tensor has {input_dim} input dimensions, but {self.input_dim} dimensions were expected.")
+                f"Input tensor has {input_dim} input dimensions, but {self.input_dim} dimensions were expected."
+            )
 
         if num_sentences is None:
             num_sentences = num_sentences_input
@@ -168,7 +180,10 @@ class SentenceGP(nn.Module):
         K_xi = self.rbf_kernel(x, self.inducing_points)
         K_ii = self.rbf_kernel(self.inducing_points, self.inducing_points)
 
-        K_ii_inv = torch.inverse(K_ii + torch.exp(self.log_variance) * torch.eye(self.n_inducing, device=x.device))
+        K_ii_inv = torch.inverse(
+            K_ii
+            + torch.exp(self.log_variance) * torch.eye(self.n_inducing, device=x.device)
+        )
         mean = K_xi @ K_ii_inv @ self.output_proj.weight.T
         var = K_xx - K_xi @ K_ii_inv @ K_xi.transpose(-1, -2)
 

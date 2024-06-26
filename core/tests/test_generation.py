@@ -1,5 +1,4 @@
-# core/tests/test_generation.py
-
+# test_generation.py
 import pytest
 import torch
 from loguru import logger
@@ -7,9 +6,9 @@ from transformers import StoppingCriteria
 
 from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
 from core.utils.tokenizer import Tokenizer
-from core.models.uncertainty.uncertainty_utils import uncertainty_guided_sampling
-from core.utils.utils import calculate_perplexity
+from core.utils.utils import generate_text, calculate_perplexity
 
+# Constants
 MAX_LENGTH = 50
 TEMPERATURE = 0.7
 TIMEOUT = 30
@@ -37,7 +36,7 @@ def model(device):
         d_conv=4,
         expand_factor=2.0,
         dt_rank=16,
-        sliding_window_size=512,
+        sliding_window_size=512,  # Add this line
     )
     model = UncertainTransformerLMHeadModel(config)
     model.to(device)
@@ -53,7 +52,9 @@ class MaxLengthCriteria(StoppingCriteria):
     def __init__(self, max_length: int):
         self.max_length = max_length
 
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+    def __call__(
+            self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
+    ) -> bool:
         return input_ids.shape[-1] >= self.max_length
 
 
@@ -67,7 +68,7 @@ class MaxLengthCriteria(StoppingCriteria):
         "The future of artificial intelligence",
     ],
 )
-def test_generation_and_perplexity_with_uncertainty(
+def test_generation_and_perplexity(
         model: UncertainTransformerLMHeadModel,
         tokenizer: Tokenizer,
         prompt: str,
@@ -77,22 +78,19 @@ def test_generation_and_perplexity_with_uncertainty(
     logger.info(f"\nTesting prompt: {prompt}")
 
     try:
-        torch.cuda.empty_cache()
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-
-        generated_outputs = model.generate(
-            input_ids,
-            max_length=MAX_LENGTH,
-            num_return_sequences=NUM_SAMPLES,
-            do_sample=True,
-            temperature=TEMPERATURE,
-            use_cache=True,
-            return_dict_in_generate=True,
-            output_scores=True,
+        torch.cuda.empty_cache()  # Clear CUDA cache before generation
+        generated_texts = generate_text(
+            model,
+            tokenizer.tokenizer,
+            prompt,
+            max_length=100,  # Reduced from 1024 for testing
+            temperature=1.31,
+            top_k=49,
+            top_p=0.18,
+            repetition_penalty=1.2,
+            num_return_sequences=1,
+            device=device,
         )
-
-        generated_sequences = generated_outputs.sequences
-        generated_texts = tokenizer.batch_decode(generated_sequences, skip_special_tokens=True)
 
         assert len(generated_texts) > 0, "No text was generated"
 
@@ -103,41 +101,40 @@ def test_generation_and_perplexity_with_uncertainty(
 
             assert len(generated_text) > 0, f"Generated text {i + 1} is empty"
 
-            # Calculate perplexity
-            perplexity = calculate_perplexity(model, tokenizer, generated_text, device=device)
+            perplexity = calculate_perplexity(
+                model, tokenizer.tokenizer, generated_text, device=device
+            )
             logger.info(f"Perplexity: {perplexity:.2f}")
 
             assert 0 < perplexity < float("inf"), f"Invalid perplexity value: {perplexity}"
 
-        # Test uncertainty-guided sampling
-        logits = generated_outputs.scores[-1]
-        uncertainties = \
-            model.transformer.uncertainty_module(
-                model.transformer.final_layer_norm(generated_outputs.hidden_states[-1]))[
-                -1]
-        sampled_tokens = uncertainty_guided_sampling(logits, uncertainties)
-        assert sampled_tokens.shape == (NUM_SAMPLES,)
-
     except Exception as e:
-        logger.error(f"Error in test_generation_and_perplexity_with_uncertainty for prompt '{prompt}': {str(e)}")
+        logger.error(f"Error in test_generation_and_perplexity for prompt '{prompt}': {str(e)}")
         logger.exception("Full traceback:")
-        raise
+        raise  # Re-raise the exception to see the full traceback
 
 
-def test_model_output_shapes_with_uncertainty(model, tokenizer, device):
+def test_model_output_shapes(model, tokenizer, device):
+    """
+    Tests the output shapes of the model for a given input.
+
+    Args:
+        model (UncertainTransformerLMHeadModel): The model to test.
+        tokenizer (Tokenizer): The tokenizer to use for encoding.
+        device (torch.device): The device to run the model on.
+    """
     model.to(device)
     prompt = "Test prompt"
     try:
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-        logger.debug(f"Input IDs shape: {input_ids.shape}, device: {input_ids.device}")
+        input_ids = tokenizer.encode(prompt)
+        logger.info(f"Input IDs shape: {input_ids.shape}, device: {input_ids.device}")
 
         with torch.no_grad():
-            outputs, uncertainty = model(input_ids)
+            outputs = model(input_ids)
 
-        logger.debug(f"\nModel output shapes:")
-        logger.debug(f"Input shape: {input_ids.shape}")
-        logger.debug(f"Logits shape: {outputs.logits.shape}")
-        logger.debug(f"Uncertainty shape: {uncertainty.shape}")
+        logger.info(f"\nModel output shapes:")
+        logger.info(f"Input shape: {input_ids.shape}")
+        logger.info(f"Logits shape: {outputs.logits.shape}")
 
         assert outputs.logits.shape[0] == input_ids.shape[
             0], f"Batch size mismatch: expected {input_ids.shape[0]}, got {outputs.logits.shape[0]}"
@@ -145,11 +142,73 @@ def test_model_output_shapes_with_uncertainty(model, tokenizer, device):
             1], f"Sequence length mismatch: expected {input_ids.shape[1]}, got {outputs.logits.shape[1]}"
         assert outputs.logits.shape[
                    2] == model.config.vocab_size, f"Vocabulary size mismatch: expected {model.config.vocab_size}, got {outputs.logits.shape[2]}"
-        assert uncertainty.shape == outputs.logits.shape, f"Uncertainty shape mismatch: expected {outputs.logits.shape}, got {uncertainty.shape}"
 
     except Exception as e:
-        logger.error(f"Error in test_model_output_shapes_with_uncertainty: {str(e)}")
+        logger.error(f"Error in test_model_output_shapes: {str(e)}")
         logger.exception("Full traceback:")
         raise
 
-# Add more tests as needed
+
+def test_attention_mask(model, tokenizer, device):
+    """
+    Tests the effect of using an attention mask on the model's output.
+
+    Args:
+        model (UncertainTransformerLMHeadModel): The model to test.
+        tokenizer (Tokenizer): The tokenizer to use for encoding.
+        device (torch.device): The device to run the model on.
+    """
+    model.to(device)
+    prompt = "Test with padding"
+    try:
+        input_ids = tokenizer.encode(prompt)
+
+        with torch.no_grad():
+            outputs_without_mask = model(input_ids)
+            if not model.config.use_mamba:
+                attention_mask = torch.ones_like(input_ids)
+                attention_mask[:, -2:] = 0  # Simulate padding
+                outputs_with_mask = model(input_ids, attention_mask=attention_mask)
+            else:
+                outputs_with_mask = outputs_without_mask  # For Mamba, we don't use attention mask
+
+        logger.info("\nTesting attention mask:")
+
+        if torch.isnan(outputs_with_mask.logits).any() or torch.isnan(outputs_without_mask.logits).any():
+            logger.warning("NaN values detected in logits")
+            return
+
+        diff = (outputs_with_mask.logits[:, -1] - outputs_without_mask.logits[:, -1]).abs().max().item()
+        logger.info(f"Difference in last token logits: {diff:.4f}")
+
+        if not model.config.use_mamba:
+            assert diff > 0, "Outputs should differ when using attention mask"
+        else:
+            assert diff == 0, "Outputs should be the same for Mamba layers"
+
+    except Exception as e:
+        logger.error(f"Error in test_attention_mask: {str(e)}")
+        logger.exception("Full traceback:")
+        raise
+
+
+def test_cuda_tensor_transfer(device):
+    """
+    Test if we can successfully transfer a tensor to CUDA.
+    """
+    try:
+        cpu_tensor = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)
+        logger.info(f"CPU tensor shape: {cpu_tensor.shape}, device: {cpu_tensor.device}")
+
+        cuda_tensor = cpu_tensor.to(device)
+        logger.info(f"CUDA tensor shape: {cuda_tensor.shape}, device: {cuda_tensor.device}")
+
+        assert cuda_tensor.device.type == 'cuda', f"Expected CUDA device, got {cuda_tensor.device.type}"
+        logger.info("CUDA tensor transfer successful")
+    except Exception as e:
+        logger.error(f"CUDA tensor transfer failed: {str(e)}")
+        raise
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])

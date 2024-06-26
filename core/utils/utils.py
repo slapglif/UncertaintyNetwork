@@ -1,11 +1,12 @@
-# core/utils/utils.py
+# .\core\utils\utils.py
+
+import inspect
+import random
+from typing import Tuple, List, Union, Optional
 
 import torch
 import torch.nn as nn
-import inspect
-from typing import Tuple, List, Union
-
-import torch
+import torch.nn.functional as F
 from loguru import logger
 from torch import Tensor
 from transformers import PreTrainedModel, GenerationConfig
@@ -45,12 +46,13 @@ def generate_text(
         tokenizer: "Tokenizer",
         prompt: str,
         max_length: int = 100,
-        temperature: float = 0.7,
-        top_k: int = 50,
-        top_p: float = 0.95,
-        repetition_penalty: float = 1.2,
+        temperature: float = 1.13,
+        top_k: int = 49,
+        top_p: float = 0.18,
+        repetition_penalty: float = 1.8,
         num_return_sequences: int = 1,
         device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        generation_config: Optional[GenerationConfig] = None,
 ) -> List[str]:
     """
     Generates text using the specified model and tokenizer with given parameters.
@@ -66,6 +68,8 @@ def generate_text(
         repetition_penalty (float, optional): The repetition penalty (default: 1.2).
         num_return_sequences (int, optional): The number of sequences to generate for each prompt (default: 1).
         device (torch.device, optional): The device to run the model on (default: CUDA if available, else CPU).
+        generation_config (GenerationConfig, optional): A GenerationConfig object to override default generation parameters.
+            Defaults to None.
 
     Returns:
         List[str]: A list of generated texts.
@@ -80,20 +84,27 @@ def generate_text(
 
         attention_mask = torch.ones_like(input_ids)
 
-        generation_config = GenerationConfig(
-            max_length=max_length,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            num_return_sequences=num_return_sequences,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            do_sample=True,
+        if generation_config is None:
+            generation_config = GenerationConfig(
+                use_cache=False,
+                max_length=max_length,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                num_return_sequences=num_return_sequences,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                do_sample=True,
+            )
+
+        logger.info(
+            f"Starting text generation with generation config: {generation_config}"
         )
 
-        logger.info(f"Starting text generation with generation config: {generation_config}")
-
+        # Set the random seed for each generation
+        random.seed()
+        torch.manual_seed(random.randint(1, 10000))
         with torch.no_grad():
             outputs = model.generate(
                 input_ids=input_ids,
@@ -101,20 +112,16 @@ def generate_text(
                 generation_config=generation_config,
             )
 
-        logger.info("Text generation completed")
 
+        logger.info("Text generation completed")
+        torch.cuda.empty_cache()
         return tokenizer.batch_decode(outputs, skip_special_tokens=True)
     except Exception as e:
         logger.exception(f"Error during text generation: {str(e)}")
         return []
 
 
-def calculate_perplexity(
-        model: PreTrainedModel,
-        tokenizer: Tokenizer,
-        text: str,
-        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-) -> float:
+def calculate_perplexity(model: PreTrainedModel, tokenizer: Tokenizer, text: str, device: torch.device) -> float:
     """
     Calculate the perplexity of the given text using the specified model and tokenizer.
 
@@ -122,7 +129,7 @@ def calculate_perplexity(
         model (PreTrainedModel): The pre-trained language model.
         tokenizer (Tokenizer): The tokenizer for encoding the text.
         text (str): The input text to calculate perplexity for.
-        device (torch.device): The device to run the model on (default: CUDA if available, else CPU).
+        device (torch.device): The device to run the model on.
 
     Returns:
         float: The perplexity of the text.
@@ -130,8 +137,8 @@ def calculate_perplexity(
     model.to(device)
     model.eval()
 
-    tokens = tokenizer.encode(text)
-    input_ids = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)  # Convert to tensor
+    ids = tokenizer.encode(text)
+    input_ids = torch.tensor([ids], dtype=torch.long).to(device)
     num_tokens = input_ids.shape[1]
 
     with torch.no_grad():
@@ -143,13 +150,18 @@ def calculate_perplexity(
 
 def check_shapes(tensors, expected_shapes, names):
     for tensor, expected_shape, name in zip(tensors, expected_shapes, names):
-        assert tensor.shape == expected_shape, f"{name} shape mismatch: expected {expected_shape}, got {tensor.shape}"
+        assert (
+                tensor.shape == expected_shape
+        ), f"{name} shape mismatch: expected {expected_shape}, got {tensor.shape}"
 
 
-def einsum_safe(equation: str, *operands: torch.Tensor,
-                check_shapes: bool = True,
-                reshape_operands: bool = True,
-                verbose: bool = False) -> torch.Tensor:
+def einsum_safe(
+        equation: str,
+        *operands: torch.Tensor,
+        check_shapes: bool = True,
+        reshape_operands: bool = True,
+        verbose: bool = False,
+) -> torch.Tensor:
     """
     A safe wrapper for torch.einsum that automatically checks for shape compatibility and attempts to
     reshape operands to resolve mismatches, even those that occur before the einsum operation.
@@ -190,9 +202,13 @@ def einsum_safe(equation: str, *operands: torch.Tensor,
                 raise
 
             # Attempt to reshape operands to resolve the mismatch
-            operands = _reshape_operands_for_einsum(equation, *operands, verbose=verbose)
+            operands = _reshape_operands_for_einsum(
+                equation, *operands, verbose=verbose
+            )
             if operands is None:
-                raise ValueError("Shape mismatch cannot be resolved after reshaping.") from e
+                raise ValueError(
+                    "Shape mismatch cannot be resolved after reshaping."
+                ) from e
             if verbose:
                 logger.info("Reshaped operands successfully.")
             return torch.einsum(equation, *operands)
@@ -200,8 +216,9 @@ def einsum_safe(equation: str, *operands: torch.Tensor,
     return torch.einsum(equation, *operands)
 
 
-def _reshape_operands_for_einsum(equation: str, *operands: torch.Tensor, verbose: bool = False) -> Union[
-    Tuple[torch.Tensor], None]:
+def _reshape_operands_for_einsum(
+        equation: str, *operands: torch.Tensor, verbose: bool = False
+) -> Union[Tuple[torch.Tensor], None]:
     """
     Attempts to reshape operands to resolve shape mismatches in einsum.
 
@@ -215,7 +232,7 @@ def _reshape_operands_for_einsum(equation: str, *operands: torch.Tensor, verbose
     """
 
     # Extract operand dimensions from the einsum equation
-    operand_dims = [list(dim) for dim in equation.split(',')]
+    operand_dims = [list(dim) for dim in equation.split(",")]
     if verbose:
         logger.debug(f"Operand dimensions: {operand_dims}")
 
@@ -253,7 +270,9 @@ def _reshape_operands_for_einsum(equation: str, *operands: torch.Tensor, verbose
     for i, operand in enumerate(operands):
         if callable(operand):
             if verbose:
-                logger.debug(f"Operand {i} is a function call. Attempting to resolve shape mismatch.")
+                logger.debug(
+                    f"Operand {i} is a function call. Attempting to resolve shape mismatch."
+                )
             try:
                 # Get the function's signature
                 signature = inspect.signature(operand)
@@ -266,10 +285,14 @@ def _reshape_operands_for_einsum(equation: str, *operands: torch.Tensor, verbose
                 operands[i] = result
                 operands = tuple(operands)
                 if verbose:
-                    logger.debug(f"Function call resolved. Operand {i} shape: {result.shape}")
+                    logger.debug(
+                        f"Function call resolved. Operand {i} shape: {result.shape}"
+                    )
             except Exception as e:
                 if verbose:
-                    logger.warning(f"Function call resolution failed for operand {i}: {e}")
+                    logger.warning(
+                        f"Function call resolution failed for operand {i}: {e}"
+                    )
                 return None
 
     return operands
@@ -278,9 +301,9 @@ def _reshape_operands_for_einsum(equation: str, *operands: torch.Tensor, verbose
 def check_shape(tensor: torch.Tensor, expected_shape: Tuple[int], name: str):
     """Checks the shape of a tensor against the expected shape and raises a ValueError if they don't match."""
     if tensor.shape != expected_shape:
-        raise ValueError(f"Shape mismatch for {name}: expected {expected_shape}, got {tensor.shape}")
-
-
+        raise ValueError(
+            f"Shape mismatch for {name}: expected {expected_shape}, got {tensor.shape}"
+        )
 
 
 class TimestepNorm(nn.Module):

@@ -64,7 +64,9 @@ def calculate_bleu_score(
     Returns:
         float: The corpus-level BLEU score.
     """
-    references = [[ref.lower() if lowercase else ref for ref in refs] for refs in references]
+    references = [
+        [ref.lower() if lowercase else ref for ref in refs] for refs in references
+    ]
     hypotheses = [hyp.lower() if lowercase else hyp for hyp in hypotheses]
 
     return corpus_bleu(

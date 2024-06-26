@@ -9,8 +9,15 @@ from loguru import logger
 from tqdm import tqdm
 from transformers import PreTrainedModel, StoppingCriteria
 
-from core.models.uncertainty.uncertain_nn import UncertainTransformerLMHeadModel, UncertainTransformerConfig
-from core.utils.metrics import calculate_bleu_score, calculate_perplexity, calculate_rouge_scores
+from core.models.uncertainty.uncertain_nn import (
+    UncertainTransformerLMHeadModel,
+    UncertainTransformerConfig,
+)
+from core.utils.metrics import (
+    calculate_bleu_score,
+    calculate_perplexity,
+    calculate_rouge_scores,
+)
 from core.utils.tokenizer import Tokenizer
 from core.utils.utils import generate_text
 
@@ -30,7 +37,7 @@ class MaxLengthCriteria(StoppingCriteria):
         self.max_length = max_length
 
     def __call__(
-            self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
     ) -> bool:
         """
         Check if the stopping condition is met.
@@ -105,7 +112,10 @@ def evaluate_model(
     avg_perplexity = np.mean(perplexities) if perplexities else float("nan")
     avg_bleu_score = np.mean(bleu_scores) if bleu_scores else float("nan")
     avg_rouge_scores = (
-        {key: np.mean([score[key] for score in rouge_scores]) for key in rouge_scores[0]}
+        {
+            key: np.mean([score[key] for score in rouge_scores])
+            for key in rouge_scores[0]
+        }
         if rouge_scores
         else {}
     )
@@ -166,7 +176,10 @@ def visualize_metrics(
 def main():
     # Set up logging
     logger.add(
-        "evaluation.log", format="{time} {level} {message}", level="INFO", rotation="10 MB"
+        "evaluation.log",
+        format="{time} {level} {message}",
+        level="INFO",
+        rotation="10 MB",
     )
 
     # Load the tokenizer
@@ -191,7 +204,9 @@ def main():
         model.load_state_dict(torch.load(checkpoint_path))
         logger.info(f"Loaded model checkpoint from: {checkpoint_path}")
     else:
-        logger.warning("Checkpoint path does not exist. Using a randomly initialized model.")
+        logger.warning(
+            "Checkpoint path does not exist. Using a randomly initialized model."
+        )
 
     # Set the device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

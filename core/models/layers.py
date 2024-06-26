@@ -32,16 +32,21 @@ class MultiHeadAttention(nn.Module):
 
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, use_cache: bool = False,
-                **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        use_cache: bool = False,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size, seq_len, _ = x.shape
 
-        q = rearrange(self.W_q(x), 'b l (h d) -> b h l d', h=self.n_heads)
-        k = rearrange(self.W_k(x), 'b l (h d) -> b h l d', h=self.n_heads)
-        v = rearrange(self.W_v(x), 'b l (h d) -> b h l d', h=self.n_heads)
+        q = rearrange(self.W_q(x), "b l (h d) -> b h l d", h=self.n_heads)
+        k = rearrange(self.W_k(x), "b l (h d) -> b h l d", h=self.n_heads)
+        v = rearrange(self.W_v(x), "b l (h d) -> b h l d", h=self.n_heads)
 
         # Compute attention scores
-        attn_scores = torch.einsum('bhid,bhjd->bhij', q, k) / (self.d_k ** 0.5)
+        attn_scores = torch.einsum("bhid,bhjd->bhij", q, k) / (self.d_k**0.5)
 
         # Apply sliding window attention
         if self.window_size < seq_len:
@@ -50,20 +55,22 @@ class MultiHeadAttention(nn.Module):
         # Apply attention mask if provided
         if attention_mask is not None:
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            attn_scores = attn_scores.masked_fill(attention_mask == 0, float('-inf'))
+            attn_scores = attn_scores.masked_fill(attention_mask == 0, float("-inf"))
 
         # Compute attention probabilities
         attn_probs = F.softmax(attn_scores, dim=-1)
         attn_probs = self.dropout(attn_probs)
 
         # Compute output
-        attn_output = torch.einsum('bhij,bhjd->bhid', attn_probs, v)
-        output = rearrange(attn_output, 'b h l d -> b l (h d)')
+        attn_output = torch.einsum("bhij,bhjd->bhid", attn_probs, v)
+        output = rearrange(attn_output, "b h l d -> b l (h d)")
         output = self.W_o(output)
 
         return (output, attn_probs) if use_cache else (output, None)
 
-    def _apply_sliding_window_attention(self, attn_scores: torch.Tensor) -> torch.Tensor:
+    def _apply_sliding_window_attention(
+        self, attn_scores: torch.Tensor
+    ) -> torch.Tensor:
         """
         Applies sliding window attention to the attention scores.
 
@@ -80,21 +87,33 @@ class MultiHeadAttention(nn.Module):
         padded_scores = F.pad(attn_scores, (0, pad_len, 0, pad_len))
 
         # Reshape for windowed attention
-        windowed_scores = rearrange(padded_scores,
-                                    'b h (w1 d1) (w2 d2) -> b h w1 w2 d1 d2',
-                                    d1=self.window_size, d2=self.window_size)
+        windowed_scores = rearrange(
+            padded_scores,
+            "b h (w1 d1) (w2 d2) -> b h w1 w2 d1 d2",
+            d1=self.window_size,
+            d2=self.window_size,
+        )
 
         # Create causal mask within each window
-        causal_mask = torch.tril(torch.ones(self.window_size, self.window_size, device=attn_scores.device))
-        causal_mask = repeat(causal_mask, 'd1 d2 -> b h w1 w2 d1 d2', b=batch_size, h=n_heads,
-                             w1=windowed_scores.shape[2], w2=windowed_scores.shape[3])
+        causal_mask = torch.tril(
+            torch.ones(self.window_size, self.window_size, device=attn_scores.device)
+        )
+        causal_mask = repeat(
+            causal_mask,
+            "d1 d2 -> b h w1 w2 d1 d2",
+            b=batch_size,
+            h=n_heads,
+            w1=windowed_scores.shape[2],
+            w2=windowed_scores.shape[3],
+        )
 
         # Apply causal mask
-        windowed_scores = windowed_scores.masked_fill(causal_mask == 0, float('-inf'))
+        windowed_scores = windowed_scores.masked_fill(causal_mask == 0, float("-inf"))
 
         # Reshape back to original shape
-        attn_scores = rearrange(windowed_scores,
-                                'b h w1 w2 d1 d2 -> b h (w1 d1) (w2 d2)')
+        attn_scores = rearrange(
+            windowed_scores, "b h w1 w2 d1 d2 -> b h (w1 d1) (w2 d2)"
+        )
 
         # Remove padding
         attn_scores = attn_scores[:, :, :seq_len, :seq_len]
@@ -130,7 +149,9 @@ class CEMA(nn.Module):
         batch_size, seq_len, _ = x.shape
         output = []
         for i in range(seq_len):
-            self.ema = self.alpha * self.ema + (1 - self.alpha) * x[:, i, :].mean(dim=0, keepdim=True)
+            self.ema = self.alpha * self.ema + (1 - self.alpha) * x[:, i, :].mean(
+                dim=0, keepdim=True
+            )
             output.append(self.ema.expand(batch_size, -1))
         return torch.stack(output, dim=1)
 
@@ -145,14 +166,21 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.config = config
 
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, use_cache: bool = False,
-                **kwargs: Any) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        use_cache: bool = False,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Preserve input shape
         original_shape = x.shape
         batch_size, seq_length, d_model = original_shape
 
         # Self-attention
-        attn_output, attn_weights = self.attention(self.norm1(x), attention_mask, use_cache=use_cache, **kwargs)
+        attn_output, attn_weights = self.attention(
+            self.norm1(x), attention_mask, use_cache=use_cache, **kwargs
+        )
         x = x + self.dropout(attn_output)
 
         # Feed-forward
@@ -160,6 +188,8 @@ class TransformerEncoderLayer(nn.Module):
         x = x + self.dropout(ff_output)
 
         # Ensure output shape matches input shape
-        assert x.shape == original_shape, f"Shape mismatch in TransformerEncoderLayer: input {original_shape}, output {x.shape}"
+        assert (
+            x.shape == original_shape
+        ), f"Shape mismatch in TransformerEncoderLayer: input {original_shape}, output {x.shape}"
 
         return (x, (attn_weights, ff_output)) if use_cache else (x, None)
