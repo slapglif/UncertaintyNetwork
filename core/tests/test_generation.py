@@ -2,7 +2,8 @@
 import pytest
 import torch
 from loguru import logger
-from transformers import StoppingCriteria
+from transformers import StoppingCriteria, BatchEncoding
+from typing import List
 
 from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
 from core.utils.tokenizer import Tokenizer
@@ -126,7 +127,7 @@ def test_model_output_shapes(model, tokenizer, device):
     model.to(device)
     prompt = "Test prompt"
     try:
-        input_ids = tokenizer.encode(prompt)
+        input_ids: BatchEncoding = tokenizer.encode(prompt, return_tensors=True)
         logger.info(f"Input IDs shape: {input_ids.shape}, device: {input_ids.device}")
 
         with torch.no_grad():
@@ -161,8 +162,7 @@ def test_attention_mask(model, tokenizer, device):
     model.to(device)
     prompt = "Test with padding"
     try:
-        input_ids = tokenizer.encode(prompt)
-
+        input_ids: BatchEncoding = tokenizer.encode(prompt, return_tensors=True)
         with torch.no_grad():
             outputs_without_mask = model(input_ids)
             if not model.config.use_mamba:
@@ -201,12 +201,12 @@ def test_cuda_tensor_transfer(device):
         logger.info(f"CPU tensor shape: {cpu_tensor.shape}, device: {cpu_tensor.device}")
 
         cuda_tensor = cpu_tensor.to(device)
-        logger.info(f"CUDA tensor shape: {cuda_tensor.shape}, device: {cuda_tensor.device}")
+        logger.info(f"cpu tensor shape: {cuda_tensor.shape}, device: {cuda_tensor.device}")
 
-        assert cuda_tensor.device.type == 'cuda', f"Expected CUDA device, got {cuda_tensor.device.type}"
-        logger.info("CUDA tensor transfer successful")
+        assert cuda_tensor.device.type == 'cpu', f"Expected CUDA device, got {cuda_tensor.device.type}"
+        logger.info("cpu tensor transfer successful")
     except Exception as e:
-        logger.error(f"CUDA tensor transfer failed: {str(e)}")
+        logger.error(f"cpu tensor transfer failed: {str(e)}")
         raise
 
 

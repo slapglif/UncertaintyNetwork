@@ -3,6 +3,7 @@ import unittest
 
 import gpytorch
 import torch
+from gpytorch.distributions import MultivariateNormal
 from gpytorch.kernels import ScaleKernel
 from loguru import logger
 
@@ -26,42 +27,61 @@ class TestUncertaintyUtils(unittest.TestCase):
         self.batch_size = 3
         self.seq_len = 6
 
-    def test_gaussian_process_layer_forward(self):
+    def test_gaussian_process_layer_forward(self) -> None:
+        """
+        Test the forward pass of the GaussianProcessLayer.
+
+        This test checks the shape of the output distribution in both train and eval modes,
+        as well as the shape of the predicted mean and variance.
+        """
         logger.info("Starting test_gaussian_process_layer_forward")
-        gp_layer = GaussianProcessLayer(
-            self.input_dim, self.output_dim, self.num_inducing
+
+        # Initialize the GaussianProcessLayer
+        gp_layer: GaussianProcessLayer = GaussianProcessLayer(
+            input_dim=self.input_dim,
+            output_dim=self.output_dim,
+            num_inducing=self.num_inducing
         ).to(self.device)
-        x = torch.randn(
+
+        # Generate random input tensor
+        x: torch.Tensor = torch.randn(
             self.batch_size, self.seq_len, self.input_dim, device=self.device
         )
+
+        # Test in train mode
         gp_layer.train()
+        x_flat: torch.Tensor = x.view(-1, self.input_dim)
+        output_dist: MultivariateNormal = gp_layer(x_flat)
 
-        x_flat = x.view(-1, self.input_dim)
-        output_dist = gp_layer(x_flat)
-
+        # Check output distribution shapes
         self.assertEqual(
-            output_dist.loc.shape, torch.Size([self.batch_size * self.seq_len])
+            output_dist.loc.shape,
+            torch.Size([self.batch_size * self.seq_len, self.output_dim]),
+            "Mismatch in output distribution location shape"
         )
         self.assertEqual(
             output_dist.covariance_matrix.shape,
-            torch.Size(
-                [self.batch_size * self.seq_len, self.batch_size * self.seq_len]
-            ),
+            torch.Size([self.batch_size * self.seq_len, self.batch_size * self.seq_len]),
+            "Mismatch in output distribution covariance matrix shape"
         )
 
+        # Test in eval mode
         gp_layer.eval()
-        pred_mean, pred_var = gp_layer.predict_with_uncertainty(
-            x_flat
-        )  # Pass flattened input
+        pred_mean, pred_var = gp_layer.predict_with_uncertainty(x)
 
+        # Check predicted mean and variance shapes
         self.assertEqual(
             pred_mean.shape,
-            torch.Size([self.batch_size * self.seq_len, self.output_dim]),
+            torch.Size([self.batch_size, self.seq_len, self.output_dim]),
+            "Mismatch in predicted mean shape"
         )
         self.assertEqual(
             pred_var.shape,
-            torch.Size([self.batch_size * self.seq_len, self.output_dim]),
+            torch.Size([self.batch_size, self.seq_len, self.output_dim]),
+            "Mismatch in predicted variance shape"
         )
+
+        logger.info("Completed test_gaussian_process_layer_forward")
 
     def test_gaussian_process_layer_training(self):
         gp_layer = GaussianProcessLayer(

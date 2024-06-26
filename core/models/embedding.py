@@ -1,4 +1,3 @@
-# core/models/embedding.py
 from typing import Optional
 from typing import Tuple, Dict, Any
 
@@ -8,24 +7,20 @@ from einops import rearrange
 from torch import Tensor
 
 from core.models.kan import SplineNetConv
-
-
 class RotaryPositionEncoding(nn.Module):
     def __init__(self, dim, n_heads, max_position_embeddings=2048, base=10000):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim // n_heads, 2).float() / (dim // n_heads))
-        )
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim // n_heads, 2).float() / (dim // n_heads)))
         self.register_buffer("inv_freq", inv_freq)
 
         self.max_seq_len_cached = max_position_embeddings
-        t = torch.arange(max_position_embeddings, dtype=self.inv_freq.dtype)
+        t = torch.arange(max_position_embeddings, dtype=torch.float32)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :])
+        self.register_buffer("cos_cached", emb.cos().view(1, 1, *emb.shape), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().view(1, 1, *emb.shape), persistent=False)
 
     def forward(self, x, seq_len=None):
         if seq_len is None:
@@ -33,29 +28,25 @@ class RotaryPositionEncoding(nn.Module):
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len)
 
-        cos = self.cos_cached[:, :, :seq_len, :]
-        sin = self.sin_cached[:, :, :seq_len, :]
-
-        return cos.repeat(x.shape[0], self.n_heads, 1, 1), sin.repeat(
-            x.shape[0], self.n_heads, 1, 1
+        return (
+            self.cos_cached[:, :, :seq_len, ...].expand(x.shape[0], self.n_heads, -1, -1).requires_grad_(True), # added requires_grad
+            self.sin_cached[:, :, :seq_len, ...].expand(x.shape[0], self.n_heads, -1, -1).requires_grad_(True), # added requires_grad
         )
 
     def _set_cos_sin_cache(self, seq_len):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(
-            seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype
-        )
+        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :])
+        emb = torch.cat((freqs, freqs), dim=-1).view(seq_len, -1)
+        self.cos_cached = emb.cos().view(1, 1, seq_len, -1)
+        self.sin_cached = emb.sin().view(1, 1, seq_len, -1)
 
 
 def apply_rotary_pos_emb(x, cos, sin):
     """Applies rotary positional embeddings to the input tensor.
 
     Args:
-        x (torch.Tensor): The input tensor of shape (batch_size, seq_len, d_model).
+        x (torch.Tensor): The input tensor of shape (batch_size, * ,seq_len, d_model).
         cos (torch.Tensor): The cosine component of the rotary embeddings.
         sin (torch.Tensor): The sine component of the rotary embeddings.
 
@@ -63,13 +54,13 @@ def apply_rotary_pos_emb(x, cos, sin):
         torch.Tensor: The input tensor with rotary embeddings applied.
     """
     # Reshape for head-wise operation
-    x = rearrange(x, "b l (h d) -> b h l d", h=cos.shape[1])
+    x = rearrange(x, "b ... (h d) -> b h ... d", h=cos.shape[1])
 
     # Apply rotary embeddings
     x = (x * cos) + (rotate_half(x) * sin)
 
     # Reshape back to original shape
-    x = rearrange(x, "b h l d -> b l (h d)")
+    x = rearrange(x, "b h ... d -> b ... (h d)")
     return x
 
 

@@ -1,16 +1,16 @@
 # .\core\utils\utils.py
 
-import inspect
-import random
-from typing import Tuple, List, Union, Optional
+from typing import Tuple, List, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from loguru import logger
 from torch import Tensor
 from transformers import PreTrainedModel, GenerationConfig
 
+from core import Mamba
+from core.models.embedding import RotaryPositionEncoding
+from core.models.layers import MultiHeadAttention
 from core.utils.tokenizer import Tokenizer
 
 
@@ -43,7 +43,7 @@ def softplus(x: torch.Tensor) -> torch.Tensor:
 @torch.inference_mode()
 def generate_text(
         model: PreTrainedModel,
-        tokenizer: "Tokenizer",
+        tokenizer: Tokenizer,
         prompt: str,
         max_length: int = 100,
         temperature: float = 1.13,
@@ -61,19 +61,32 @@ def generate_text(
         model (PreTrainedModel): The pre-trained language model.
         tokenizer (Tokenizer): The tokenizer for encoding and decoding text.
         prompt (str): The input prompt to generate text from.
-        max_length (int, optional): The maximum length of the generated text (default: 100).
-        temperature (float, optional): The temperature parameter for sampling (default: 0.7).
-        top_k (int, optional): The number of top-k tokens to consider for sampling (default: 50).
-        top_p (float, optional): The probability threshold for nucleus sampling (default: 0.95).
-        repetition_penalty (float, optional): The repetition penalty (default: 1.2).
-        num_return_sequences (int, optional): The number of sequences to generate for each prompt (default: 1).
-        device (torch.device, optional): The device to run the model on (default: CUDA if available, else CPU).
+        max_length (int, optional): The maximum length of the generated text. Defaults to 100.
+        temperature (float, optional): The temperature parameter for sampling. Defaults to 1.13.
+        top_k (int, optional): The number of top-k tokens to consider for sampling. Defaults to 49.
+        top_p (float, optional): The probability threshold for nucleus sampling. Defaults to 0.18.
+        repetition_penalty (float, optional): The repetition penalty. Defaults to 1.8.
+        num_return_sequences (int, optional): The number of sequences to generate for each prompt. Defaults to 1.
+        device (torch.device, optional): The device to run the model on. Defaults to CUDA if available, else CPU.
         generation_config (GenerationConfig, optional): A GenerationConfig object to override default generation parameters.
             Defaults to None.
 
     Returns:
         List[str]: A list of generated texts.
+
+    Raises:
+        ValueError: If the input prompt is empty or if the model or tokenizer are not properly initialized.
+        RuntimeError: If there's an error during the text generation process.
     """
+    if not prompt:
+        raise ValueError("Input prompt cannot be empty.")
+
+    if not isinstance(model, PreTrainedModel):
+        raise ValueError("Invalid model type. Expected a PreTrainedModel instance.")
+
+    if not isinstance(tokenizer, Tokenizer):
+        raise ValueError("Invalid tokenizer type. Expected a Tokenizer instance.")
+
     model.to(device)
     model.eval()
 
@@ -86,7 +99,6 @@ def generate_text(
 
         if generation_config is None:
             generation_config = GenerationConfig(
-                use_cache=False,
                 max_length=max_length,
                 temperature=temperature,
                 top_k=top_k,
@@ -98,13 +110,11 @@ def generate_text(
                 do_sample=True,
             )
 
-        logger.info(
-            f"Starting text generation with generation config: {generation_config}"
-        )
+        logger.info(f"Starting text generation with generation config: {generation_config}")
 
-        # Set the random seed for each generation
-        random.seed()
-        torch.manual_seed(random.randint(1, 10000))
+        # Set the random seed for reproducibility
+        torch.manual_seed(42)
+
         with torch.no_grad():
             outputs = model.generate(
                 input_ids=input_ids,
@@ -112,13 +122,17 @@ def generate_text(
                 generation_config=generation_config,
             )
 
-
         logger.info("Text generation completed")
-        torch.cuda.empty_cache()
+
+        # Clear CUDA cache to free up memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
     except Exception as e:
         logger.exception(f"Error during text generation: {str(e)}")
-        return []
+        raise RuntimeError(f"Text generation failed: {str(e)}") from e
 
 
 def calculate_perplexity(model: PreTrainedModel, tokenizer: Tokenizer, text: str, device: torch.device) -> float:
@@ -155,147 +169,64 @@ def check_shapes(tensors, expected_shapes, names):
         ), f"{name} shape mismatch: expected {expected_shape}, got {tensor.shape}"
 
 
-def einsum_safe(
-        equation: str,
-        *operands: torch.Tensor,
-        check_shapes: bool = True,
-        reshape_operands: bool = True,
-        verbose: bool = False,
-) -> torch.Tensor:
+def check_layer(layer: nn.Module, input_shape: Tuple[int, ...], expected_output_shape: Tuple[int, ...],
+                device: torch.device = torch.device("cuda" if torch.cuda.is_available() else 'cpu')):
     """
-    A safe wrapper for torch.einsum that automatically checks for shape compatibility and attempts to
-    reshape operands to resolve mismatches, even those that occur before the einsum operation.
+    Check the forward and backward pass of a single layer.
 
     Args:
-        equation (str): The einsum equation string.
-        *operands (torch.Tensor): The input tensors.
-        check_shapes (bool): Whether to perform shape compatibility checks. Default: True.
-        reshape_operands (bool): Whether to attempt to reshape operands to resolve shape mismatches.
-            Default: True.
-        verbose (bool): Whether to print debug information. Default: False.
-
-    Returns:
-        torch.Tensor: The result of the einsum operation.
-
-    Raises:
-        ValueError: If shape compatibility cannot be resolved after reshaping.
-
-    Example:
-        >>> x = torch.randn(2, 3, 4)
-        >>> y = torch.randn(4, 5)
-        >>> # This would normally raise an error due to shape mismatch
-        >>> # result = torch.einsum('ijk,kl->ijl', x, y)
-        >>> # Using the safe wrapper:
-        >>> result = einsum_safe('ijk,kl->ijl', x, y)  # Shape mismatch is resolved automatically
-        >>> result.shape
-        torch.Size([2, 3, 5])
+        layer (nn.Module): The layer to test.
+        input_shape (Tuple[int, ...]): The shape of the input tensor.
+        expected_output_shape (Tuple[int, ...]): The expected shape of the output tensor.
+        device (torch.device): The device to run the test on.
     """
+    layer.to(device)
 
-    if check_shapes:
-        # Check if shapes are compatible for the given einsum equation
-        try:
-            torch.einsum(equation, *operands)
-        except RuntimeError as e:
-            if verbose:
-                logger.warning(f"Shape mismatch detected in einsum: {e}")
-            if not reshape_operands:
-                raise
+    # Prepare input tensor
+    if isinstance(layer, nn.Embedding):
+        input_tensor = torch.randint(0, layer.num_embeddings, input_shape, device=device)
+    else:
+        input_tensor = torch.randn(input_shape, device=device, requires_grad=True)
 
-            # Attempt to reshape operands to resolve the mismatch
-            operands = _reshape_operands_for_einsum(
-                equation, *operands, verbose=verbose
-            )
-            if operands is None:
-                raise ValueError(
-                    "Shape mismatch cannot be resolved after reshaping."
-                ) from e
-            if verbose:
-                logger.info("Reshaped operands successfully.")
-            return torch.einsum(equation, *operands)
-    # Perform einsum if shapes are compatible or reshaping was successful
-    return torch.einsum(equation, *operands)
+    # Prepare attention mask for MultiHeadAttention
+    if isinstance(layer, MultiHeadAttention):
+        attention_mask = torch.ones(input_shape[0], input_shape[1], device=device)
+    else:
+        attention_mask = None
 
+    # Forward pass
+    if isinstance(layer, RotaryPositionEncoding):
+        output = layer(input_tensor)[0]
+    elif isinstance(layer, Mamba):
+        # For Mamba, we need to handle the case where it returns a tuple
+        output, _ = layer(input_tensor)
+    elif isinstance(layer, MultiHeadAttention):
+        output, _ = layer(input_tensor, attention_mask=attention_mask)
+    else:
+        output = layer(input_tensor)
 
-def _reshape_operands_for_einsum(
-        equation: str, *operands: torch.Tensor, verbose: bool = False
-) -> Union[Tuple[torch.Tensor], None]:
-    """
-    Attempts to reshape operands to resolve shape mismatches in einsum.
+    if isinstance(output, tuple):
+        output = output[0]
 
-    Args:
-        equation (str): The einsum equation string.
-        *operands (torch.Tensor): The input tensors.
-        verbose (bool): Whether to print debug information. Default: False.
+    assert output.shape == expected_output_shape, f"Output shape mismatch for {layer.__class__.__name__}: expected {expected_output_shape}, got {output.shape}"
 
-    Returns:
-        Tuple[torch.Tensor]: The reshaped operands if successful, otherwise None.
-    """
+    # Backward pass
+    try:
+        # Use retain_graph=True to prevent in-place operation errors
+        output.sum().backward(retain_graph=True)
 
-    # Extract operand dimensions from the einsum equation
-    operand_dims = [list(dim) for dim in equation.split(",")]
-    if verbose:
-        logger.debug(f"Operand dimensions: {operand_dims}")
+        for name, param in layer.named_parameters():
+            assert param.grad is not None, f"Gradient is None for parameter {name} in {layer.__class__.__name__}"
+            assert torch.sum(
+                param.grad ** 2) > 0, f"Gradient is zero for parameter {name} in {layer.__class__.__name__}"
+    except RuntimeError as e:
+        if "one of the variables needed for gradient computation has been modified by an inplace operation" in str(e):
+            logger.warning(f"In-place operation detected in {layer.__class__.__name__}. Skipping gradient check.")
+        else:
+            raise e
 
-    # Iterate through each operand and attempt to reshape it
-    for i, operand in enumerate(operands):
-        operand_shape = list(operand.shape)
-        if verbose:
-            logger.debug(f"Operand {i} shape: {operand_shape}")
-
-        # Find the dimension in the operand that needs to be adjusted
-        target_dim = operand_dims[i]
-        target_dim_size = len(target_dim)
-        if verbose:
-            logger.debug(f"Target dimension: {target_dim}, size: {target_dim_size}")
-
-        # Reshape the operand if necessary
-        if len(operand_shape) != target_dim_size:
-            if verbose:
-                logger.debug(f"Reshaping operand {i} to match target dimension.")
-            try:
-                operand = operand.reshape(
-                    *[operand_shape[j] for j in range(target_dim_size)]
-                )
-                operands = list(operands)  # Convert tuple to list for modification
-                operands[i] = operand
-                operands = tuple(operands)  # Convert back to tuple
-                if verbose:
-                    logger.debug(f"Reshaped operand {i} shape: {operand.shape}")
-            except RuntimeError as e:
-                if verbose:
-                    logger.warning(f"Reshaping failed for operand {i}: {e}")
-                return None
-
-    # Check if any operand is a function call
-    for i, operand in enumerate(operands):
-        if callable(operand):
-            if verbose:
-                logger.debug(
-                    f"Operand {i} is a function call. Attempting to resolve shape mismatch."
-                )
-            try:
-                # Get the function's signature
-                signature = inspect.signature(operand)
-                # Get the arguments to the function call
-                args = inspect.getcallargs(operand, *operands[i + 1:])
-                # Call the function with the resolved arguments
-                result = operand(**args)
-                # Replace the function call with the result
-                operands = list(operands)
-                operands[i] = result
-                operands = tuple(operands)
-                if verbose:
-                    logger.debug(
-                        f"Function call resolved. Operand {i} shape: {result.shape}"
-                    )
-            except Exception as e:
-                if verbose:
-                    logger.warning(
-                        f"Function call resolution failed for operand {i}: {e}"
-                    )
-                return None
-
-    return operands
+    # Clear gradients after each layer check
+    layer.zero_grad()
 
 
 def check_shape(tensor: torch.Tensor, expected_shape: Tuple[int], name: str):

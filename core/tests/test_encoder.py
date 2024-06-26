@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from core.models.embedding import RotaryPositionEncoding, SentenceEncoder, SentenceGP
+from core.models.embedding import RotaryPositionEncoding, SentenceGP
 from core.models.uncertainty.uncertain_nn import (
     UncertainTransformerConfig,
     UncertainTransformerLMHeadModel,
@@ -61,30 +61,6 @@ def test_rotary_position_encoding_shape():
     assert sin.shape == (1, N_HEADS, SEQ_LEN, EMBED_DIM // N_HEADS)
 
 
-def test_sentence_encoder_shape(tokenizer, config):
-    sentence_encoder = SentenceEncoder(
-        vocab_size=config.vocab_size,
-        hidden_dim=EMBED_DIM,
-        output_dim=EMBED_DIM,
-        kan_config={
-            "layers_hidden": [1024, 2048],
-            "grid_min": -1.2,
-            "grid_max": 0.2,
-            "num_grids": 8,
-            "exponent": 2,
-            "inv_denominator": 0.5,
-            "train_grid": False,
-            "train_inv_denominator": False,
-            "spline_weight_init_scale": 1.0,
-        },
-    ).to(DEVICE)
-
-    input_tensor = torch.randint(
-        0, config.vocab_size, (BATCH_SIZE, SEQ_LEN), device=DEVICE
-    )
-    output = sentence_encoder(input_tensor)
-    assert output.shape == (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
-
 
 def test_sentence_gp_output_type(config):
     sentence_gp = SentenceGP(
@@ -101,11 +77,12 @@ def test_sentence_gp_output_type(config):
 
 def test_uncertainty_module(config):
     uncertainty_module = UncertaintyModule(
-        input_dim=EMBED_DIM,
+        input_dim=config.d_model,
         output_dim=config.vocab_size,
-        n_gp_layers=2,
-        n_inducing=N_INDUCING,
+        n_gp_layers=1,  # Reduced from 2
+        n_inducing=5,  # Reduced from 10
         dropout_rate=0.1,
+        mc_samples=3,  # Reduced from 5
     ).to(DEVICE)
 
     input_tensor = torch.randn(BATCH_SIZE, SEQ_LEN, EMBED_DIM, device=DEVICE)

@@ -2,11 +2,13 @@
 
 import os
 import sys
-from typing import Dict, Any, List, Optional
+from typing import Any, Optional
+from typing import Dict
 
 import pytorch_lightning as pl
 import torch
-from datasets import load_dataset, Dataset
+import torch.nn.functional as F
+from datasets import load_dataset
 from loguru import logger
 from pytorch_lightning.callbacks import (
     ModelCheckpoint,
@@ -15,15 +17,11 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from core.models.uncertainty.uncertain_nn import (
     UncertainTransformerLMHeadModel,
-    UncertainTransformerConfig,
-)
-from core.models.uncertainty.uncertainty_utils import (
-    uncertainty_weighted_loss,
-    total_uncertainty,
-)
+    UncertainTransformerConfig, )
 from core.utils.tokenizer import Tokenizer
 
 # Configure Loguru
@@ -37,6 +35,7 @@ logger.add(
 
 # Enable tensor core support
 torch.set_float32_matmul_precision("high")
+torch.autograd.set_detect_anomaly(True)
 
 
 class UncertainTransformerLightningModule(pl.LightningModule):
@@ -69,74 +68,21 @@ class UncertainTransformerLightningModule(pl.LightningModule):
     def forward(self, input_ids, attention_mask=None, labels=None):
         return self.model(input_ids, attention_mask=attention_mask, labels=labels)
 
-    def training_step(
-            self, batch: Dict[str, torch.Tensor], batch_idx: int
-    ) -> torch.Tensor:
-        outputs, uncertainty = self(**batch)
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Optional[torch.Tensor]:
+        outputs = self(**batch)
         loss = outputs.loss
 
-        # Apply uncertainty-weighted loss
-        weighted_loss = uncertainty_weighted_loss(loss, total_uncertainty(uncertainty))
+        if torch.isnan(loss) or torch.isinf(loss):
+            self.log("nan_loss", 1.0, on_step=True, on_epoch=False, prog_bar=True, logger=True)
+            return None
 
-        self.log(
-            "train_loss",
-            weighted_loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-            sync_dist=True,
-        )
-        return weighted_loss
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        return loss
 
-    def validation_step(
-            self, batch: Dict[str, torch.Tensor], batch_idx: int
-    ) -> Dict[str, torch.Tensor]:
-        outputs, uncertainty = self(**batch)
-        loss = outputs.loss
-
-        self.log(
-            "val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True
-        )
-
-        perplexity = torch.exp(loss)
-
-        self.log(
-            "val_perplexity",
-            perplexity,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-            sync_dist=True,
-        )
-
-        # Log mean uncertainty
-        mean_uncertainty = uncertainty.mean()
-        self.log(
-            "val_mean_uncertainty",
-            mean_uncertainty,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-            sync_dist=True,
-        )
-
-        # Sample Generation for Logging
-        if batch_idx == 0:
-            sample_input_ids = batch["input_ids"][:1]
-            generated = self.model.generate(sample_input_ids, max_new_tokens=50)
-            generated_text = self.tokenizer.decode(
-                generated[0], skip_special_tokens=True
-            )
-            self.logger.experiment.add_text(
-                "generated_text", generated_text, self.current_epoch
-            )
-
-        return {
-            "val_loss": loss,
-            "val_perplexity": perplexity,
-            "val_uncertainty": mean_uncertainty,
-        }
+    def on_train_batch_end(self, outputs, batch: Any, batch_idx: int, unused: Optional[int] = 0) -> None:
+        if outputs is None:
+            self.zero_grad()
+            self.trainer.strategy.optimizer_step(self.optimizers())
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -158,6 +104,79 @@ class UncertainTransformerLightningModule(pl.LightningModule):
             },
         }
 
+    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
+        outputs = self(**batch)
+        loss = outputs.loss
+
+        self.log(
+            "val_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True
+        )
+
+        perplexity = torch.exp(loss)
+        self.log(
+            "val_perplexity",
+            perplexity,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+        )
+
+        # Sample Generation for Logging
+        if batch_idx == 0:
+            sample_input_ids = batch["input_ids"][:1]
+            generated = self.model.generate(sample_input_ids, max_new_tokens=50)
+            generated_text = self.tokenizer.decode(
+                generated[0], skip_special_tokens=True
+            )
+            self.logger.experiment.add_text(
+                "generated_text", generated_text, self.current_epoch
+            )
+
+        return {
+            "val_loss": loss,
+            "val_perplexity": perplexity,
+        }
+
+
+class TinyShakespeareDataset(torch.utils.data.Dataset):
+    def __init__(self, tokenizer: Tokenizer, max_length: int = 1024, split: str = "train"):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.dataset = load_dataset("tiny_shakespeare", split=split, trust_remote_code=True)
+        self.text = self.dataset["text"][0]  # Access the text from the single example
+        self.lines = self.text.split('\n')
+        self.tokenized_lines = self._tokenize_lines()
+
+    def _tokenize_lines(self):
+        tokenized = []
+        for line in self.lines:
+            if line.strip():  # Skip empty lines
+                tokens = self.tokenizer.encode(line, add_special_tokens=False)
+                tokenized.append(tokens)
+        return tokenized
+
+    def __len__(self):
+        return len(self.tokenized_lines)
+
+    def __getitem__(self, idx):
+        tokens = self.tokenized_lines[idx]
+        tokens = tokens[:self.max_length]  # Truncate to max_length
+
+        input_ids = torch.tensor(tokens[:-1])
+        labels = torch.tensor(tokens[1:])
+
+        # Pad sequences
+        input_ids = F.pad(input_ids, (0, self.max_length - len(input_ids)), value=self.tokenizer.pad_token_id)
+        labels = F.pad(labels, (0, self.max_length - len(labels)), value=-100)
+        attention_mask = (input_ids != self.tokenizer.pad_token_id).float()
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
 
 class TinyShakespeareDataModule(pl.LightningDataModule):
     def __init__(
@@ -167,164 +186,122 @@ class TinyShakespeareDataModule(pl.LightningDataModule):
             batch_size: int = 32,
             num_workers: int = 4,
     ):
-        """
-        Initialize the TinyShakespeareDataModule.
-
-        Args:
-            tokenizer (Tokenizer): The tokenizer to use for processing text.
-            max_length (int): Maximum sequence length for tokenization.
-            batch_size (int): Batch size for DataLoaders.
-            num_workers (int): Number of workers for DataLoaders.
-        """
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.batch_size = batch_size
         self.num_workers = num_workers
 
-        self.train_dataset: Optional[Dataset] = None
-        self.val_dataset: Optional[Dataset] = None
-        self.test_dataset: Optional[Dataset] = None
+        self.train_dataset: Optional[TinyShakespeareDataset] = None
+        self.val_dataset: Optional[TinyShakespeareDataset] = None
+        self.test_dataset: Optional[TinyShakespeareDataset] = None
 
     def setup(self, stage: Optional[str] = None):
-        """
-        Set up the datasets for each stage (fit, validate, test).
-
-        Args:
-            stage (Optional[str]): The stage to set up. Can be 'fit', 'validate', or 'test'.
-        """
         if stage == "fit" or stage is None:
             self.train_dataset = TinyShakespeareDataset(
                 tokenizer=self.tokenizer,
                 max_length=self.max_length,
+                split="train",
             )
             self.val_dataset = TinyShakespeareDataset(
                 tokenizer=self.tokenizer,
                 max_length=self.max_length,
+                split="validation"
             )
 
         if stage == "test" or stage is None:
             self.test_dataset = TinyShakespeareDataset(
                 tokenizer=self.tokenizer,
                 max_length=self.max_length,
+                split="test"
             )
 
-    def train_dataloader(self) -> DataLoader:
+    def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            pin_memory=True,
             shuffle=True,
-            collate_fn=self._collate_fn,
-            persistent_workers=True,
+            pin_memory=True,
+            persistent_workers=True
         )
 
-    def val_dataloader(self) -> DataLoader:
+    def val_dataloader(self):
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            shuffle=False,
             pin_memory=True,
-            collate_fn=self._collate_fn,
-            persistent_workers=True,
+            persistent_workers=True
         )
 
-    def test_dataloader(self) -> DataLoader:
+    def test_dataloader(self):
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            shuffle=False,
             pin_memory=True,
-            collate_fn=self._collate_fn,
-            persistent_workers=True,
+            persistent_workers=True
         )
 
-    @staticmethod
-    def _collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        input_ids = [item["input_ids"] for item in batch]
-        attention_mask = [item["attention_mask"] for item in batch]
-        labels = [item["labels"] for item in batch]
 
-        max_len = max(ids.size(0) for ids in input_ids)
-
-        input_ids_padded = torch.stack(
-            [
-                torch.cat(
-                    [
-                        ids,
-                        torch.full(
-                            (max_len - ids.size(0),),
-                            50256,
-                            dtype=ids.dtype,
-                            device=ids.device,
-                        ),
-                    ]
-                )
-                for ids in input_ids
-            ]
-        )
-        attention_mask_padded = torch.stack(
-            [
-                torch.cat(
-                    [
-                        mask,
-                        torch.zeros(
-                            max_len - mask.size(0), dtype=mask.dtype, device=mask.device
-                        ),
-                    ]
-                )
-                for mask in attention_mask
-            ]
-        )
-        labels_padded = torch.stack(
-            [
-                torch.cat(
-                    [
-                        label,
-                        torch.full(
-                            (max_len - label.size(0),),
-                            -100,
-                            dtype=label.dtype,
-                            device=label.device,
-                        ),
-                    ]
-                )
-                for label in labels
-            ]
-        )
-
-        return {
-            "input_ids": input_ids_padded,
-            "attention_mask": attention_mask_padded,
-            "labels": labels_padded,
-        }
-
-
-class TinyShakespeareDataset(torch.utils.data.Dataset):
-    def __init__(self, tokenizer: Tokenizer, max_length: int = 1024):
+class Wikitext2Dataset(Dataset):
+    def __init__(self, tokenizer, data, max_length):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.dataset = load_dataset("tiny_shakespeare", split="train")
-        self.text = self.dataset["text"]
+        self.examples = self.preprocess_data(data)
+
+    def preprocess_data(self, data):
+        examples = []
+        for item in data:
+            if item['text'].strip():  # Skip empty texts
+                encodings = self.tokenizer(item['text'], truncation=True, max_length=self.max_length,
+                                           padding='max_length')
+                examples.append({
+                    'input_ids': torch.tensor(encodings['input_ids']),
+                    'attention_mask': torch.tensor(encodings['attention_mask']),
+                })
+        return examples
 
     def __len__(self):
-        return len(self.text)
+        return len(self.examples)
 
     def __getitem__(self, idx):
-        text = self.text[idx]
-        tokenized = self.tokenizer.tokenizer(
-            text,
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
-            return_tensors="pt",
-        )
+        item = self.examples[idx]
+        labels = item['input_ids'].clone()
+        labels[labels == self.tokenizer.pad_token_id] = -100  # Ignore padding in loss
         return {
-            "input_ids": tokenized["input_ids"].squeeze(0),
-            "attention_mask": tokenized["attention_mask"].squeeze(0),
-            "labels": tokenized["input_ids"].squeeze(0).clone(),
+            'input_ids': item['input_ids'],
+            'attention_mask': item['attention_mask'],
+            'labels': labels
         }
+
+
+class Wikitext2DataModule(pl.LightningDataModule):
+    def __init__(self, tokenizer, batch_size=32, max_length=128):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.batch_size = batch_size
+        self.max_length = max_length
+
+    def setup(self, stage=None):
+        dataset = load_dataset("wikitext", "wikitext-2-v1")
+
+        self.train_dataset = Wikitext2Dataset(self.tokenizer, dataset['train'], self.max_length)
+        self.val_dataset = Wikitext2Dataset(self.tokenizer, dataset['validation'], self.max_length)
+        self.test_dataset = Wikitext2Dataset(self.tokenizer, dataset['test'], self.max_length)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4,
+                          persistent_workers=True)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=4, persistent_workers=True)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=4, persistent_workers=True)
 
 
 def main():
@@ -332,26 +309,27 @@ def main():
 
     hparams = {
         "vocab_size": 50257,
-        "d_model": 512,
-        "n_heads": 8,
-        "d_ff": 2048,
-        "n_layers": 6,
+        "d_model": 128,
+        "n_heads": 4,
+        "d_ff": 512,
+        "n_layers": 2,
         "dropout": 0.1,
-        "learning_rate": 3e-4,
+        "learning_rate": 5e-5,
         "weight_decay": 0.01,
-        "max_length": 1024,
+        "max_length": 128,
         "batch_size": 32,
-        "accumulate_grad_batches": 4,
+        "accumulate_grad_batches": 1,
         "max_epochs": 10,
         "pad_token_id": 50256,
-        "use_mamba": True,
-        "d_state": 16,
-        "d_conv": 4,
-        "expand_factor": 2.0,
-        "dt_rank": 16,
+        "use_mamba": True,  # Set to True if you want to use Mamba
+        "d_state": 8,
+        "d_conv": 2,
+        "expand_factor": 1.5,
+        "dt_rank": 8,
         "dt_min": 0.001,
         "dt_max": 0.1,
-        "sliding_window_size": 512,
+        "sliding_window_size": 128,
+        "use_gradient_checkpointing": False,
     }
 
     logger.info("Initializing model...")
@@ -362,10 +340,10 @@ def main():
     model.tokenizer = tokenizer
 
     logger.info("Initializing DataModule...")
-    datamodule = TinyShakespeareDataModule(
+    datamodule = Wikitext2DataModule(
         tokenizer=tokenizer,
-        max_length=hparams["max_length"],
         batch_size=hparams["batch_size"],
+        max_length=hparams["max_length"],
     )
 
     logger.info("Setting up callbacks...")
@@ -390,8 +368,10 @@ def main():
         precision="16-mixed" if torch.cuda.is_available() else 32,
         accumulate_grad_batches=hparams["accumulate_grad_batches"],
         gradient_clip_val=1.0,
-        log_every_n_steps=10,
+        log_every_n_steps=1,
         val_check_interval=0.25,
+        detect_anomaly=True,
+        num_sanity_val_steps=0
     )
 
     logger.info("Starting training...")

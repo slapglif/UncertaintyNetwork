@@ -179,4 +179,4 @@ def boolq_dataset():
 tokenizer = Tokenizer.from_pretrained("gpt2")
 
 if __name__ == "__main__":
-    evaluate_qa(model, tokenizer, boolq_dataset(), torch.device("cpu"))
+    evaluate_qa(model, tokenizer, boolq_dataset(), torch.device("cuda"))

@@ -1,38 +1,28 @@
-from typing import List
+from typing import List, Any
 
 import torch
-from transformers import GPT2Tokenizer
+from transformers import GPT2Tokenizer, BatchEncoding
 
 
 class Tokenizer:
     def __init__(self, pretrained_tokenizer: str = "gpt2", vocab_size: int = 50257):
-        self.tokenizer = GPT2Tokenizer.from_pretrained(pretrained_tokenizer)
+        """
+        Initialize the Tokenizer class.
+
+        Args:
+            pretrained_tokenizer (str, optional): The name of the pretrained tokenizer. Defaults to "gpt2".
+            vocab_size (int, optional): The vocabulary size. Defaults to 50257.
+        """
+        self.tokenizer = GPT2Tokenizer.from_pretrained(pretrained_tokenizer,  # Initialize with the full GPT-2 vocabulary
+                                                       vocab_size=vocab_size)  # Ensure the vocab_size matches the GPT-2 tokenizer
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.vocab_size = vocab_size
         self.pad_token_id = self.tokenizer.pad_token_id
         self.eos_token_id = self.tokenizer.eos_token_id
         self.bos_token_id = self.tokenizer.bos_token_id
 
-    def encode(self, text: str, return_tensors: str = None, **kwargs):
-        """
-        Encode the given text into token IDs.
-
-        Args:
-            text (str): The text to encode.
-            return_tensors (str, optional): The type of tensors to return. Can be 'pt' for PyTorch tensors.
-            **kwargs: Additional arguments to pass to the tokenizer's encode method.
-
-        Returns:
-            torch.Tensor or List[int]: The encoded token IDs as a tensor or list.
-        """
-        encoded = self.tokenizer.encode(text, add_special_tokens=True, **kwargs)
-
-        # Ensure all token IDs are within the valid range
-        encoded = [min(token_id, self.vocab_size - 1) for token_id in encoded]
-
-        if return_tensors == "pt":
-            return torch.tensor([encoded], dtype=torch.long)
-        return encoded
+    def encode(self, text: str, add_special_tokens: bool = True, **kwargs) -> List[int] | BatchEncoding :
+        return self.tokenizer.encode_plus(text, add_special_tokens=add_special_tokens, **kwargs)
 
     def decode(self, token_ids: torch.Tensor, **kwargs):
         """
@@ -47,7 +37,7 @@ class Tokenizer:
         """
         return self.tokenizer.decode(token_ids.tolist(), **kwargs)
 
-    def batch_decode(self, token_ids_batch: List[torch.Tensor], **kwargs):
+    def batch_decode(self, token_ids_batch: List[torch.Tensor] | torch.Tensor, **kwargs):
         """
         Decode a batch of token IDs back into text.
 
