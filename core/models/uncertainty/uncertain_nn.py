@@ -18,8 +18,8 @@ from transformers.modeling_outputs import ModelOutput
 from core.models.embedding import RotaryPositionEncoding, apply_rotary_pos_emb
 from core.models.layers import TransformerEncoderLayer, CEMA, KANFeedForward
 from core.models.statespace import Mamba, MambaConfig
-from core.models.uncertainty.uncertainty_utils import UncertaintyAwareLoss, uncertainty_decomposition
-from core.models.uncertainty.uncertainty_utils import UncertaintyModule
+from core.models.uncertainty.layers import UncertaintyModule, UncertaintyAwareLoss
+from core.models.uncertainty.uncertainty_utils import uncertainty_decomposition
 from core.utils.tokenizer import Tokenizer
 from core.utils.utils import TimestepNorm
 
@@ -318,8 +318,8 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             top_k: int = 50,
             top_p: float = 0.95,
             do_sample: bool = True,
-            **kwargs
-    ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
+            **_
+    ) -> tuple[Tensor, Tensor]:
         """
         Generate sequences with associated uncertainties.
 
@@ -331,13 +331,13 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             top_k (int): Top-k sampling parameter.
             top_p (float): Top-p sampling parameter.
             do_sample (bool): Whether to use sampling or greedy decoding.
-            **kwargs: Additional arguments for generation.
+            **_: Additional arguments for generation.
 
         Returns:
             Tuple[torch.LongTensor, torch.FloatTensor]: Generated sequences and their uncertainties.
         """
-        batch_size = input_ids.shape[0]
-        device = input_ids.device
+        _batch_size = input_ids.shape[0]
+        _device = input_ids.device
 
         generated_sequences = []
         sequence_uncertainties = []
@@ -387,7 +387,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
 
         Args:
             logits (torch.Tensor): Logits distribution shape (batch size, vocabulary size).
-            top_k (int): Keep only top k tokens with highest probability (top-k filtering).
+            top_k (int): Keep only top k tokens with the highest probability (top-k filtering).
             top_p (float): Keep the top tokens with cumulative probability >= top_p (nucleus filtering).
             filter_value (float): Value to assign to filtered tokens.
 
