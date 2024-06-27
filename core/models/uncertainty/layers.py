@@ -182,7 +182,8 @@ class GaussianProcessLayer(ApproximateGP):
         self.num_inducing = num_inducing
         self.device = device
 
-        inducing_points = torch.randn(num_inducing, input_dim, device=self.device)
+        inducing_points = torch.randn(output_dim, num_inducing, input_dim, device=self.device)
+        logger.info(f"Inducing points shape: {inducing_points.shape}")
 
         variational_distribution = CholeskyVariationalDistribution(
             num_inducing_points=num_inducing, batch_shape=torch.Size([output_dim])
@@ -220,40 +221,43 @@ class GaussianProcessLayer(ApproximateGP):
         Forward pass of the Gaussian Process Layer.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, embedding_dim) representing sentence embeddings.
+            x (torch.Tensor): Input tensor of shape (batch_size * seq_len, output_dim, embedding_dim).
 
         Returns:
             gpytorch.distributions.MultivariateNormal: The output distribution.
         """
+        logger.info(f"Input tensor shape: {x.shape}")
         if x.dim() == 3:
-            batch_size, seq_len, _ = x.shape
-            x = x.view(-1, self.input_dim)
+            batch_size_seq_len, _, _ = x.shape
         elif x.dim() == 2:
-            batch_size = x.size(0)
-            seq_len = 1
+            batch_size_seq_len = x.size(0)
         else:
             raise ValueError(f"Expected 2D or 3D input, got {x.dim()}D")
 
         # Normalize the input data
-        x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-8)
+        x = (x - x.mean(dim=2, keepdim=True)) / (x.std(dim=2, keepdim=True) + 1e-8)
+        logger.info(f"Normalized input tensor shape: {x.shape}")
 
         # Apply eigenvalue thresholding to the inducing points covariance matrix
         with gpytorch.settings.prior_mode(True):
             induc_induc_covar = self.covar_module(
                 self.variational_strategy.inducing_points
             )
+            logger.info(f"Inducing points covariance matrix shape: {induc_induc_covar.shape}")
 
         # Compute the mean and covariance
         mean_x = self.mean_module(x)
+        logger.info(f"Mean tensor shape: {mean_x.shape}")
 
         if isinstance(self.covar_module.base_kernel, TSPKernel):
             covar_x = self.covar_module(x).evaluate_kernel()
             covar_x = covar_x.to_dense()  # Convert lazy tensor to dense tensor
         else:
             covar_x = self.covar_module(x).evaluate()
+        logger.info(f"Covariance matrix shape: {covar_x.shape}")
 
-        # Reshape mean_x
-        mean_x = mean_x.reshape(batch_size * seq_len, self.output_dim)
+        # Reshape the mean to have the same batch shape as the covariance
+        mean_x = mean_x.view(batch_size_seq_len, self.output_dim)
 
         return MultivariateNormal(mean_x, covar_x)
 
@@ -442,12 +446,12 @@ class TSPKernel(gpytorch.kernels.Kernel):
         self.energy_function = energy_function
 
     def forward(
-            self,
-            x1: Tensor,
-            x2: Tensor,
-            diag: bool = False,
-            last_dim_is_batch: bool = False,
-            **params,
+        self,
+        x1: Tensor,
+        x2: Tensor,
+        diag: bool = False,
+        last_dim_is_batch: bool = False,
+        **params,
     ) -> Tensor:
         logger.debug(f"TSPKernel input shapes: x1 {x1.shape}, x2 {x2.shape}")
 
@@ -471,8 +475,7 @@ class TSPKernel(gpytorch.kernels.Kernel):
         # Reshape the output to match the expected shape
         batch_size1, seq_len1, _ = x1.shape
         batch_size2, seq_len2, _ = x2.shape
-        output = output.view(batch_size1, batch_size2, seq_len1, seq_len2)
-        output = output.squeeze()
+        output = output.view(batch_size1 * seq_len1, batch_size2 * seq_len2)
 
         return output
 

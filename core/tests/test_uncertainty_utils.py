@@ -1,6 +1,7 @@
 import unittest
-import torch
+
 import gpytorch
+import torch
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.kernels import ScaleKernel
 from loguru import logger
@@ -101,6 +102,7 @@ class TestUncertaintyUtils(unittest.TestCase):
             gp_layer.likelihood, gp_layer, num_data=x.size(0) * x.size(1)
         )
 
+        # sourcery skip: no-loop-in-tests
         for _ in range(5):  # Train for a few iterations
             optimizer.zero_grad()
             output_dist = gp_layer(x)
@@ -118,6 +120,24 @@ class TestUncertaintyUtils(unittest.TestCase):
                 gp_layer.variational_strategy.base_variational_strategy.inducing_points
             ).any()
         )
+
+    def test_gaussian_process_layer_covar_positive_definite(self):
+        """Tests if the covariance matrix produced by GaussianProcessLayer is positive definite."""
+        gp_layer = GaussianProcessLayer(
+            self.input_dim, self.output_dim, self.num_inducing
+        ).to(self.device)
+        gp_layer.train()  # Set to train mode
+
+        x = torch.randn(
+            self.batch_size * self.seq_len, self.output_dim, self.input_dim, device=self.device
+        )
+
+        with gpytorch.settings.cholesky_jitter(1e-5):
+            output_dist = gp_layer(x)
+
+        # Check for positive definiteness
+        eigenvalues = torch.linalg.eigvalsh(output_dist.covariance_matrix)
+        self.assertTrue(torch.all(eigenvalues > 0), "Covariance matrix is not positive definite")
 
     def test_gaussian_process_layer_with_tsp_kernel(self):
         energy_function = TSPEnergyFunction(self.input_dim, compression_dim=16).to(

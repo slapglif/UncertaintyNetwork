@@ -119,7 +119,7 @@ def generate_text(
             prompt, padding=True, truncation=True, return_tensors="pt"
         )["input_ids"].to(device)
 
-        logger.debug(f"Input IDs shape: {input_ids.shape}, device: {input_ids.device}")
+        logger.info(f"Input IDs shape: {input_ids.shape}, device: {input_ids.device}")
 
         attention_mask = torch.ones_like(input_ids)
 

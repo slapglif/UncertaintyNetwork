@@ -279,7 +279,7 @@ class DataProcessor:
                 )
                 if os.path.exists(batch_cache_path):
                     # Load processed batch from cache
-                    logger.debug(f"Loading batch from cache: {batch_cache_path}")
+                    logger.info(f"Loading batch from cache: {batch_cache_path}")
                     cached_batch = load_from_disk(batch_cache_path)
                     yield from cached_batch["text"]
                 else:
@@ -294,7 +294,7 @@ class DataProcessor:
                     ds_logging.disable_progress_bar()
                     processed_batch_dataset.save_to_disk(batch_cache_path)
 
-                    logger.debug(f"Saved batch to cache: {batch_cache_path}")
+                    logger.info(f"Saved batch to cache: {batch_cache_path}")
                     yield from processed_batch
 
                 pbar_batches.update(
