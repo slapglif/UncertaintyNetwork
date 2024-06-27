@@ -19,7 +19,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
 from torch.utils.data import DataLoader, Dataset
 
-from core.models.uncertainty.uncertain_nn import (
+from core.models.uncertainty.uncertainty import (
     UncertainTransformerLMHeadModel,
     UncertainTransformerConfig, )
 from core.utils.tokenizer import Tokenizer

@@ -45,10 +45,9 @@ class Mamba(nn.Module):
         super().__init__()
         self.config = config
 
-        # Input projection
+        # Adjust the input projection to match the expected input dimension
         self.in_proj = nn.Linear(config.d_model, 2 * config.d_inner, bias=config.bias)
 
-        # Convolution layer
         self.conv = nn.Conv1d(
             in_channels=config.d_inner,
             out_channels=config.d_inner,
@@ -64,10 +63,7 @@ class Mamba(nn.Module):
         self.B = nn.Parameter(torch.randn(config.d_inner, config.d_state))
         self.C = nn.Parameter(torch.randn(config.d_inner, config.d_state))
 
-        # Delta projection
         self.dt_proj = nn.Linear(config.d_inner, config.d_inner, bias=True)
-
-        # Output projection
         self.out_proj = nn.Linear(config.d_inner, config.d_model, bias=config.bias)
 
         self._initialize_weights()
@@ -79,7 +75,6 @@ class Mamba(nn.Module):
             x = x.unsqueeze(0)
 
         batch_size, seq_len, _ = x.shape
-        device = x.device
 
         # Input projection and splitting
         xz = self.in_proj(x)
@@ -95,10 +90,10 @@ class Mamba(nn.Module):
         delta = F.softplus(dt)
 
         # Selective scan
-        A = -torch.exp(self.A_log.float().to(device))
-        B = self.B.float().to(device)
-        C = self.C.float().to(device)
-        D = self.D.float().to(device)
+        A = -torch.exp(self.A_log.float())
+        B = self.B.float()
+        C = self.C.float()
+        D = self.D.float()
 
         if self.config.pscan:
             y = self.parallel_scan(x, delta, A, B, C, D)
@@ -158,10 +153,9 @@ class Mamba(nn.Module):
                 h[:, block_size::2 * block_size] = h[:, block_size::2 * block_size] + h_odd_update
 
         return (
-            torch.einsum('bne,de->bnd', h[:, :seq_len], C)
-            + D.unsqueeze(0).unsqueeze(0) * x
+                torch.einsum('bne,de->bnd', h[:, :seq_len], C)
+                + D.unsqueeze(0).unsqueeze(0) * x
         )
-
 
     def sequential_scan(self, x, delta, A, B, C, D, state):
         batch_size, seq_len, d_inner = x.shape

@@ -3,7 +3,7 @@ import os
 import pytest
 import torch
 
-from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
+from core.models.uncertainty.uncertainty import UncertainTransformerConfig, UncertainTransformerLMHeadModel
 from core.utils.tokenizer import Tokenizer
 
 # Constants

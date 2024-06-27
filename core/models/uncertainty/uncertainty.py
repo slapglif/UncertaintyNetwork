@@ -1,13 +1,11 @@
 # .\core\models\uncertainty\uncertain_nn.py
 from dataclasses import dataclass
-from typing import Any
 from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 import torch
 import torch.nn as nn
 from scipy.optimize import minimize_scalar
-from sentence_transformers import SentenceTransformer
 from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -20,15 +18,14 @@ from core.models.layers import TransformerEncoderLayer, CEMA, KANFeedForward
 from core.models.statespace import Mamba, MambaConfig
 from core.models.uncertainty.layers import UncertaintyModule, UncertaintyAwareLoss
 from core.models.uncertainty.uncertainty_utils import uncertainty_decomposition
-from core.utils.tokenizer import Tokenizer
 from core.utils.utils import TimestepNorm
 
 
 class UncertainTransformerConfig(PretrainedConfig):
     def __init__(
             self,
-            vocab_size: int = 50257,  # Set to match GPT-2's vocabulary size
-            d_model: int = 512,
+            vocab_size: int = 50257,
+            d_model: int = 768,  # Adjusted to match typical transformer models
             n_heads: int = 12,
             d_ff: int = 3072,
             n_layers: int = 12,
@@ -37,9 +34,9 @@ class UncertainTransformerConfig(PretrainedConfig):
             layer_norm_epsilon: float = 1e-5,
             initializer_range: float = 0.02,
             use_cache: bool = False,
-            pad_token_id: int = 50256,  # Set to match GPT-2's pad token ID
-            bos_token_id: int = 50256,  # Set to match GPT-2's BOS token ID
-            eos_token_id: int = 50256,  # Set to match GPT-2's EOS token ID
+            pad_token_id: int = 50256,
+            bos_token_id: int = 50256,
+            eos_token_id: int = 50256,
             use_mamba: bool = True,
             d_state: int = 16,
             d_conv: int = 4,
@@ -55,9 +52,7 @@ class UncertainTransformerConfig(PretrainedConfig):
             use_gelu_approximation: bool = False,
             sliding_window_size: int = 512,
             use_gradient_checkpointing: bool = False,
-            device: torch.device = torch.device(
-                "cuda" if torch.cuda.is_available() else "cpu"
-            ),
+            device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
             **kwargs
     ):
         super().__init__(
@@ -80,7 +75,8 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.d_state = d_state
         self.d_conv = d_conv
         self.expand_factor = expand_factor
-        self.dt_rank = dt_rank if dt_rank is not None else self.d_model
+        self.d_inner = int(self.expand_factor * self.d_model)  # Add this line
+        self.dt_rank = dt_rank if dt_rank is not None else self.d_inner
         self.dt_min = dt_min
         self.dt_max = dt_max
         self.dt_init = dt_init
@@ -94,18 +90,14 @@ class UncertainTransformerConfig(PretrainedConfig):
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
 
-class UncertainNN(nn.Module):
-    def __init__(self, config: PretrainedConfig):
+class UncertainNetwork(nn.Module):
+    def __init__(self, config: UncertainTransformerConfig):
         super().__init__()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model).to(config.device)
         self.rotary_pos_emb = RotaryPositionEncoding(
             config.d_model, config.n_heads, config.max_position_embeddings
         ).to(config.device)
-        self.sentence_transformer = SentenceTransformer(
-            "tomaarsen/mpnet-base-nli-matryoshka"
-        ).to(config.device)
-        self.sentence_proj = nn.Linear(768, config.d_model).to(config.device)
         self.cema = CEMA(config.d_model).to(config.device)
         self.layers = nn.ModuleList(
             [
@@ -133,56 +125,19 @@ class UncertainNN(nn.Module):
             ]
         ).to(config.device)
         self.final_layer_norm = nn.LayerNorm(config.d_model).to(config.device)
-        self.uncertainty_module = UncertaintyModule(
-            input_dim=config.d_model,
-            output_dim=config.vocab_size,
-            n_gp_layers=1,  # Reduced from 2
-            n_inducing=5,  # Reduced from 10
-            dropout_rate=0.1,
-            mc_samples=3,  # Reduced from 5
-        ).to(config.device)
-        self.use_cache = config.use_cache
         self.dropout = nn.Dropout(config.dropout).to(config.device)
-        self.tokenizer = Tokenizer.from_pretrained("gpt2")
 
     def forward(
             self,
-            input_ids: torch.LongTensor,
+            inputs_embeds: torch.Tensor,
             attention_mask: Optional[torch.FloatTensor] = None,
             use_cache: bool = False,
-            **_: Any
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, ...]], torch.Tensor]:
-        """
-        Forward pass of the Uncertain Transformer Neural Network.
+        print(f"UncertainNN input shape: {inputs_embeds.shape}")
+        print(f"UncertainNN input contains NaN: {torch.isnan(inputs_embeds).any()}")
 
-        Args:
-            input_ids (torch.LongTensor): Input token IDs of shape (batch_size, seq_len).
-            attention_mask (torch.FloatTensor, optional): Attention mask of shape (batch_size, seq_len). Defaults to None.
-            use_cache (bool, optional): Whether to use the cache. Defaults to False.
-            **_: Additional keyword arguments.
-
-        Returns:
-            Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, ...]], torch.Tensor]:
-                - Hidden states of shape (batch_size, seq_len, d_model).
-                - Cache if use_cache is True, else None.
-                - Uncertainty estimates of shape (batch_size, seq_len, vocab_size).
-        """
-        inputs_embeds = self.embedding(input_ids)
-
-        # Sentence embedding using SentenceTransformer
-        with torch.no_grad():
-            # Convert input_ids to text
-            input_text = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-            sentence_emb = self.sentence_transformer.encode(
-                input_text, convert_to_tensor=True
-            ).to(self.config.device)
-        sentence_emb = self.sentence_proj(sentence_emb)
-        sentence_emb = self.dropout(sentence_emb)
-        sentence_emb = sentence_emb.unsqueeze(1).repeat(1, inputs_embeds.size(1), 1)
-
-        inputs_embeds = inputs_embeds + sentence_emb
-
-        cos, sin = self.rotary_pos_emb(inputs_embeds, seq_len=input_ids.size(1))
+        batch_size, seq_len, _ = inputs_embeds.shape
+        cos, sin = self.rotary_pos_emb(inputs_embeds)
         inputs_embeds = apply_rotary_pos_emb(inputs_embeds, cos, sin)
 
         inputs_embeds = self.cema(inputs_embeds)
@@ -210,10 +165,10 @@ class UncertainNN(nn.Module):
 
         hidden_states = self.final_layer_norm(hidden_states)
 
-        _, uncertainty = self.uncertainty_module(hidden_states)
+        print(f"UncertainNN output shape: {hidden_states.shape}")
+        print(f"UncertainNN output contains NaN: {torch.isnan(hidden_states).any()}")
 
-        return hidden_states, cache, uncertainty
-
+        return hidden_states, cache, torch.zeros_like(hidden_states)  # placeholder for uncertainty
 
 @dataclass
 class UncertainCausalLMOutputWithCrossAttentions(ModelOutput):
@@ -227,41 +182,61 @@ class UncertainCausalLMOutputWithCrossAttentions(ModelOutput):
 
 
 class UncertainTransformerLMHeadModel(PreTrainedModel):
-    """
-    Uncertain Transformer Language Model with a head for language modeling tasks.
-
-    This model combines a transformer architecture with uncertainty estimation capabilities.
-
-    Attributes:
-        config (UncertainTransformerConfig): The configuration for the model.
-        transformer (UncertainNN): The main transformer network.
-        lm_head (nn.Linear): The language modeling head.
-        uncertainty_module (UncertaintyModule): Module for estimating uncertainty.
-        uncertainty_loss (UncertaintyAwareLoss): Loss function that incorporates uncertainty.
-        temperature (nn.Parameter): Temperature scaling parameter for calibration.
-
-    Args:
-        config (UncertainTransformerConfig): The configuration for the model.
-    """
-
     def __init__(self, config: UncertainTransformerConfig):
         super().__init__(config)
         self.config = config
-        self.transformer = UncertainNN(config)
+        self.transformer = UncertainNetwork(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.uncertainty_module = UncertaintyModule(
             input_dim=config.d_model,
             output_dim=config.vocab_size,
-            n_gp_layers=1,  # Reduced from 2
-            n_inducing=5,  # Reduced from 10
+            n_gp_layers=1,
+            n_inducing=5,
             dropout_rate=0.1,
-            mc_samples=3,  # Reduced from 5
+            mc_samples=3,
         )
         self.uncertainty_loss = UncertaintyAwareLoss(uncertainty_weight=config.uncertainty_weight)
         self.temperature = nn.Parameter(torch.ones(1))
 
         # Initialize weights
         self.apply(self._init_weights)
+
+    def forward(
+            self,
+            input_ids: torch.LongTensor,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        print(f"Input IDs shape: {input_ids.shape}")
+        print(f"Input IDs device: {input_ids.device}")
+        print(f"Input IDs contains NaN: {torch.isnan(input_ids).any()}")
+
+        inputs_embeds = self.transformer.embedding(input_ids)
+        print(f"Embedded shape: {inputs_embeds.shape}")
+        print(f"Embedded contains NaN: {torch.isnan(inputs_embeds).any()}")
+
+        hidden_states, _, _ = self.transformer(inputs_embeds, attention_mask=attention_mask)
+        print(f"Hidden states shape: {hidden_states.shape}")
+        print(f"Hidden states contains NaN: {torch.isnan(hidden_states).any()}")
+
+        logits = self.lm_head(hidden_states)
+        print(f"Logits shape: {logits.shape}")
+        print(f"Logits contains NaN: {torch.isnan(logits).any()}")
+
+        _, uncertainties = self.uncertainty_module(hidden_states)
+        print(f"Uncertainties shape: {uncertainties.shape}")
+        print(f"Uncertainties contains NaN: {torch.isnan(uncertainties).any()}")
+
+        outputs = {"logits": logits, "uncertainties": uncertainties}
+
+        if labels is not None:
+            print(f"Labels shape: {labels.shape}")
+            print(f"Labels device: {labels.device}")
+
+            loss = self.uncertainty_loss(logits, labels, uncertainties)
+            outputs["loss"] = loss
+
+        return outputs
 
     def _init_weights(self, module: nn.Module) -> None:
         """
@@ -278,36 +253,24 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(
-            self,
-            input_ids: torch.LongTensor,
-            attention_mask: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+    def _compute_embeddings(self, input_ids: torch.LongTensor) -> Tensor:
         """
-        Forward pass of the model.
+        Computes sentence embeddings from input_ids using the SentenceTransformer model.
 
         Args:
             input_ids (torch.LongTensor): The input token IDs.
-            attention_mask (Optional[torch.FloatTensor]): The attention mask. Defaults to None.
-            labels (Optional[torch.LongTensor]): The labels for computing the loss. Defaults to None.
 
         Returns:
-            Dict[str, torch.Tensor]: A dictionary containing the model outputs.
+            torch.FloatTensor: The computed sentence embeddings.
         """
-        transformer_outputs = self.transformer(input_ids, attention_mask=attention_mask)
-        hidden_states = transformer_outputs[0]
-        uncertainties = transformer_outputs[2]
+        # Decode token IDs to sentences
+        sentences = self.tokenizer.batch_decode(input_ids.to(self.device), skip_special_tokens=True)
 
-        logits = self.lm_head(hidden_states)
+        # Embed sentences using SentenceTransformer
+        embeddings = self.sentence_transformer.encode(sentences, convert_to_tensor=True).to(self.device)
+        embeddings = embeddings.to(self.device)  # Ensure embeddings are on the correct device
 
-        outputs = {"logits": logits, "uncertainties": uncertainties}
-
-        if labels is not None:
-            loss = self.uncertainty_loss(logits, labels, uncertainties)
-            outputs["loss"] = loss
-
-        return outputs
+        return embeddings
 
     def generate_with_uncertainty(
             self,

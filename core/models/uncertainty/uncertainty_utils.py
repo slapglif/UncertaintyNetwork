@@ -1,7 +1,9 @@
 # .\core\models\uncertainty\uncertainty_utils.py
 from typing import Tuple
 
+import gpytorch
 import torch
+from loguru import logger
 
 
 def total_uncertainty(epistemic: torch.Tensor, aleatoric: torch.Tensor) -> torch.Tensor:
@@ -96,3 +98,51 @@ def uncertainty_decomposition(_total_uncertainty: torch.Tensor, aleatoric_uncert
     """
     epistemic_uncertainty = _total_uncertainty - aleatoric_uncertainty
     return aleatoric_uncertainty, epistemic_uncertainty
+
+
+def diagnose_positive_definite_error(
+        gp_layer: gpytorch.models.ApproximateGP,
+        x: torch.Tensor,
+):
+    """
+    Diagnose the "Matrix not positive definite" error in a GaussianProcessLayer.
+
+    This function gathers information about the data, kernel, and covariance matrix
+    to help identify the cause of the error.
+
+    Args:
+        gp_layer (gpytorch.models.ApproximateGP): The Gaussian Process layer.
+        x (torch.Tensor): The input data tensor.
+    """
+
+    logger.info("Diagnosing 'Matrix not positive definite' error...")
+
+    # 1. Data Information
+    logger.info("Data Information:")
+    logger.info(f"  Input data shape: {x.shape}")
+    logger.info(f"  Number of data points: {x.size(0)}")
+    logger.info(f"  Data mean: {x.mean(dim=0)}")
+    logger.info(f"  Data standard deviation: {x.std(dim=0)}")
+
+    # 2. Kernel Information
+    logger.info("Kernel Information:")
+    logger.info(f"  Kernel type: {type(gp_layer.covar_module.base_kernel).__name__}")
+    logger.info(f"  Lengthscale: {gp_layer.covar_module.base_kernel.lengthscale}")
+
+    # 3. Covariance Matrix Information
+    with gpytorch.settings.prior_mode(True):
+        induc_induc_covar = gp_layer.covar_module(gp_layer.variational_strategy.inducing_points)
+
+    logger.info("Covariance Matrix Information:")
+    logger.info(f"  Inducing points covariance matrix shape: {induc_induc_covar.shape}")
+    logger.info(f"  Minimum eigenvalue: {torch.linalg.eigvalsh(induc_induc_covar).min().item()}")
+    logger.info(f"  Maximum eigenvalue: {torch.linalg.eigvalsh(induc_induc_covar).max().item()}")
+    # logger.info(f"  Trace of the covariance matrix: {torch.trace(induc_induc_covar).item()}")
+    # logger.info(f"  Are there NaN values in the covariance matrix: {torch.isnan(induc_induc_covar).any().item()}")
+    # logger.info(f"  Are there Inf values in the covariance matrix: {torch.isinf(induc_induc_covar).any().item()}")
+
+    # Optional: Print the covariance matrix if it's not too large
+    if induc_induc_covar.numel() < 100:
+        logger.info(f"  Inducing points covariance matrix:\n{induc_induc_covar}")
+
+    logger.info("Diagnosis completed.")

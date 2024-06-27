@@ -1,5 +1,6 @@
 import math
-from typing import Optional, Tuple, List
+from typing import Optional
+from typing import Tuple, List
 
 import gpytorch
 import torch
@@ -13,6 +14,7 @@ from gpytorch.models import ApproximateGP
 from gpytorch.priors import GammaPrior
 from gpytorch.variational import CholeskyVariationalDistribution, VariationalStrategy
 from loguru import logger
+from sentence_transformers import SentenceTransformer
 from torch import Tensor
 from torch import nn
 
@@ -20,14 +22,8 @@ from core.models.kan.spline_layers import SplineNetLayer
 
 
 class UncertaintyModule(nn.Module):
-    def __init__(self,
-                 input_dim: int,
-                 output_dim: int,
-                 n_gp_layers: int = 1,
-                 n_inducing: int = 5,
-                 dropout_rate: float = 0.1,
-                 mc_samples: int = 3
-                 ):
+    def __init__(self, input_dim: int, output_dim: int, n_gp_layers: int = 1, n_inducing: int = 5,
+                 dropout_rate: float = 0.1, mc_samples: int = 3):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -40,94 +36,41 @@ class UncertaintyModule(nn.Module):
         self.mc_dropout = nn.Dropout(p=dropout_rate)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # sourcery skip: low-code-quality
-        """
-        Forward pass of the uncertainty module.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_dim),
-                              (batch_size * seq_len, input_dim), or (input_dim,).
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: A tuple containing the mean output and the uncertainty.
-
-        Raises:
-            ValueError: If the input tensor has an incorrect shape.
-        """
-        original_shape = x.shape
-        logger.debug(f"Original input shape: {original_shape}")
-
-        if x.dim() == 1:
-            x = x.unsqueeze(0).unsqueeze(0)
-        elif x.dim() == 2:
-            x = x.unsqueeze(1)
-        elif x.dim() != 3:
-            raise ValueError(f"Expected 1D, 2D or 3D input, but got shape {x.shape}")
-
-        batch_size, seq_len, input_dim = x.shape
-        logger.debug(f"Reshaped input: batch_size={batch_size}, seq_len={seq_len}, input_dim={input_dim}")
-
-        if input_dim != self.input_dim:
-            raise ValueError(f"Expected input dimension of {self.input_dim}, but got {input_dim}")
-
-        x = x.view(-1, input_dim)
-        logger.debug(f"Flattened input shape: {x.shape}")
+        batch_size, seq_len, _ = x.shape
+        x = x.view(-1, self.input_dim)
 
         total_mean = None
         total_variance = None
 
-        for i in range(self.mc_samples):
+        for _ in range(self.mc_samples):
             x_dropout = self.mc_dropout(x)
 
-            for j, gp_layer in enumerate(self.gp_layers):
-                try:
-                    gp_output = gp_layer(x_dropout)
-                    logger.debug(f"MC sample {i}, GP layer {j} output type: {type(gp_output)}")
+            for gp_layer in self.gp_layers:
+                gp_output = gp_layer(x_dropout)
+                mean, variance = gp_output.mean, gp_output.variance
 
-                    if isinstance(gp_output, MultivariateNormal):
-                        mean = gp_output.mean
-                        variance = gp_output.variance
-                    elif isinstance(gp_output, torch.Tensor):
-                        mean = gp_output
-                        variance = torch.zeros_like(mean)
-                    else:
-                        raise TypeError(f"Unexpected output type from GP layer: {type(gp_output)}")
-
-                    logger.debug(f"Mean shape: {mean.shape}, Variance shape: {variance.shape}")
-
-                    if total_mean is None:
-                        total_mean = mean
-                        total_variance = variance
-                    else:
-                        if total_mean.shape != mean.shape:
-                            raise ValueError(f"Shape mismatch: total_mean {total_mean.shape}, mean {mean.shape}")
-                        total_mean += mean
-                        total_variance += variance
-                except Exception as e:
-                    logger.error(f"Error in MC sample {i}, GP layer {j}: {str(e)}")
-                    raise
+                if total_mean is None:
+                    total_mean = mean
+                    total_variance = variance
+                else:
+                    total_mean += mean
+                    total_variance += variance
 
         mean_output = total_mean / (len(self.gp_layers) * self.mc_samples)
         uncertainty = total_variance / (len(self.gp_layers) * self.mc_samples)
 
-        logger.debug(f"Mean output shape before reshape: {mean_output.shape}")
-        logger.debug(f"Uncertainty shape before reshape: {uncertainty.shape}")
-
         mean_output = mean_output.view(batch_size, seq_len, -1)
         uncertainty = uncertainty.view(batch_size, seq_len, -1)
 
-        logger.debug(f"Final output shapes: mean={mean_output.shape}, uncertainty={uncertainty.shape}")
         return mean_output, uncertainty
 
 
 class GaussianProcessLayer(ApproximateGP):
-    """
-    Gaussian Process Layer with data normalization and improved kernel initialization.
-    """
+    """Gaussian Process Layer with data normalization and eigenvalue thresholding."""
 
     def __init__(
             self,
-            input_dim: int,
+            input_dim: int,  # This should now be the embedding dimension
             output_dim: int,
             num_inducing: int,
             kernel: Optional[Kernel] = None,
@@ -137,10 +80,10 @@ class GaussianProcessLayer(ApproximateGP):
         Initialize the GaussianProcessLayer.
 
         Args:
-            input_dim (int): Dimension of the input.
+            input_dim (int): Dimension of the input (embedding dimension).
             output_dim (int): Dimension of the output.
             num_inducing (int): Number of inducing points.
-            kernel (Optional[gpytorch.kernels.Kernel]): Kernel to use. If None, a default RBF kernel is used.
+            kernel (Optional[Kernel]): Kernel to use. If None, uses RandomWalkKernel with cosine similarity.
             device (torch.device): Device to use for computation.
         """
         self.input_dim = input_dim
@@ -148,23 +91,16 @@ class GaussianProcessLayer(ApproximateGP):
         self.num_inducing = num_inducing
         self.device = device
 
-        # Initialize inducing points
         inducing_points = torch.randn(output_dim, num_inducing, input_dim, device=self.device)
 
-        # Set up variational distribution and strategy
         variational_distribution = CholeskyVariationalDistribution(
-            num_inducing_points=num_inducing,
-            batch_shape=torch.Size([output_dim])
+            num_inducing_points=num_inducing, batch_shape=torch.Size([output_dim])
         )
         variational_strategy = VariationalStrategy(
-            self,
-            inducing_points,
-            variational_distribution,
-            learn_inducing_locations=True
+            self, inducing_points, variational_distribution, learn_inducing_locations=True
         )
         super().__init__(variational_strategy)
 
-        # Set up mean and covariance modules
         self.mean_module = ConstantMean(batch_shape=torch.Size([output_dim])).to(self.device)
         self.covar_module = (
             kernel
@@ -175,31 +111,27 @@ class GaussianProcessLayer(ApproximateGP):
             ).to(self.device)
         )
 
-        # Set up likelihood
         self.likelihood = GaussianLikelihood(batch_shape=torch.Size([output_dim])).to(self.device)
-        self.likelihood.noise_covar.raw_noise.data.fill_(-3)  # Initialize with low noise
+        self.likelihood.noise_covar.raw_noise.data.fill_(-3)
 
     def forward(self, x: torch.Tensor) -> MultivariateNormal:
         """
-        Forward pass of the Gaussian Process Layer with data normalization and eigenvalue thresholding.
+        Forward pass of the Gaussian Process Layer.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_dim) or (batch_size * seq_len, input_dim).
+            x (torch.Tensor): Input tensor of shape (batch_size, embedding_dim) representing sentence embeddings.
 
         Returns:
             gpytorch.distributions.MultivariateNormal: The output distribution.
         """
-
         # Normalize the input data
         x = (x - x.mean(dim=0)) / x.std(dim=0)
 
         # Apply eigenvalue thresholding to the inducing points covariance matrix
         with gpytorch.settings.prior_mode(True):
             induc_induc_covar = self.covar_module(self.variational_strategy.inducing_points)
-            # Call _eigenvalue_thresholding on the base_kernel of the ScaleKernel
-            induc_induc_covar = self.covar_module.base_kernel._eigenvalue_thresholding(induc_induc_covar)
 
-        # The rest of the forward pass remains the same
+        # Compute the mean and covariance
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
@@ -309,16 +241,7 @@ class MultiOutputUncertaintyModule(nn.Module):
 
 class RandomWalkKernel(Kernel):
     """
-    Custom kernel implementing a random walk covariance function with numerical stability checks.
-
-    This kernel can be used to model sequential data where the covariance
-    between points depends on their distance in the sequence.
-
-    Attributes:
-        input_dim (int): Dimension of the input.
-        n_steps (int): Number of steps in the random walk.
-        walk_type (str): Type of random walk. Options: "standard", "reflected".
-        eigenvalue_threshold (float): Minimum allowed eigenvalue for the covariance matrix.
+    RandomWalkKernel with cosine similarity and sentence embedding.
     """
 
     def __init__(
@@ -328,6 +251,7 @@ class RandomWalkKernel(Kernel):
             walk_type: str = "standard",
             lengthscale_prior: Optional[torch.distributions.Distribution] = None,
             eigenvalue_threshold: float = 1e-6,
+            sentence_transformer_model_name: str = "all-mpnet-base-v2",
             active_dims: Optional[Tuple[int, ...]] = None,
             **kwargs,
     ):
@@ -335,11 +259,12 @@ class RandomWalkKernel(Kernel):
         Initialize the RandomWalkKernel.
 
         Args:
-            input_dim (int): Dimension of the input.
+            input_dim (int): Dimension of the input (number of tokens in a sentence).
             n_steps (int): Number of steps in the random walk.
             walk_type (str): Type of random walk. Options: "standard", "reflected".
             lengthscale_prior (Optional[torch.distributions.Distribution]): Prior distribution for the lengthscale parameter.
             eigenvalue_threshold (float): Minimum allowed eigenvalue for the covariance matrix.
+            sentence_transformer_model_name (str): Name of the SentenceTransformer model to use.
             active_dims (Optional[Tuple[int, ...]]): See gpytorch.kernels.Kernel
             **kwargs: Additional keyword arguments for the base Kernel class.
         """
@@ -348,6 +273,7 @@ class RandomWalkKernel(Kernel):
         self.n_steps = n_steps
         self.walk_type = walk_type
         self.eigenvalue_threshold = eigenvalue_threshold
+        self.sentence_transformer = SentenceTransformer(sentence_transformer_model_name)
 
         # Use a lengthscale parameter with a prior
         self.register_parameter(
@@ -359,37 +285,22 @@ class RandomWalkKernel(Kernel):
             self.register_prior(
                 "lengthscale_prior",
                 lengthscale_prior,
-                lambda module: module.lengthscale,  # Corrected lambda function
+                lambda module: module.lengthscale,
                 lambda module, value: module._set_lengthscale(value),
             )
 
     @property
     def lengthscale(self) -> Tensor:
-        """
-        Get the lengthscale parameter after applying the constraint.
-
-        Returns:
-            torch.Tensor: The lengthscale parameter.
-        """
+        """Get the lengthscale parameter."""
         return self.raw_lengthscale_constraint.transform(self.raw_lengthscale)
 
     @lengthscale.setter
     def lengthscale(self, value: Tensor):
-        """
-        Set the lengthscale parameter.
-
-        Args:
-            value (torch.Tensor): The new lengthscale value.
-        """
+        """Set the lengthscale parameter."""
         self._set_lengthscale(value)
 
     def _set_lengthscale(self, value: Tensor):
-        """
-        Set the lengthscale parameter after applying the constraint.
-
-        Args:
-            value (torch.Tensor): The new lengthscale value.
-        """
+        """Set the lengthscale parameter after applying the constraint."""
         if not torch.is_tensor(value):
             value = torch.as_tensor(value).to(self.raw_lengthscale)
         self.initialize(
@@ -405,60 +316,56 @@ class RandomWalkKernel(Kernel):
             **params,
     ) -> Tensor:
         """
-        Compute the kernel matrix between inputs x1 and x2 with numerical stability checks.
+        Compute the kernel matrix using cosine similarity on sentence embeddings.
+        """
+        # Ensure embeddings are 3D tensors: (batch_size, seq_len, embedding_dim)
+        if x1.dim() == 2:
+            x1 = x1.unsqueeze(1)
+        if x2.dim() == 2:
+            x2 = x2.unsqueeze(1)
+
+        # Calculate cosine similarity matrix
+        similarity_matrix = self._cosine_similarity(x1, x2)
+
+        # Handle diagonal case
+        if diag:
+            return similarity_matrix.diagonal(dim1=-2, dim2=-1)
+
+        # Apply random walk logic (assuming you want to apply it to the similarity matrix)
+        if self.walk_type == "standard":
+            kernel_matrix = similarity_matrix
+        elif self.walk_type == "reflected":
+            kernel_matrix = self._reflect_distances(similarity_matrix, 10.0)
+        else:
+            raise ValueError(f"Unsupported walk type: {self.walk_type}")
+
+        return kernel_matrix
+
+    def _cosine_similarity(self, x1: Tensor, x2: Tensor) -> Tensor:
+        """Calculate cosine similarity between x1 and x2."""
+        x1_norm = x1 / x1.norm(dim=-1, keepdim=True)
+        x2_norm = x2 / x2.norm(dim=-1, keepdim=True)
+        return torch.bmm(x1_norm, x2_norm.transpose(-2, -1))
+
+    def _embed_sentences(self, sentences: Tensor) -> Tensor:
+        """
+        Embed sentences using the SentenceTransformer model.
 
         Args:
-            x1 (torch.Tensor): First input tensor.
-            x2 (torch.Tensor): Second input tensor.
-            diag (bool): If True, return only the diagonal of the kernel matrix.
-            last_dim_is_batch (bool): If True, the last dimension of the input is treated as the batch dimension.
-            **params: Additional parameters.
+            sentences (torch.Tensor): Tensor of shape (batch_size, seq_len) representing tokenized sentences.
 
         Returns:
-            torch.Tensor: The computed kernel matrix.
+            torch.Tensor: Tensor of shape (batch_size, seq_len, embedding_dim) representing embedded sentences.
         """
-        x1_ = x1.div(self.lengthscale)
-        x2_ = x2.div(self.lengthscale)
+        # Assume sentences is a tensor of token IDs
+        sentences_list = [
+            self.sentence_transformer.tokenizer.decode(sentence, skip_special_tokens=True)
+            for sentence in sentences.tolist()
+        ]
+        return torch.tensor(self.sentence_transformer.encode(sentences_list), device=sentences.device)
 
-        # Use squared Euclidean distance instead of Manhattan distance
-        diff = self.covar_dist(x1_, x2_, square_dist=True, diag=diag, **params)
-
-        if self.walk_type == "reflected":
-            diff = self._reflect_distances(diff, 10.0)
-
-        # Check for NaN or Inf in the distances
-        if torch.isnan(diff).any() or torch.isinf(diff).any():
-            logger.warning("NaN or Inf detected in computed distances. Replacing with small values.")
-            diff = torch.where(torch.isnan(diff) | torch.isinf(diff), torch.tensor(1e-6), diff)
-
-        return diff
-
-    def _eigenvalue_thresholding(self, covar_matrix: Tensor) -> Tensor:
-        """
-        Performs eigenvalue thresholding on the covariance matrix.
-
-        Args:
-            covar_matrix (torch.Tensor): The covariance matrix.
-
-        Returns:
-            torch.Tensor: The covariance matrix with eigenvalues clipped to the threshold.
-        """
-        eigenvalues, eigenvectors = torch.linalg.eigh(covar_matrix)
-        eigenvalues = torch.clamp(eigenvalues, min=self.eigenvalue_threshold)
-        return torch.matmul(torch.matmul(eigenvectors, torch.diag(eigenvalues)), eigenvectors.t())
-
-    @classmethod
-    def _reflect_distances(cls, distances: Tensor, clip_value: float) -> Tensor:
-        """
-        Reflect distances exceeding the clip value.
-
-        Args:
-            distances (torch.Tensor): The distance matrix.
-            clip_value (float): The value at which to reflect the distances.
-
-        Returns:
-            torch.Tensor: The distance matrix with reflected values.
-        """
+    def _reflect_distances(self, distances: Tensor, clip_value: float) -> Tensor:
+        """Reflect distances exceeding the clip value."""
         exceeding_mask = distances > clip_value
         distances[exceeding_mask] = 2 * clip_value - distances[exceeding_mask]
         return distances

@@ -5,7 +5,7 @@ from loguru import logger
 from transformers import StoppingCriteria, BatchEncoding
 from typing import List
 
-from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
+from core.models.uncertainty.uncertainty import UncertainTransformerConfig, UncertainTransformerLMHeadModel
 from core.utils.tokenizer import Tokenizer
 from core.utils.utils import generate_text, calculate_perplexity
 

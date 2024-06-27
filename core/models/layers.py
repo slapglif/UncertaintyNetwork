@@ -149,21 +149,68 @@ class KANFeedForward(nn.Module):
         return x
 
 
+import torch
+import torch.nn as nn
+
+
 class CEMA(nn.Module):
-    def __init__(self, d_model, alpha=0.99):
+    """
+    Cumulative Exponential Moving Average (CEMA) module.
+
+    This module computes a cumulative exponential moving average of the input tensor
+    across the sequence dimension.
+
+    Attributes:
+        d_model (int): The dimension of the model (embedding dimension).
+        alpha (float): The smoothing factor for the exponential moving average.
+        ema (torch.Tensor): The exponential moving average tensor.
+    """
+
+    def __init__(self, d_model: int, alpha: float = 0.99):
+        """
+        Initialize the CEMA module.
+
+        Args:
+            d_model (int): The dimension of the model (embedding dimension).
+            alpha (float, optional): The smoothing factor for the exponential moving average.
+                Defaults to 0.99.
+        """
         super().__init__()
         self.d_model = d_model
         self.alpha = alpha
         self.register_buffer("ema", torch.zeros(1, d_model))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = x.shape
+        """
+        Compute the cumulative exponential moving average of the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_model) with CEMA applied.
+        """
+        batch_size, seq_len, d_model = x.shape
+
+        # Ensure self.ema has the correct shape
+        if self.ema.shape[1] != d_model:
+            self.ema = self.ema.new_zeros(1, d_model)
+
         output = []
+
         for i in range(seq_len):
-            self.ema = self.alpha * self.ema + (1 - self.alpha) * x[:, i, :].mean(
-                dim=0, keepdim=True
-            )
-            output.append(self.ema.expand(batch_size, -1))
+            # Compute the mean across the batch dimension for the current time step
+            current_mean = x[:, i, :].mean(dim=0, keepdim=True)
+
+            # Update the EMA
+            self.ema = self.alpha * self.ema + (1 - self.alpha) * current_mean
+
+            # Expand the EMA to match the batch size
+            expanded_ema = self.ema.expand(batch_size, -1)
+
+            output.append(expanded_ema)
+
+        # Stack the output tensors along the sequence dimension
         return torch.stack(output, dim=1)
 
 

@@ -3,7 +3,7 @@
 import pytest
 import torch
 from core.models.embedding import RotaryPositionEncoding, SentenceGP
-from core.models.uncertainty.uncertain_nn import (
+from core.models.uncertainty.uncertainty import (
     UncertainTransformerConfig,
     UncertainTransformerLMHeadModel,
 )

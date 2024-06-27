@@ -9,7 +9,7 @@ from loguru import logger
 from tqdm import tqdm
 from transformers import PreTrainedModel, StoppingCriteria
 
-from core.models.uncertainty.uncertain_nn import (
+from core.models.uncertainty.uncertainty import (
     UncertainTransformerLMHeadModel,
     UncertainTransformerConfig,
 )

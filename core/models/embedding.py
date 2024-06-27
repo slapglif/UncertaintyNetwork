@@ -1,71 +1,89 @@
-from typing import Optional
-from typing import Tuple, Dict, Any
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from einops import rearrange
 from torch import Tensor
-
-from core.models.kan import SplineNetConv
 class RotaryPositionEncoding(nn.Module):
-    def __init__(self, dim, n_heads, max_position_embeddings=2048, base=10000):
+    def __init__(self, dim: int, n_heads: int, max_position_embeddings: int = 2048, base: int = 10000):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim // n_heads, 2).float() / (dim // n_heads)))
+        self.max_seq_len_cached = max_position_embeddings
+
+        # Calculate the rotary embeddings for each head
+        head_dim = dim // n_heads
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim).to('cuda'))
         self.register_buffer("inv_freq", inv_freq)
 
-        self.max_seq_len_cached = max_position_embeddings
-        t = torch.arange(max_position_embeddings, dtype=torch.float32)
+        t = torch.arange(max_position_embeddings, dtype=torch.float32).to('cuda')
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().view(1, 1, *emb.shape), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().view(1, 1, *emb.shape), persistent=False)
 
-    def forward(self, x, seq_len=None):
-        if seq_len is None:
-            seq_len = x.shape[-2]
+        # Stack the embeddings for each head
+        cos_cached = emb.cos().view(1, max_position_embeddings, 1, head_dim)
+        sin_cached = emb.sin().view(1, max_position_embeddings, 1, head_dim)
+
+        self.register_buffer("cos_cached", cos_cached, persistent=False)
+        self.register_buffer("sin_cached", sin_cached, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq_len = x.shape[1]  # Extract the sequence length from the input tensor
+
         if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len)
+            self.max_seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device, dtype=torch.float32)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1).unsqueeze(0).unsqueeze(2)
+            self.cos_cached = emb.cos()
+            self.sin_cached = emb.sin()
 
-        return (
-            self.cos_cached[:, :, :seq_len, ...].expand(x.shape[0], self.n_heads, -1, -1).requires_grad_(True), # added requires_grad
-            self.sin_cached[:, :, :seq_len, ...].expand(x.shape[0], self.n_heads, -1, -1).requires_grad_(True), # added requires_grad
-        )
+        return self.cos_cached[:, :seq_len, :, :], self.sin_cached[:, :seq_len, :, :]
 
-    def _set_cos_sin_cache(self, seq_len):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1).view(seq_len, -1)
-        self.cos_cached = emb.cos().view(1, 1, seq_len, -1)
-        self.sin_cached = emb.sin().view(1, 1, seq_len, -1)
-
-
-def apply_rotary_pos_emb(x, cos, sin):
-    """Applies rotary positional embeddings to the input tensor.
+def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    Applies rotary positional embeddings to the input tensor using the SUPERHOT approach.
 
     Args:
-        x (torch.Tensor): The input tensor of shape (batch_size, * ,seq_len, d_model).
-        cos (torch.Tensor): The cosine component of the rotary embeddings.
-        sin (torch.Tensor): The sine component of the rotary embeddings.
+        x (torch.Tensor): Input tensor of shape (batch_size, 1, seq_len, embedding_dim) or (batch_size, seq_len, embedding_dim).
+        cos (torch.Tensor): Cosine component of the positional embeddings of shape (1, seq_len, 1, head_dim).
+        sin (torch.Tensor): Sine component of the positional embeddings of shape (1, seq_len, 1, head_dim).
 
     Returns:
-        torch.Tensor: The input tensor with rotary embeddings applied.
+        torch.Tensor: Input tensor with rotary positional embeddings applied, of shape (batch_size, seq_len, embedding_dim).
     """
+    if x.dim() == 4:
+        batch_size, _, seq_len, embedding_dim = x.shape
+        x = x.squeeze(1)  # Remove the extra dimension
+    elif x.dim() == 3:
+        batch_size, seq_len, embedding_dim = x.shape
+    else:
+        raise ValueError(f"Expected input tensor to have 3 or 4 dimensions, but got {x.dim()} dimensions")
+
+    head_dim = cos.shape[-1]
+    num_heads = embedding_dim // (2 * head_dim)
+
     # Reshape for head-wise operation
-    x = rearrange(x, "b ... (h d) -> b h ... d", h=cos.shape[1])
+    x = x.view(batch_size, seq_len, num_heads, 2, head_dim)
+    x1, x2 = x[..., 0, :], x[..., 1, :]
+
+    # Ensure cos and sin have the correct shape
+    cos = cos.view(1, seq_len, 1, head_dim)
+    sin = sin.view(1, seq_len, 1, head_dim)
 
     # Apply rotary embeddings
-    x = (x * cos) + (rotate_half(x) * sin)
+    x_rotated = torch.stack(
+        (x1 * cos - x2 * sin, x1 * sin + x2 * cos),
+        dim=-2
+    )
 
     # Reshape back to original shape
-    x = rearrange(x, "b h ... d -> b ... (h d)")
-    return x
+    x_rotated = x_rotated.view(batch_size, seq_len, embedding_dim)
+
+    return x_rotated
 
 
 def rotate_half(x):
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -128,7 +146,7 @@ kan_config = {
 
 class SentenceGP(nn.Module):
     def __init__(
-        self, input_dim: int, output_dim: int, n_inducing: int, embedding_dim: int
+            self, input_dim: int, output_dim: int, n_inducing: int, embedding_dim: int
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -151,7 +169,7 @@ class SentenceGP(nn.Module):
         return torch.exp(-0.5 * dist / torch.exp(self.log_lengthscale).pow(2))
 
     def forward(
-        self, x: torch.Tensor, num_sentences: Optional[int] = None
+            self, x: torch.Tensor, num_sentences: Optional[int] = None
     ) -> tuple[Tensor, Tensor]:
         batch_size, num_sentences_input, input_dim = x.shape
 

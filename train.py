@@ -15,7 +15,7 @@ from pytorch_lightning.callbacks import (
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from core.data.datamodule import SlimPajamaDataModule
-from core.models.uncertainty.uncertain_nn import (
+from core.models.uncertainty.uncertainty import (
     UncertainTransformerLMHeadModel,
     UncertainTransformerConfig,
 )

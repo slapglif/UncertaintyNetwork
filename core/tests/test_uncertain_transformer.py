@@ -7,7 +7,7 @@ from loguru import logger
 
 from core import Mamba, MambaConfig, check_layer
 from core.models.layers import TransformerEncoderLayer, KANFeedForward
-from core.models.uncertainty.uncertain_nn import UncertainTransformerConfig, UncertainTransformerLMHeadModel
+from core.models.uncertainty.uncertainty import UncertainTransformerConfig, UncertainTransformerLMHeadModel
 
 
 def test_uncertain_transformer():
