@@ -23,13 +23,13 @@ from core.models.kan.spline_layers import SplineNetLayer
 
 class UncertaintyModule(nn.Module):
     def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        n_gp_layers: int = 1,
-        n_inducing: int = 5,
-        dropout_rate: float = 0.1,
-        mc_samples: int = 3,
+            self,
+            input_dim: int,
+            output_dim: int,
+            n_gp_layers: int = 1,
+            n_inducing: int = 5,
+            dropout_rate: float = 0.1,
+            mc_samples: int = 3,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -89,12 +89,12 @@ class UncertaintyModule(nn.Module):
 
 class RandomWalkKernel(Kernel):
     def __init__(
-        self,
-        input_dim: int,
-        n_steps: int = 5,
-        walk_type: str = "standard",
-        lengthscale_prior: Optional[torch.distributions.Distribution] = None,
-        **kwargs,
+            self,
+            input_dim: int,
+            n_steps: int = 5,
+            walk_type: str = "standard",
+            lengthscale_prior: Optional[torch.distributions.Distribution] = None,
+            **kwargs,
     ):
         super().__init__(**kwargs)
         self.input_dim = input_dim
@@ -158,14 +158,14 @@ class GaussianProcessLayer(ApproximateGP):
     """Gaussian Process Layer with data normalization and eigenvalue thresholding."""
 
     def __init__(
-        self,
-        input_dim: int,  # This should now be the embedding dimension
-        output_dim: int,
-        num_inducing: int,
-        kernel: Optional[Kernel] = None,
-        device: torch.device = torch.device(
-            "cuda" if torch.cpu.is_available() else "cpu"
-        ),
+            self,
+            input_dim: int,  # This should now be the embedding dimension
+            output_dim: int,
+            num_inducing: int,
+            kernel: Optional[Kernel] = None,
+            device: torch.device = torch.device(
+                "cuda" if torch.cpu.is_available() else "cpu"
+            ),
     ):
         """
         Initialize the GaussianProcessLayer.
@@ -192,7 +192,6 @@ class GaussianProcessLayer(ApproximateGP):
             inducing_points,
             variational_distribution,
             learn_inducing_locations=True,
-            batch_shape=torch.Size([output_dim]),
         )
         super().__init__(variational_strategy)
 
@@ -208,7 +207,6 @@ class GaussianProcessLayer(ApproximateGP):
                     lengthscale_prior=GammaPrior(3.0, 6.0),
                     batch_shape=torch.Size([output_dim]),
                 ).to(self.device),
-                batch_shape=torch.Size([output_dim]),
             ).to(self.device)
         )
 
@@ -255,14 +253,14 @@ class GaussianProcessLayer(ApproximateGP):
             covar_x = self.covar_module(x).evaluate()
 
         # Reshape mean_x
-        mean_x = mean_x.view(batch_size, seq_len, self.output_dim)
+        mean_x = mean_x.reshape(batch_size * seq_len, self.output_dim)
 
         return MultivariateNormal(mean_x, covar_x)
 
 
 class SplineCritic(nn.Module):
     def __init__(
-        self, input_dim: int, hidden_dims: List[int] = None, num_grids: int = 8
+            self, input_dim: int, hidden_dims: List[int] = None, num_grids: int = 8
     ):
         if hidden_dims is None:
             hidden_dims = [128, 64]
@@ -356,13 +354,13 @@ class TSPEnergyFunction(nn.Module):
     """
 
     def __init__(
-        self,
-        embedding_dim: int,
-        compression_dim: Optional[int] = None,
-        lambda_ib: float = 0.01,
-        device: torch.device = torch.device(
-            "cuda" if torch.cpu.is_available() else "cpu"
-        ),
+            self,
+            embedding_dim: int,
+            compression_dim: Optional[int] = None,
+            lambda_ib: float = 0.01,
+            device: torch.device = torch.device(
+                "cuda" if torch.cpu.is_available() else "cpu"
+            ),
     ):
         """
         Initialize the TSPEnergyFunction.
@@ -444,12 +442,12 @@ class TSPKernel(gpytorch.kernels.Kernel):
         self.energy_function = energy_function
 
     def forward(
-        self,
-        x1: Tensor,
-        x2: Tensor,
-        diag: bool = False,
-        last_dim_is_batch: bool = False,
-        **params,
+            self,
+            x1: Tensor,
+            x2: Tensor,
+            diag: bool = False,
+            last_dim_is_batch: bool = False,
+            **params,
     ) -> Tensor:
         logger.debug(f"TSPKernel input shapes: x1 {x1.shape}, x2 {x2.shape}")
 
@@ -473,7 +471,8 @@ class TSPKernel(gpytorch.kernels.Kernel):
         # Reshape the output to match the expected shape
         batch_size1, seq_len1, _ = x1.shape
         batch_size2, seq_len2, _ = x2.shape
-        output = output.view(batch_size1 * seq_len1, batch_size2 * seq_len2)
+        output = output.view(batch_size1, batch_size2, seq_len1, seq_len2)
+        output = output.squeeze()
 
         return output
 
@@ -518,7 +517,7 @@ class MutualInformationEstimator(nn.Module):
             raise ValueError(f"Input tensor y should be 2D or 3D, got {y.dim()}D")
 
         assert (
-            input_dim == input_dim_y
+                input_dim == input_dim_y
         ), f"Input dimensions of x and y should match, got {input_dim} and {input_dim_y}"
 
         # Ensure x and y have the same sequence length
@@ -599,14 +598,14 @@ class ECELoss(nn.Module):
 
 class UncertaintyAwareLoss(nn.Module):
     def __init__(
-        self, base_loss: str = "cross_entropy", uncertainty_weight: float = 0.1
+            self, base_loss: str = "cross_entropy", uncertainty_weight: float = 0.1
     ):
         super().__init__()
         self.base_loss = base_loss
         self.uncertainty_weight = uncertainty_weight
 
     def forward(
-        self, logits: torch.Tensor, targets: torch.Tensor, uncertainties: torch.Tensor
+            self, logits: torch.Tensor, targets: torch.Tensor, uncertainties: torch.Tensor
     ) -> torch.Tensor:
         if self.base_loss == "cross_entropy":
             base_loss = F.cross_entropy(
@@ -650,14 +649,14 @@ class MultiOutputUncertaintyModule(nn.Module):
     """
 
     def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        n_gp_layers: int = 2,
-        n_inducing: int = 10,
-        dropout_rate: float = 0.1,
-        mc_samples: int = 5,
-        temperature: float = 1.0,
+            self,
+            input_dim: int,
+            output_dim: int,
+            n_gp_layers: int = 2,
+            n_inducing: int = 10,
+            dropout_rate: float = 0.1,
+            mc_samples: int = 5,
+            temperature: float = 1.0,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -732,7 +731,7 @@ class MultiOutputUncertaintyModule(nn.Module):
             mean_uncertainty = _total_uncertainty / self.mc_samples
 
             scaled_mean = mean_output / self.temperature
-            scaled_uncertainty = mean_uncertainty / (self.temperature**2)
+            scaled_uncertainty = mean_uncertainty / (self.temperature ** 2)
 
             return scaled_mean, scaled_uncertainty
         except Exception as e:
