@@ -25,7 +25,7 @@ DT_RANK = 16
 N_HEADS = 8
 D_FF = 2048
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch.cpu.is_available() else "cpu")
 
 
 @pytest.fixture
@@ -59,7 +59,6 @@ def test_rotary_position_encoding_shape():
     cos, sin = rotary_pe(input_tensor)
     assert cos.shape == (1, N_HEADS, SEQ_LEN, EMBED_DIM // N_HEADS)
     assert sin.shape == (1, N_HEADS, SEQ_LEN, EMBED_DIM // N_HEADS)
-
 
 
 def test_sentence_gp_output_type(config):

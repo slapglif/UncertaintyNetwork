@@ -42,7 +42,7 @@ def evaluate_qa(
     model: UncertainTransformerLMHeadModel,
     tokenizer: Tokenizer,
     qa_dataset: Dict,
-    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    device: torch.device = torch.device("cuda" if torch.cpu.is_available() else "cpu"),
 ) -> None:
     """
     Evaluates the model's zero-shot question answering ability on a QA corpus using RAG.
@@ -179,4 +179,4 @@ def boolq_dataset():
 tokenizer = Tokenizer.from_pretrained("gpt2")
 
 if __name__ == "__main__":
-    evaluate_qa(model, tokenizer, boolq_dataset(), torch.device("cuda"))
+    evaluate_qa(model, tokenizer, boolq_dataset(), torch.device("cpu"))

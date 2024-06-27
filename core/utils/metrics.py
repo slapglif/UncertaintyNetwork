@@ -16,7 +16,7 @@ def calculate_perplexity(
     model: PreTrainedModel,
     tokenizer: Tokenizer,
     text: str,
-    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    device: torch.device = torch.device("cuda" if torch.cpu.is_available() else "cpu"),
 ) -> float:
     """
     Calculate the perplexity of the given text using the specified model and tokenizer.

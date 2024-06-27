@@ -362,7 +362,7 @@ class Classification(nn.Module):
             nn.Dropout(0.25),
             SelfAttention(512),
         )
-        self.fc = nn.Linear(512, hidden_dim).to("cuda")  # Move fc to GPU
+        self.fc = nn.Linear(512, hidden_dim).to("cpu")  # Move fc to GPU
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Check for NaN and Inf values

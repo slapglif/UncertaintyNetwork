@@ -1,6 +1,7 @@
 # .\core\utils\utils.py
 
-from typing import Tuple, List, Optional
+from typing import List, Optional, Union
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,9 @@ from core import Mamba
 from core.models.embedding import RotaryPositionEncoding
 from core.models.layers import MultiHeadAttention
 from core.utils.tokenizer import Tokenizer
+
+
+# noinspection PyTypeChecker
 
 
 def _check_nan_inf(tensor: Tensor, message: str):
@@ -39,37 +43,43 @@ def softplus(x: torch.Tensor) -> torch.Tensor:
     return torch.log(1 + torch.exp(x))
 
 
-# noinspection PyTypeChecker
 @torch.inference_mode()
 def generate_text(
-        model: PreTrainedModel,
-        tokenizer: Tokenizer,
-        prompt: str,
-        max_length: int = 100,
-        temperature: float = 1.13,
-        top_k: int = 49,
-        top_p: float = 0.18,
-        repetition_penalty: float = 1.8,
-        num_return_sequences: int = 1,
-        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        generation_config: Optional[GenerationConfig] = None,
+    model: PreTrainedModel,
+    tokenizer: Tokenizer,
+    prompt: Union[str, List[str]],
+    max_length: int = 100,
+    temperature: float = 1.13,
+    top_k: int = 49,
+    top_p: float = 0.18,
+    repetition_penalty: float = 1.8,
+    num_return_sequences: int = 1,
+    device: Optional[torch.device] = None,
+    generation_config: Optional[GenerationConfig] = None,
+    seed: Optional[int] = None,
+    **kwargs,
 ) -> List[str]:
     """
     Generates text using the specified model and tokenizer with given parameters.
 
+    This function uses advanced sampling techniques, including temperature scaling,
+    top-k filtering, and nucleus (top-p) sampling to generate diverse and coherent text.
+    It also implements error handling, logging, and optional seeding for reproducibility.
+
     Args:
         model (PreTrainedModel): The pre-trained language model.
         tokenizer (Tokenizer): The tokenizer for encoding and decoding text.
-        prompt (str): The input prompt to generate text from.
+        prompt (Union[str, List[str]]): The input prompt(s) to generate text from.
         max_length (int, optional): The maximum length of the generated text. Defaults to 100.
         temperature (float, optional): The temperature parameter for sampling. Defaults to 1.13.
         top_k (int, optional): The number of top-k tokens to consider for sampling. Defaults to 49.
         top_p (float, optional): The probability threshold for nucleus sampling. Defaults to 0.18.
         repetition_penalty (float, optional): The repetition penalty. Defaults to 1.8.
         num_return_sequences (int, optional): The number of sequences to generate for each prompt. Defaults to 1.
-        device (torch.device, optional): The device to run the model on. Defaults to CUDA if available, else CPU.
+        device (torch.device, optional): The device to run the model on. If None, uses CUDA if available, else CPU.
         generation_config (GenerationConfig, optional): A GenerationConfig object to override default generation parameters.
-            Defaults to None.
+        seed (int, optional): Random seed for reproducibility. If None, no seed is set.
+        **kwargs: Additional keyword arguments to pass to the model's generate method.
 
     Returns:
         List[str]: A list of generated texts.
@@ -77,6 +87,13 @@ def generate_text(
     Raises:
         ValueError: If the input prompt is empty or if the model or tokenizer are not properly initialized.
         RuntimeError: If there's an error during the text generation process.
+
+    Example:
+        >>> model = YourPreTrainedModel.from_pretrained("model_name")
+        >>> tokenizer = Tokenizer.from_pretrained("tokenizer_name")
+        >>> prompt = "Once upon a time"
+        >>> generated_texts = generate_text(model, tokenizer, prompt, max_length=200)
+        >>> print(generated_texts[0])
     """
     if not prompt:
         raise ValueError("Input prompt cannot be empty.")
@@ -87,12 +104,21 @@ def generate_text(
     if not isinstance(tokenizer, Tokenizer):
         raise ValueError("Invalid tokenizer type. Expected a Tokenizer instance.")
 
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     model.to(device)
     model.eval()
 
     try:
         logger.info(f"Encoding prompt: {prompt}")
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+        if isinstance(prompt, str):
+            prompt = [prompt]
+
+        input_ids = tokenizer.batch_encode_plus(
+            prompt, padding=True, truncation=True, return_tensors="pt"
+        )["input_ids"].to(device)
+
         logger.debug(f"Input IDs shape: {input_ids.shape}, device: {input_ids.device}")
 
         attention_mask = torch.ones_like(input_ids)
@@ -110,32 +136,41 @@ def generate_text(
                 do_sample=True,
             )
 
-        logger.info(f"Starting text generation with generation config: {generation_config}")
+        logger.info(
+            f"Starting text generation with generation config: {generation_config}"
+        )
 
-        # Set the random seed for reproducibility
-        torch.manual_seed(42)
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
 
         with torch.no_grad():
             outputs = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 generation_config=generation_config,
+                **kwargs,
             )
 
         logger.info("Text generation completed")
+
+        generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
         # Clear CUDA cache to free up memory
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        return generated_texts
 
     except Exception as e:
         logger.exception(f"Error during text generation: {str(e)}")
         raise RuntimeError(f"Text generation failed: {str(e)}") from e
 
 
-def calculate_perplexity(model: PreTrainedModel, tokenizer: Tokenizer, text: str, device: torch.device) -> float:
+def calculate_perplexity(
+    model: PreTrainedModel, tokenizer: Tokenizer, text: str, device: torch.device
+) -> float:
     """
     Calculate the perplexity of the given text using the specified model and tokenizer.
 
@@ -165,12 +200,16 @@ def calculate_perplexity(model: PreTrainedModel, tokenizer: Tokenizer, text: str
 def check_shapes(tensors, expected_shapes, names):
     for tensor, expected_shape, name in zip(tensors, expected_shapes, names):
         assert (
-                tensor.shape == expected_shape
+            tensor.shape == expected_shape
         ), f"{name} shape mismatch: expected {expected_shape}, got {tensor.shape}"
 
 
-def check_layer(layer: nn.Module, input_shape: Tuple[int, ...], expected_output_shape: Tuple[int, ...],
-                device: torch.device = torch.device("cuda" if torch.cuda.is_available() else 'cpu')):
+def check_layer(
+    layer: nn.Module,
+    input_shape: Tuple[int, ...],
+    expected_output_shape: Tuple[int, ...],
+    device: torch.device = torch.device("cuda" if torch.cpu.is_available() else "cpu"),
+):
     """
     Check the forward and backward pass of a single layer.
 
@@ -184,7 +223,9 @@ def check_layer(layer: nn.Module, input_shape: Tuple[int, ...], expected_output_
 
     # Prepare input tensor
     if isinstance(layer, nn.Embedding):
-        input_tensor = torch.randint(0, layer.num_embeddings, input_shape, device=device)
+        input_tensor = torch.randint(
+            0, layer.num_embeddings, input_shape, device=device
+        )
     else:
         input_tensor = torch.randn(input_shape, device=device, requires_grad=True)
 
@@ -208,7 +249,9 @@ def check_layer(layer: nn.Module, input_shape: Tuple[int, ...], expected_output_
     if isinstance(output, tuple):
         output = output[0]
 
-    assert output.shape == expected_output_shape, f"Output shape mismatch for {layer.__class__.__name__}: expected {expected_output_shape}, got {output.shape}"
+    assert (
+        output.shape == expected_output_shape
+    ), f"Output shape mismatch for {layer.__class__.__name__}: expected {expected_output_shape}, got {output.shape}"
 
     # Backward pass
     try:
@@ -216,12 +259,20 @@ def check_layer(layer: nn.Module, input_shape: Tuple[int, ...], expected_output_
         output.sum().backward(retain_graph=True)
 
         for name, param in layer.named_parameters():
-            assert param.grad is not None, f"Gradient is None for parameter {name} in {layer.__class__.__name__}"
-            assert torch.sum(
-                param.grad ** 2) > 0, f"Gradient is zero for parameter {name} in {layer.__class__.__name__}"
+            assert (
+                param.grad is not None
+            ), f"Gradient is None for parameter {name} in {layer.__class__.__name__}"
+            assert (
+                torch.sum(param.grad**2) > 0
+            ), f"Gradient is zero for parameter {name} in {layer.__class__.__name__}"
     except RuntimeError as e:
-        if "one of the variables needed for gradient computation has been modified by an inplace operation" in str(e):
-            logger.warning(f"In-place operation detected in {layer.__class__.__name__}. Skipping gradient check.")
+        if (
+            "one of the variables needed for gradient computation has been modified by an inplace operation"
+            in str(e)
+        ):
+            logger.warning(
+                f"In-place operation detected in {layer.__class__.__name__}. Skipping gradient check."
+            )
         else:
             raise e
 

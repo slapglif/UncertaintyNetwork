@@ -11,7 +11,7 @@ def total_uncertainty(epistemic: torch.Tensor, aleatoric: torch.Tensor) -> torch
 
 
 def out_of_distribution_detection(
-        in_dist_uncertainties: torch.Tensor, out_dist_uncertainties: torch.Tensor
+    in_dist_uncertainties: torch.Tensor, out_dist_uncertainties: torch.Tensor
 ) -> Tuple[float, float]:
     """
     Perform out-of-distribution detection using uncertainty estimates.
@@ -40,7 +40,7 @@ def out_of_distribution_detection(
 
 
 def uncertainty_weighted_loss(
-        loss: torch.Tensor, uncertainty: torch.Tensor
+    loss: torch.Tensor, uncertainty: torch.Tensor
 ) -> torch.Tensor:
     """
     Compute uncertainty-weighted loss.
@@ -84,8 +84,9 @@ def entropy(probs: torch.Tensor) -> torch.Tensor:
     return -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
 
 
-def uncertainty_decomposition(_total_uncertainty: torch.Tensor, aleatoric_uncertainty: torch.Tensor) -> Tuple[
-    torch.Tensor, torch.Tensor]:
+def uncertainty_decomposition(
+    _total_uncertainty: torch.Tensor, aleatoric_uncertainty: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Decompose total uncertainty into aleatoric and epistemic components.
 
@@ -101,8 +102,8 @@ def uncertainty_decomposition(_total_uncertainty: torch.Tensor, aleatoric_uncert
 
 
 def diagnose_positive_definite_error(
-        gp_layer: gpytorch.models.ApproximateGP,
-        x: torch.Tensor,
+    gp_layer: gpytorch.models.ApproximateGP,
+    x: torch.Tensor,
 ):
     """
     Diagnose the "Matrix not positive definite" error in a GaussianProcessLayer.
@@ -131,12 +132,18 @@ def diagnose_positive_definite_error(
 
     # 3. Covariance Matrix Information
     with gpytorch.settings.prior_mode(True):
-        induc_induc_covar = gp_layer.covar_module(gp_layer.variational_strategy.inducing_points)
+        induc_induc_covar = gp_layer.covar_module(
+            gp_layer.variational_strategy.inducing_points
+        )
 
     logger.info("Covariance Matrix Information:")
     logger.info(f"  Inducing points covariance matrix shape: {induc_induc_covar.shape}")
-    logger.info(f"  Minimum eigenvalue: {torch.linalg.eigvalsh(induc_induc_covar).min().item()}")
-    logger.info(f"  Maximum eigenvalue: {torch.linalg.eigvalsh(induc_induc_covar).max().item()}")
+    logger.info(
+        f"  Minimum eigenvalue: {torch.linalg.eigvalsh(induc_induc_covar).min().item()}"
+    )
+    logger.info(
+        f"  Maximum eigenvalue: {torch.linalg.eigvalsh(induc_induc_covar).max().item()}"
+    )
     # logger.info(f"  Trace of the covariance matrix: {torch.trace(induc_induc_covar).item()}")
     # logger.info(f"  Are there NaN values in the covariance matrix: {torch.isnan(induc_induc_covar).any().item()}")
     # logger.info(f"  Are there Inf values in the covariance matrix: {torch.isinf(induc_induc_covar).any().item()}")

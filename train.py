@@ -69,7 +69,7 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         return self.model(input_ids, attention_mask=attention_mask, labels=labels)
 
     def training_step(
-            self, batch: Dict[str, torch.Tensor], batch_idx: int
+        self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
         outputs, uncertainty = self(**batch)
         loss = outputs.loss
@@ -89,7 +89,7 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         return weighted_loss
 
     def validation_step(
-            self, batch: Dict[str, torch.Tensor], batch_idx: int
+        self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> Dict[str, torch.Tensor]:
         outputs, uncertainty = self(**batch)
         loss = outputs.loss
@@ -219,7 +219,7 @@ def main():
         max_epochs=hparams["max_epochs"],
         callbacks=[checkpoint_callback, early_stop_callback, lr_monitor],
         logger=tb_logger,
-        precision="16-mixed" if torch.cuda.is_available() else 32,
+        precision="16-mixed" if torch.cpu.is_available() else 32,
         accumulate_grad_batches=hparams["accumulate_grad_batches"],
         gradient_clip_val=1.0,
         log_every_n_steps=10,

@@ -6,6 +6,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+import torch.nn.functional as F
+from einops import rearrange, repeat
+
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -15,89 +19,36 @@ class MultiHeadAttention(nn.Module):
         self.window_size = config.sliding_window_size
         self.device = config.device
 
-        self.W_q = nn.Linear(config.d_model, config.d_model).to(self.device)
-        self.W_k = nn.Linear(config.d_model, config.d_model).to(self.device)
-        self.W_v = nn.Linear(config.d_model, config.d_model).to(self.device)
-        self.W_o = nn.Linear(config.d_model, config.d_model).to(self.device)
+        self.to_qkv = nn.Linear(config.d_model, 3 * config.d_model)
+        self.to_out = nn.Linear(config.d_model, config.d_model)
 
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x, attention_mask=None, use_cache=False, **kwargs):
-        # Reshape x if necessary
-        original_shape = x.shape
-        if x.dim() == 2:
-            x = x.unsqueeze(0)
+        b, n, _ = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(
+            lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.n_heads), qkv
+        )
 
-        batch_size, seq_len, _ = x.shape
-        print(f"Input shape: {x.shape}")
+        dots = torch.einsum("bhid,bhjd->bhij", q, k) * (self.d_k**-0.5)
 
-        # Linear projections
-        q = self.W_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        k = self.W_k(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        v = self.W_v(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        print(f"Q shape: {q.shape}, K shape: {k.shape}, V shape: {v.shape}")
-
-        # Compute attention scores
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
-        print(f"Attention scores shape: {attn_scores.shape}")
-
-        # Apply sliding window attention
-        if self.window_size < seq_len:
-            attn_scores = self._apply_sliding_window_attention(attn_scores)
-
-        # Apply attention mask if provided
         if attention_mask is not None:
-            if attention_mask.dim() == 2:
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            elif attention_mask.dim() == 3:
-                attention_mask = attention_mask.unsqueeze(1)
-            elif attention_mask.dim() == 4:
-                # Ensure the mask matches the batch size of our input
-                if attention_mask.size(0) != batch_size:
-                    attention_mask = attention_mask[:batch_size]
+            mask = rearrange(attention_mask, "b j -> b 1 1 j")
+            dots = dots.masked_fill(mask == 0, float("-inf"))
 
-            # Ensure the mask matches the attention scores shape
-            if attention_mask.size(-1) != seq_len:
-                attention_mask = F.pad(attention_mask, (0, seq_len - attention_mask.size(-1)), value=1)
+        attn = F.softmax(dots, dim=-1)
+        attn = self.dropout(attn)
 
-            attn_scores = attn_scores.masked_fill(attention_mask == 0, float("-inf"))
+        out = torch.einsum("bhij,bhjd->bhid", attn, v)
+        out = rearrange(out, "b h n d -> b n (h d)")
+        out = self.to_out(out)
 
-        # Compute attention probabilities
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_probs = self.dropout(attn_probs)
-        print(f"Attention probabilities shape: {attn_probs.shape}")
+        return out, attn if use_cache else out
 
-        # Ensure attn_probs has the same batch size as the input
-        if attn_probs.size(0) != batch_size:
-            attn_probs = attn_probs[:batch_size]
-
-        # Compute output
-        attn_output = torch.matmul(attn_probs, v)
-        print(f"Attention output shape: {attn_output.shape}")
-
-        # Reshape attn_output to match expected dimensions
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        print(f"Transposed attention output shape: {attn_output.shape}")
-
-        output = attn_output.view(batch_size, seq_len, self.d_model)
-        print(f"Reshaped output shape: {output.shape}")
-
-        output = self.W_o(output)
-        print(f"Final output shape: {output.shape}")
-
-        # Ensure output has the same shape as input
-        if output.shape != x.shape:
-            output = F.pad(output, (0, 0, 0, x.size(1) - output.size(1), 0, 0))
-
-        # Reshape back to original shape if necessary
-        if original_shape != output.shape:
-            output = output.view(original_shape)
-
-        print(f"MultiHeadAttention input shape: {x.shape}, output shape: {output.shape}")
-
-        return output, None  # (output, attn_probs) if use_cache else (output, None)
-
-    def _apply_sliding_window_attention(self, attn_scores: torch.Tensor) -> torch.Tensor:
+    def _apply_sliding_window_attention(
+        self, attn_scores: torch.Tensor
+    ) -> torch.Tensor:
         """
         Applies sliding window attention to the attention scores.
 
@@ -135,22 +86,26 @@ class MultiHeadAttention(nn.Module):
 class KANFeedForward(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.device = 'cuda'
+        self.device = "cuda"
         self.fc1 = nn.Linear(config.d_model, config.d_ff).to(self.device)
         self.fc2 = nn.Linear(config.d_ff, config.d_model).to(self.device)
         self.activation = nn.ReLU()
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
+        original_shape = x.shape
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+
         x = self.fc1(x)
         x = self.activation(x)
         x = self.dropout(x)
         x = self.fc2(x)
+
+        # Ensure output has the same shape as input
+        x = x.view(original_shape)
+
         return x
-
-
-import torch
-import torch.nn as nn
 
 
 class CEMA(nn.Module):
@@ -221,23 +176,22 @@ class TransformerEncoderLayer(nn.Module):
         self.feed_forward = nn.Sequential(
             nn.Linear(config.d_model, config.d_ff).to(config.device),
             nn.ReLU(),
-            nn.Linear(config.d_ff, config.d_model).to(config.device)
+            nn.Linear(config.d_ff, config.d_model).to(config.device),
         )
         self.norm1 = nn.LayerNorm(config.d_model)
         self.norm2 = nn.LayerNorm(config.d_model)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x, attention_mask=None):
-        # Reshape x if necessary
+        # Save original shape
         original_shape = x.shape
+
+        # Ensure x is 3D: [batch_size, seq_len, d_model]
         if x.dim() == 2:
             x = x.unsqueeze(0)
 
+        # Multi-head attention
         attn_output, _ = self.attention(x, attention_mask=attention_mask)
-
-        # Ensure attn_output has the same shape as x
-        if attn_output.shape != x.shape:
-            attn_output = F.pad(attn_output, (0, 0, 0, x.size(1) - attn_output.size(1), 0, 0))
 
         # Add and norm
         x = self.norm1(x + self.dropout(attn_output))
@@ -246,8 +200,8 @@ class TransformerEncoderLayer(nn.Module):
         ff_output = self.feed_forward(x)
         x = self.norm2(x + self.dropout(ff_output))
 
-        # Reshape back to original shape if necessary
-        if original_shape != x.shape:
+        # Ensure output shape matches input shape
+        if x.shape != original_shape:
             x = x.view(original_shape)
 
         return x
@@ -293,13 +247,13 @@ class BayesianLinear(nn.Module):
 
     @staticmethod
     def _kl_divergence(
-            mu: torch.Tensor, std: torch.Tensor, prior_std: float
+        mu: torch.Tensor, std: torch.Tensor, prior_std: float
     ) -> torch.Tensor:
         kl = 0.5 * (
-                2 * torch.log(prior_std / std)
-                - 1
-                + (std / prior_std).pow(2)
-                + (mu / prior_std).pow(2)
+            2 * torch.log(prior_std / std)
+            - 1
+            + (std / prior_std).pow(2)
+            + (mu / prior_std).pow(2)
         )
         return kl.sum()
 

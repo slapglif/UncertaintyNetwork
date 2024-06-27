@@ -1,28 +1,75 @@
 from typing import List, Any
 
 import torch
-from transformers import GPT2Tokenizer, BatchEncoding
+from transformers import GPT2Tokenizer, BatchEncoding, GemmaTokenizer
 
 
 class Tokenizer:
-    def __init__(self, pretrained_tokenizer: str = "gpt2", vocab_size: int = 50257):
+    """
+    A class to handle tokenization using either GPT-2 or Gemma tokenizers.
+
+    This class provides a unified interface for tokenizing text using either the
+    pretrained GPT-2 tokenizer or the Gemma tokenizer from KerasNLP. It allows
+    for encoding and decoding text, accessing vocabulary, and setting special tokens.
+
+    Attributes:
+        tokenizer: The underlying tokenizer object (either GPT2Tokenizer or GemmaTokenizer).
+        vocab_size: The vocabulary size of the tokenizer.
+        pad_token_id: The ID of the padding token.
+        eos_token_id: The ID of the end-of-sequence token.
+        bos_token_id: The ID of the beginning-of-sequence token.
+    """
+
+    def __init__(
+        self, pretrained_tokenizer: str = "google/gemma-2b", vocab_size: int = 256128
+    ):
         """
         Initialize the Tokenizer class.
 
         Args:
-            pretrained_tokenizer (str, optional): The name of the pretrained tokenizer. Defaults to "gpt2".
+            pretrained_tokenizer (str, optional): The name of the pretrained tokenizer.
+                Can be either "gpt2" or a Gemma preset name (e.g., "gemma_2b_en").
+                Defaults to "gpt2".
             vocab_size (int, optional): The vocabulary size. Defaults to 50257.
+                This is used only for GPT-2; Gemma tokenizers have fixed vocab sizes.
         """
-        self.tokenizer = GPT2Tokenizer.from_pretrained(pretrained_tokenizer,  # Initialize with the full GPT-2 vocabulary
-                                                       vocab_size=vocab_size)  # Ensure the vocab_size matches the GPT-2 tokenizer
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        if pretrained_tokenizer == "gpt2":
+            vocab_size = 50257
+            self.tokenizer = GPT2Tokenizer.from_pretrained(
+                pretrained_tokenizer,  # Initialize with the full GPT-2 vocabulary
+                vocab_size=vocab_size,
+            )  # Ensure the vocab_size matches the GPT-2 tokenizer
+        else:
+            # Initialize Gemma tokenizer from the specified preset
+            self.tokenizer = GemmaTokenizer.from_pretrained(
+                pretrained_tokenizer, vocab_size=vocab_size
+            )
+
+        self.tokenizer.pad_token = (
+            self.tokenizer.eos_token
+        )  # Set pad token to eos token
         self.vocab_size = vocab_size
         self.pad_token_id = self.tokenizer.pad_token_id
         self.eos_token_id = self.tokenizer.eos_token_id
         self.bos_token_id = self.tokenizer.bos_token_id
 
-    def encode(self, text: str, add_special_tokens: bool = True, **kwargs) -> List[int] | BatchEncoding :
-        return self.tokenizer.encode_plus(text, add_special_tokens=add_special_tokens, **kwargs)
+    def encode(
+        self, text: str, add_special_tokens: bool = True, **kwargs
+    ) -> List[int] | BatchEncoding:
+        """
+        Encode the given text into a list of token IDs.
+
+        Args:
+            text (str): The text to encode.
+            add_special_tokens (bool, optional): Whether to add special tokens (BOS, EOS) to the encoded sequence. Defaults to True.
+            **kwargs: Additional arguments to pass to the tokenizer's encode_plus method.
+
+        Returns:
+            List[int] | BatchEncoding: The encoded token IDs or a BatchEncoding object (depending on the tokenizer).
+        """
+        return self.tokenizer.encode_plus(
+            text, add_special_tokens=add_special_tokens, **kwargs
+        )
 
     def decode(self, token_ids: torch.Tensor, **kwargs):
         """
@@ -37,7 +84,9 @@ class Tokenizer:
         """
         return self.tokenizer.decode(token_ids.tolist(), **kwargs)
 
-    def batch_decode(self, token_ids_batch: List[torch.Tensor] | torch.Tensor, **kwargs):
+    def batch_decode(
+        self, token_ids_batch: List[torch.Tensor] | torch.Tensor, **kwargs
+    ):
         """
         Decode a batch of token IDs back into text.
 
@@ -54,15 +103,24 @@ class Tokenizer:
 
     @property
     def pad_token(self):
+        """
+        Get the padding token.
+        """
         return self.tokenizer.pad_token
 
     @pad_token.setter
     def pad_token(self, value):
+        """
+        Set the padding token.
+        """
         self.tokenizer.pad_token = value
         self.pad_token_id = self.tokenizer.pad_token_id
 
     @property
     def eos_token(self):
+        """
+        Get the end-of-sequence token.
+        """
         return self.tokenizer.eos_token
 
     def tokenize(self, text: str, **kwargs):

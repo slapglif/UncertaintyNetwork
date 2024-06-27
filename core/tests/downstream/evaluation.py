@@ -60,7 +60,7 @@ def evaluate_model(
     checkpoint_path: Optional[str] = None,
     max_length: int = 100,
     num_return_sequences: int = 1,
-    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    device: torch.device = torch.device("cuda" if torch.cpu.is_available() else "cpu"),
 ) -> None:
     """
     Evaluate the model's performance on a set of prompts.
@@ -209,7 +209,7 @@ def main():
         )
 
     # Set the device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cpu.is_available() else "cpu")
     model.to(device)
 
     # Define the evaluation prompts

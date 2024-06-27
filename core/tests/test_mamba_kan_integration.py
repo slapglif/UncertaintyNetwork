@@ -3,14 +3,17 @@ import os
 import pytest
 import torch
 
-from core.models.uncertainty.uncertainty import UncertainTransformerConfig, UncertainTransformerLMHeadModel
+from core.models.uncertainty.uncertainty import (
+    UncertainTransformerConfig,
+    UncertainTransformerLMHeadModel,
+)
 from core.utils.tokenizer import Tokenizer
 
 # Constants
 BATCH_SIZE = 2
 SEQ_LEN = 10
 VOCAB_SIZE = 1000  # Reduced for testing
-D_MODEL = 512
+D_MODEL = 2048
 N_HEADS = 8
 N_LAYERS = 2  # Reduced for faster testing
 D_FF = 2048
@@ -23,10 +26,10 @@ NUM_RETURN_SEQUENCES = 1
 NUM_MC_SAMPLES = 3  # Reduced for faster testing
 
 # Set CUDA_LAUNCH_BLOCKING for debugging
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 # Device to use for testing
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch.cpu.is_available() else "cpu")
 
 
 @pytest.fixture(scope="module")
@@ -62,10 +65,10 @@ def tokenizer() -> Tokenizer:
 
 
 def test_model_generation_with_uncertainty(
-        model: UncertainTransformerLMHeadModel,
-        tokenizer: Tokenizer,
-        max_length: int = MAX_LENGTH,
-        num_return_sequences: int = NUM_RETURN_SEQUENCES
+    model: UncertainTransformerLMHeadModel,
+    tokenizer: Tokenizer,
+    max_length: int = MAX_LENGTH,
+    num_return_sequences: int = NUM_RETURN_SEQUENCES,
 ) -> None:
     try:
         model.eval()

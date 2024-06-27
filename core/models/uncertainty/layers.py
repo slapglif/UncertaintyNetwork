@@ -1,3 +1,4 @@
+# .\core\models\uncertainty\layers.py
 import math
 from typing import Optional
 from typing import Tuple, List
@@ -14,7 +15,6 @@ from gpytorch.models import ApproximateGP
 from gpytorch.priors import GammaPrior
 from gpytorch.variational import CholeskyVariationalDistribution, VariationalStrategy
 from loguru import logger
-from sentence_transformers import SentenceTransformer
 from torch import Tensor
 from torch import nn
 
@@ -22,21 +22,38 @@ from core.models.kan.spline_layers import SplineNetLayer
 
 
 class UncertaintyModule(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, n_gp_layers: int = 1, n_inducing: int = 5,
-                 dropout_rate: float = 0.1, mc_samples: int = 3):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        n_gp_layers: int = 1,
+        n_inducing: int = 5,
+        dropout_rate: float = 0.1,
+        mc_samples: int = 3,
+    ):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.mc_samples = mc_samples
 
-        self.gp_layers = nn.ModuleList([
-            GaussianProcessLayer(input_dim, output_dim, n_inducing)
-            for _ in range(n_gp_layers)
-        ])
+        self.gp_layers = nn.ModuleList(
+            [
+                GaussianProcessLayer(input_dim, output_dim, n_inducing)
+                for _ in range(n_gp_layers)
+            ]
+        )
         self.mc_dropout = nn.Dropout(p=dropout_rate)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, seq_len, _ = x.shape
+        original_shape = x.shape
+        if x.dim() == 2:
+            batch_size, seq_len = 1, x.shape[0]
+            x = x.unsqueeze(0)
+        elif x.dim() == 3:
+            batch_size, seq_len, _ = x.shape
+        else:
+            raise ValueError(f"Expected 2D or 3D input, got shape {x.shape}")
+
         x = x.view(-1, self.input_dim)
 
         total_mean = None
@@ -62,19 +79,93 @@ class UncertaintyModule(nn.Module):
         mean_output = mean_output.view(batch_size, seq_len, -1)
         uncertainty = uncertainty.view(batch_size, seq_len, -1)
 
+        # Restore original shape if input was 2D
+        if original_shape == mean_output.shape[1:]:
+            mean_output = mean_output.squeeze(0)
+            uncertainty = uncertainty.squeeze(0)
+
         return mean_output, uncertainty
+
+
+class RandomWalkKernel(Kernel):
+    def __init__(
+        self,
+        input_dim: int,
+        n_steps: int = 5,
+        walk_type: str = "standard",
+        lengthscale_prior: Optional[torch.distributions.Distribution] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.input_dim = input_dim
+        self.n_steps = n_steps
+        self.walk_type = walk_type
+
+        self.register_parameter(
+            name="raw_lengthscale",
+            parameter=torch.nn.Parameter(torch.ones(1, input_dim)),
+        )
+        self.register_constraint("raw_lengthscale", Positive())
+
+        if lengthscale_prior is not None:
+            self.register_prior(
+                "lengthscale_prior",
+                lengthscale_prior,
+                lambda m: m.lengthscale,
+                lambda m, v: m._set_lengthscale(v),
+            )
+
+    @property
+    def lengthscale(self):
+        return self.raw_lengthscale_constraint.transform(self.raw_lengthscale)
+
+    @lengthscale.setter
+    def lengthscale(self, value):
+        self._set_lengthscale(value)
+
+    def _set_lengthscale(self, value):
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value).to(self.raw_lengthscale)
+        self.initialize(
+            raw_lengthscale=self.raw_lengthscale_constraint.inverse_transform(value)
+        )
+
+    def forward(self, x1, x2, diag=False, last_dim_is_batch=False, **params):
+        x1_ = x1.div(self.lengthscale)
+        x2_ = x2.div(self.lengthscale)
+
+        if self.walk_type == "standard":
+            diff = self.covar_dist(x1_, x2_, square_dist=True)
+        elif self.walk_type == "reflected":
+            diff = self._reflect_distances(self.covar_dist(x1_, x2_, square_dist=True))
+        else:
+            raise ValueError(f"Unsupported walk type: {self.walk_type}")
+
+        # Ensure positive semi-definiteness
+        output = torch.exp(-diff / 2)
+
+        if diag:
+            return output.diagonal(dim1=-2, dim2=-1)
+        return output
+
+    def _reflect_distances(self, distances, clip_value=10.0):
+        return torch.where(
+            distances > clip_value, 2 * clip_value - distances, distances
+        )
 
 
 class GaussianProcessLayer(ApproximateGP):
     """Gaussian Process Layer with data normalization and eigenvalue thresholding."""
 
     def __init__(
-            self,
-            input_dim: int,  # This should now be the embedding dimension
-            output_dim: int,
-            num_inducing: int,
-            kernel: Optional[Kernel] = None,
-            device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        self,
+        input_dim: int,  # This should now be the embedding dimension
+        output_dim: int,
+        num_inducing: int,
+        kernel: Optional[Kernel] = None,
+        device: torch.device = torch.device(
+            "cuda" if torch.cpu.is_available() else "cpu"
+        ),
     ):
         """
         Initialize the GaussianProcessLayer.
@@ -91,27 +182,39 @@ class GaussianProcessLayer(ApproximateGP):
         self.num_inducing = num_inducing
         self.device = device
 
-        inducing_points = torch.randn(output_dim, num_inducing, input_dim, device=self.device)
+        inducing_points = torch.randn(num_inducing, input_dim, device=self.device)
 
         variational_distribution = CholeskyVariationalDistribution(
             num_inducing_points=num_inducing, batch_shape=torch.Size([output_dim])
         )
         variational_strategy = VariationalStrategy(
-            self, inducing_points, variational_distribution, learn_inducing_locations=True
+            self,
+            inducing_points,
+            variational_distribution,
+            learn_inducing_locations=True,
+            batch_shape=torch.Size([output_dim]),
         )
         super().__init__(variational_strategy)
 
-        self.mean_module = ConstantMean(batch_shape=torch.Size([output_dim])).to(self.device)
+        self.mean_module = ConstantMean(batch_shape=torch.Size([output_dim])).to(
+            self.device
+        )
         self.covar_module = (
             kernel
             if kernel is not None
             else ScaleKernel(
-                RandomWalkKernel(input_dim, lengthscale_prior=GammaPrior(3.0, 6.0)).to(self.device),
+                RandomWalkKernel(
+                    input_dim,
+                    lengthscale_prior=GammaPrior(3.0, 6.0),
+                    batch_shape=torch.Size([output_dim]),
+                ).to(self.device),
                 batch_shape=torch.Size([output_dim]),
             ).to(self.device)
         )
 
-        self.likelihood = GaussianLikelihood(batch_shape=torch.Size([output_dim])).to(self.device)
+        self.likelihood = GaussianLikelihood(batch_shape=torch.Size([output_dim])).to(
+            self.device
+        )
         self.likelihood.noise_covar.raw_noise.data.fill_(-3)
 
     def forward(self, x: torch.Tensor) -> MultivariateNormal:
@@ -124,255 +227,43 @@ class GaussianProcessLayer(ApproximateGP):
         Returns:
             gpytorch.distributions.MultivariateNormal: The output distribution.
         """
+        if x.dim() == 3:
+            batch_size, seq_len, _ = x.shape
+            x = x.view(-1, self.input_dim)
+        elif x.dim() == 2:
+            batch_size = x.size(0)
+            seq_len = 1
+        else:
+            raise ValueError(f"Expected 2D or 3D input, got {x.dim()}D")
+
         # Normalize the input data
-        x = (x - x.mean(dim=0)) / x.std(dim=0)
+        x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-8)
 
         # Apply eigenvalue thresholding to the inducing points covariance matrix
         with gpytorch.settings.prior_mode(True):
-            induc_induc_covar = self.covar_module(self.variational_strategy.inducing_points)
+            induc_induc_covar = self.covar_module(
+                self.variational_strategy.inducing_points
+            )
 
         # Compute the mean and covariance
         mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
-
-# todo: implement multi token inference
-class MultiOutputUncertaintyModule(nn.Module):
-    """
-    Module for estimating uncertainty using Monte Carlo dropout and Gaussian Processes.
-
-    Args:
-        input_dim (int): The dimension of the input features.
-        output_dim (int): The dimension of the output.
-        n_gp_layers (int, optional): Number of Gaussian Process layers. Defaults to 2.
-        n_inducing (int, optional): Number of inducing points for each GP layer. Defaults to 10.
-        dropout_rate (float, optional): Dropout rate for MC dropout. Defaults to 0.1.
-        mc_samples (int, optional): Number of MC samples to draw. Defaults to 5.
-        temperature (float, optional): Temperature scaling factor for logits. Defaults to 1.0.
-    """
-
-    def __init__(
-            self,
-            input_dim: int,
-            output_dim: int,
-            n_gp_layers: int = 2,
-            n_inducing: int = 10,
-            dropout_rate: float = 0.1,
-            mc_samples: int = 5,
-            temperature: float = 1.0,
-    ):
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.n_gp_layers = n_gp_layers
-        self.n_inducing = n_inducing
-        self.dropout_rate = dropout_rate
-        self.mc_samples = mc_samples
-        self.temperature = nn.Parameter(torch.tensor(temperature))
-
-        logger.info(
-            f"Initializing UncertaintyModule with {n_gp_layers} GP layers and {mc_samples} MC samples"
-        )
-
-        # Create a separate GaussianProcessLayer for each output dimension
-        self.gp_layers = nn.ModuleList(
-            [
-                GaussianProcessLayer(
-                    input_dim, 1, n_inducing
-                )  # Output dimension is 1 for each layer
-                for _ in range(output_dim)  # Create a layer for each output dimension
-            ]
-        )
-        self.mc_dropout = nn.Dropout(p=dropout_rate)
-        self.output_layer = nn.Linear(input_dim, output_dim).to(self.device).to(self.device)
-        self.uncertainty_layer = nn.Linear(input_dim, output_dim).to(self.device).to(self.device)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass of the UncertaintyModule.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_dim).
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - Scaled mean output of shape (batch_size, seq_len, output_dim)
-                - Scaled uncertainty of shape (batch_size, seq_len, output_dim)
-        """
-        if x.dim() != 3 or x.size(2) != self.input_dim:
-            logger.error(
-                f"Invalid input shape. Expected (batch_size, seq_len, {self.input_dim}), got {x.shape}"
-            )
-            raise ValueError(
-                f"Invalid input shape. Expected (batch_size, seq_len, {self.input_dim}), got {x.shape}"
-            )
-
-        batch_size, seq_len, _ = x.shape
-        device = x.device
-
-        _total_uncertainty = torch.zeros(
-            batch_size, seq_len, self.output_dim, device=device
-        )
-        outputs = []
-
-        try:
-            for _ in range(self.mc_samples):
-                h = self.mc_dropout(x)
-
-                # Apply GP layers to each dimension of the hidden state
-                for i, gp_layer in enumerate(self.gp_layers):
-                    h[:, :, i], variance = gp_layer(h[:, :, i])
-                    _total_uncertainty[:, :, i] += variance
-
-                outputs.append(self.output_layer(h))
-
-            mean_output = torch.stack(outputs).mean(dim=0)
-            mean_uncertainty = _total_uncertainty / self.mc_samples
-
-            scaled_mean = mean_output / self.temperature
-            scaled_uncertainty = mean_uncertainty / (self.temperature ** 2)
-
-            return scaled_mean, scaled_uncertainty
-        except Exception as e:
-            logger.error(f"Error in UncertaintyModule forward pass: {str(e)}")
-            raise
-
-
-class RandomWalkKernel(Kernel):
-    """
-    RandomWalkKernel with cosine similarity and sentence embedding.
-    """
-
-    def __init__(
-            self,
-            input_dim: int,
-            n_steps: int = 5,
-            walk_type: str = "standard",
-            lengthscale_prior: Optional[torch.distributions.Distribution] = None,
-            eigenvalue_threshold: float = 1e-6,
-            sentence_transformer_model_name: str = "all-mpnet-base-v2",
-            active_dims: Optional[Tuple[int, ...]] = None,
-            **kwargs,
-    ):
-        """
-        Initialize the RandomWalkKernel.
-
-        Args:
-            input_dim (int): Dimension of the input (number of tokens in a sentence).
-            n_steps (int): Number of steps in the random walk.
-            walk_type (str): Type of random walk. Options: "standard", "reflected".
-            lengthscale_prior (Optional[torch.distributions.Distribution]): Prior distribution for the lengthscale parameter.
-            eigenvalue_threshold (float): Minimum allowed eigenvalue for the covariance matrix.
-            sentence_transformer_model_name (str): Name of the SentenceTransformer model to use.
-            active_dims (Optional[Tuple[int, ...]]): See gpytorch.kernels.Kernel
-            **kwargs: Additional keyword arguments for the base Kernel class.
-        """
-        super().__init__(active_dims=active_dims, **kwargs)
-        self.input_dim = input_dim
-        self.n_steps = n_steps
-        self.walk_type = walk_type
-        self.eigenvalue_threshold = eigenvalue_threshold
-        self.sentence_transformer = SentenceTransformer(sentence_transformer_model_name)
-
-        # Use a lengthscale parameter with a prior
-        self.register_parameter(
-            name="raw_lengthscale", parameter=torch.nn.Parameter(torch.ones(1, input_dim))
-        )
-        self.register_constraint("raw_lengthscale", Positive())
-
-        if lengthscale_prior is not None:
-            self.register_prior(
-                "lengthscale_prior",
-                lengthscale_prior,
-                lambda module: module.lengthscale,
-                lambda module, value: module._set_lengthscale(value),
-            )
-
-    @property
-    def lengthscale(self) -> Tensor:
-        """Get the lengthscale parameter."""
-        return self.raw_lengthscale_constraint.transform(self.raw_lengthscale)
-
-    @lengthscale.setter
-    def lengthscale(self, value: Tensor):
-        """Set the lengthscale parameter."""
-        self._set_lengthscale(value)
-
-    def _set_lengthscale(self, value: Tensor):
-        """Set the lengthscale parameter after applying the constraint."""
-        if not torch.is_tensor(value):
-            value = torch.as_tensor(value).to(self.raw_lengthscale)
-        self.initialize(
-            raw_lengthscale=self.raw_lengthscale_constraint.inverse_transform(value)
-        )
-
-    def forward(
-            self,
-            x1: Tensor,
-            x2: Tensor,
-            diag: bool = False,
-            last_dim_is_batch: bool = False,
-            **params,
-    ) -> Tensor:
-        """
-        Compute the kernel matrix using cosine similarity on sentence embeddings.
-        """
-        # Ensure embeddings are 3D tensors: (batch_size, seq_len, embedding_dim)
-        if x1.dim() == 2:
-            x1 = x1.unsqueeze(1)
-        if x2.dim() == 2:
-            x2 = x2.unsqueeze(1)
-
-        # Calculate cosine similarity matrix
-        similarity_matrix = self._cosine_similarity(x1, x2)
-
-        # Handle diagonal case
-        if diag:
-            return similarity_matrix.diagonal(dim1=-2, dim2=-1)
-
-        # Apply random walk logic (assuming you want to apply it to the similarity matrix)
-        if self.walk_type == "standard":
-            kernel_matrix = similarity_matrix
-        elif self.walk_type == "reflected":
-            kernel_matrix = self._reflect_distances(similarity_matrix, 10.0)
+        if isinstance(self.covar_module.base_kernel, TSPKernel):
+            covar_x = self.covar_module(x).evaluate_kernel()
+            covar_x = covar_x.to_dense()  # Convert lazy tensor to dense tensor
         else:
-            raise ValueError(f"Unsupported walk type: {self.walk_type}")
+            covar_x = self.covar_module(x).evaluate()
 
-        return kernel_matrix
+        # Reshape mean_x
+        mean_x = mean_x.view(batch_size, seq_len, self.output_dim)
 
-    def _cosine_similarity(self, x1: Tensor, x2: Tensor) -> Tensor:
-        """Calculate cosine similarity between x1 and x2."""
-        x1_norm = x1 / x1.norm(dim=-1, keepdim=True)
-        x2_norm = x2 / x2.norm(dim=-1, keepdim=True)
-        return torch.bmm(x1_norm, x2_norm.transpose(-2, -1))
-
-    def _embed_sentences(self, sentences: Tensor) -> Tensor:
-        """
-        Embed sentences using the SentenceTransformer model.
-
-        Args:
-            sentences (torch.Tensor): Tensor of shape (batch_size, seq_len) representing tokenized sentences.
-
-        Returns:
-            torch.Tensor: Tensor of shape (batch_size, seq_len, embedding_dim) representing embedded sentences.
-        """
-        # Assume sentences is a tensor of token IDs
-        sentences_list = [
-            self.sentence_transformer.tokenizer.decode(sentence, skip_special_tokens=True)
-            for sentence in sentences.tolist()
-        ]
-        return torch.tensor(self.sentence_transformer.encode(sentences_list), device=sentences.device)
-
-    def _reflect_distances(self, distances: Tensor, clip_value: float) -> Tensor:
-        """Reflect distances exceeding the clip value."""
-        exceeding_mask = distances > clip_value
-        distances[exceeding_mask] = 2 * clip_value - distances[exceeding_mask]
-        return distances
+        return MultivariateNormal(mean_x, covar_x)
 
 
 class SplineCritic(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: List[int] = None, num_grids: int = 8):
+    def __init__(
+        self, input_dim: int, hidden_dims: List[int] = None, num_grids: int = 8
+    ):
         if hidden_dims is None:
             hidden_dims = [128, 64]
         super().__init__()
@@ -387,9 +278,9 @@ class SplineCritic(nn.Module):
                 SplineNetLayer(current_dim, hidden_dim, num_grids=num_grids)
             )
             current_dim = hidden_dim
-        self.final_layer = nn.Linear(
-            hidden_dims[-1] * 2, 1
-        ).to(self.device)  # Concatenate outputs of x and y layers
+        self.final_layer = nn.Linear(hidden_dims[-1] * 2, 1).to(
+            self.device
+        )  # Concatenate outputs of x and y layers
 
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
         """
@@ -465,11 +356,13 @@ class TSPEnergyFunction(nn.Module):
     """
 
     def __init__(
-            self,
-            embedding_dim: int,
-            compression_dim: Optional[int] = None,
-            lambda_ib: float = 0.01,
-            device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self,
+        embedding_dim: int,
+        compression_dim: Optional[int] = None,
+        lambda_ib: float = 0.01,
+        device: torch.device = torch.device(
+            "cuda" if torch.cpu.is_available() else "cpu"
+        ),
     ):
         """
         Initialize the TSPEnergyFunction.
@@ -507,19 +400,30 @@ class TSPEnergyFunction(nn.Module):
         Raises:
             ValueError: If the input tensors have incorrect shapes or types.
         """
-        if not isinstance(x1, torch.Tensor) or not isinstance(x2, torch.Tensor):
-            raise ValueError(f"Inputs must be tensors. Got types x1: {type(x1)}, x2: {type(x2)}")
+        if x1.dim() == 2:
+            x1 = x1.unsqueeze(0)
+        if x2.dim() == 2:
+            x2 = x2.unsqueeze(0)
 
         if x1.dim() != 3 or x2.dim() != 3:
-            raise ValueError(f"Inputs must be 3D tensors. Got shapes x1: {x1.shape}, x2: {x2.shape}")
+            raise ValueError(
+                f"Inputs must be 3D tensors. Got shapes x1: {x1.shape}, x2: {x2.shape}"
+            )
 
-        if x1.size(2) != self.embedding_dim or x2.size(2) != self.embedding_dim:
-            raise ValueError(f"Input embedding dimension mismatch. Expected {self.embedding_dim}, "
-                             f"got x1: {x1.size(2)}, x2: {x2.size(2)}")
+        if x1.size(-1) != self.embedding_dim or x2.size(-1) != self.embedding_dim:
+            raise ValueError(
+                f"Input embedding dimension mismatch. Expected {self.embedding_dim}, "
+                f"got x1: {x1.size(-1)}, x2: {x2.size(-1)}"
+            )
 
         # Compute pairwise distances
         x1_norm = x1 / x1.norm(dim=-1, keepdim=True)
         x2_norm = x2 / x2.norm(dim=-1, keepdim=True)
+
+        # Handle different batch sizes
+        if x1.size(0) != x2.size(0):
+            x1_norm = x1_norm.expand(x2.size(0), -1, -1)
+
         distances = 1 - torch.bmm(x1_norm, x2_norm.transpose(-2, -1))
 
         # Add mutual information term if compression dimension is specified
@@ -527,7 +431,9 @@ class TSPEnergyFunction(nn.Module):
             x1_compressed = self.compressor(x1)
             x2_compressed = self.compressor(x2)
             mi_estimate = self.mi_estimator(x1_compressed, x2_compressed)
-            return distances + self.lambda_ib * mi_estimate.unsqueeze(1).unsqueeze(2)
+            # Reshape mi_estimate to (batch_size, 1, 1)
+            mi_estimate = mi_estimate.view(-1, 1, 1)
+            return distances + self.lambda_ib * mi_estimate
 
         return distances
 
@@ -538,12 +444,12 @@ class TSPKernel(gpytorch.kernels.Kernel):
         self.energy_function = energy_function
 
     def forward(
-            self,
-            x1: Tensor,
-            x2: Tensor,
-            diag: bool = False,
-            last_dim_is_batch: bool = False,
-            **params,
+        self,
+        x1: Tensor,
+        x2: Tensor,
+        diag: bool = False,
+        last_dim_is_batch: bool = False,
+        **params,
     ) -> Tensor:
         logger.debug(f"TSPKernel input shapes: x1 {x1.shape}, x2 {x2.shape}")
 
@@ -558,15 +464,22 @@ class TSPKernel(gpytorch.kernels.Kernel):
             raise ValueError(
                 f"Energy function returned None for inputs: x1 shape {x1.shape}, x2 shape {x2.shape}"
             )
-        if diag:
-            return torch.exp(-energy.diag())
         output = torch.exp(-energy)
         logger.debug(f"TSPKernel output shape: {output.shape}")
+
+        if diag:
+            return torch.diagonal(output, dim1=-2, dim2=-1)
+
+        # Reshape the output to match the expected shape
+        batch_size1, seq_len1, _ = x1.shape
+        batch_size2, seq_len2, _ = x2.shape
+        output = output.view(batch_size1 * seq_len1, batch_size2 * seq_len2)
+
         return output
 
 
 class MutualInformationEstimator(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, device='cuda'):
+    def __init__(self, input_dim, hidden_dim=128, device="cpu"):
         self.device = device
         super().__init__()
         self.critic = nn.Sequential(
@@ -605,7 +518,7 @@ class MutualInformationEstimator(nn.Module):
             raise ValueError(f"Input tensor y should be 2D or 3D, got {y.dim()}D")
 
         assert (
-                input_dim == input_dim_y
+            input_dim == input_dim_y
         ), f"Input dimensions of x and y should match, got {input_dim} and {input_dim_y}"
 
         # Ensure x and y have the same sequence length
@@ -617,7 +530,7 @@ class MutualInformationEstimator(nn.Module):
 
         # Flatten x and y for critic input
         x_flat = x.view(-1, input_dim)
-        y_flat = y.view(-1, input_dim)
+        y_flat = y.reshape(-1, input_dim)  # Use reshape here
 
         # Repeat or truncate x and y to match the larger size
         size_x = x_flat.size(0)
@@ -685,21 +598,143 @@ class ECELoss(nn.Module):
 
 
 class UncertaintyAwareLoss(nn.Module):
-    def __init__(self, base_loss: str = 'cross_entropy', uncertainty_weight: float = 0.1):
+    def __init__(
+        self, base_loss: str = "cross_entropy", uncertainty_weight: float = 0.1
+    ):
         super().__init__()
         self.base_loss = base_loss
         self.uncertainty_weight = uncertainty_weight
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor, uncertainties: torch.Tensor) -> torch.Tensor:
-        if self.base_loss == 'cross_entropy':
-            base_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
+    def forward(
+        self, logits: torch.Tensor, targets: torch.Tensor, uncertainties: torch.Tensor
+    ) -> torch.Tensor:
+        if self.base_loss == "cross_entropy":
+            base_loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                reduction="none",
+                ignore_index=-100,
+            )
         else:
             raise ValueError(f"Unsupported base loss: {self.base_loss}")
 
         # Reshape uncertainties to match base_loss shape
-        uncertainties = uncertainties.view(-1)
+        uncertainties = uncertainties.view(-1)[: base_loss.shape[0]]
+
+        # Handle NaN values
+        base_loss = torch.nan_to_num(base_loss, nan=0.0)
+        uncertainties = torch.nan_to_num(uncertainties, nan=0.0)
+
+        # Clip uncertainties to avoid exp(-inf) = 0 or exp(inf) = inf
+        uncertainties = torch.clamp(uncertainties, min=-20, max=20)
 
         return torch.mean(
             base_loss * torch.exp(-uncertainties)
             + self.uncertainty_weight * uncertainties
         )
+
+
+# todo: implement multi token inference
+class MultiOutputUncertaintyModule(nn.Module):
+    """
+    Module for estimating uncertainty using Monte Carlo dropout and Gaussian Processes.
+
+    Args:
+        input_dim (int): The dimension of the input features.
+        output_dim (int): The dimension of the output.
+        n_gp_layers (int, optional): Number of Gaussian Process layers. Defaults to 2.
+        n_inducing (int, optional): Number of inducing points for each GP layer. Defaults to 10.
+        dropout_rate (float, optional): Dropout rate for MC dropout. Defaults to 0.1.
+        mc_samples (int, optional): Number of MC samples to draw. Defaults to 5.
+        temperature (float, optional): Temperature scaling factor for logits. Defaults to 1.0.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        n_gp_layers: int = 2,
+        n_inducing: int = 10,
+        dropout_rate: float = 0.1,
+        mc_samples: int = 5,
+        temperature: float = 1.0,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.n_gp_layers = n_gp_layers
+        self.n_inducing = n_inducing
+        self.dropout_rate = dropout_rate
+        self.mc_samples = mc_samples
+        self.temperature = nn.Parameter(torch.tensor(temperature))
+
+        logger.info(
+            f"Initializing UncertaintyModule with {n_gp_layers} GP layers and {mc_samples} MC samples"
+        )
+
+        # Create a separate GaussianProcessLayer for each output dimension
+        self.gp_layers = nn.ModuleList(
+            [
+                GaussianProcessLayer(
+                    input_dim, 1, n_inducing
+                )  # Output dimension is 1 for each layer
+                for _ in range(output_dim)  # Create a layer for each output dimension
+            ]
+        )
+        self.mc_dropout = nn.Dropout(p=dropout_rate)
+        self.output_layer = (
+            nn.Linear(input_dim, output_dim).to(self.device).to(self.device)
+        )
+        self.uncertainty_layer = (
+            nn.Linear(input_dim, output_dim).to(self.device).to(self.device)
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass of the UncertaintyModule.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_dim).
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - Scaled mean output of shape (batch_size, seq_len, output_dim)
+                - Scaled uncertainty of shape (batch_size, seq_len, output_dim)
+        """
+        if x.dim() != 3 or x.size(2) != self.input_dim:
+            logger.error(
+                f"Invalid input shape. Expected (batch_size, seq_len, {self.input_dim}), got {x.shape}"
+            )
+            raise ValueError(
+                f"Invalid input shape. Expected (batch_size, seq_len, {self.input_dim}), got {x.shape}"
+            )
+
+        batch_size, seq_len, _ = x.shape
+        device = x.device
+
+        _total_uncertainty = torch.zeros(
+            batch_size, seq_len, self.output_dim, device=device
+        )
+        outputs = []
+
+        try:
+            for _ in range(self.mc_samples):
+                h = self.mc_dropout(x)
+
+                # Apply GP layers to each dimension of the hidden state
+                for i, gp_layer in enumerate(self.gp_layers):
+                    h[:, :, i], variance = gp_layer(h[:, :, i])
+                    _total_uncertainty[:, :, i] += variance
+
+                outputs.append(self.output_layer(h))
+
+            mean_output = torch.stack(outputs).mean(dim=0)
+            mean_uncertainty = _total_uncertainty / self.mc_samples
+
+            scaled_mean = mean_output / self.temperature
+            scaled_uncertainty = mean_uncertainty / (self.temperature**2)
+
+            return scaled_mean, scaled_uncertainty
+        except Exception as e:
+            logger.error(f"Error in UncertaintyModule forward pass: {str(e)}")
+            raise
