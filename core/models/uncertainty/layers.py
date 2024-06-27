@@ -439,11 +439,11 @@ class TSPEnergyFunction(nn.Module):
 
         return distances
 
-
 class TSPKernel(gpytorch.kernels.Kernel):
-    def __init__(self, energy_function: TSPEnergyFunction, **kwargs):
+    def __init__(self, energy_function: TSPEnergyFunction, covar_module: ScaleKernel, **kwargs):
         super().__init__(**kwargs)
         self.energy_function = energy_function
+        self.covar_module = covar_module
 
     def forward(
         self,
@@ -475,7 +475,10 @@ class TSPKernel(gpytorch.kernels.Kernel):
         # Reshape the output to match the expected shape
         batch_size1, seq_len1, _ = x1.shape
         batch_size2, seq_len2, _ = x2.shape
-        output = output.view(batch_size1 * seq_len1, batch_size2 * seq_len2)
+        # Directly evaluate the kernel matrix
+        output = self.covar_module(x1, x2).evaluate()
+        logger.debug(f"TSPKernel output shape after evaluation: {output.shape}")
+        output = output.permute(0, 2, 1, 3).reshape(batch_size1 * seq_len1, batch_size2 * seq_len2)
 
         return output
 
