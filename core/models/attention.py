@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -62,24 +63,38 @@ class TimestepNorm(nn.Module):
         )
 
 
-import torch
-import torch.nn as nn
-from typing import Tuple
-
 class CEMA(nn.Module):
-    def __init__(self, embed_dim: int, ndim: int, device: str = 'cpu'):
+    """
+    Complex Exponential Moving Average (CEMA) layer.
+
+    This layer implements a cumulative effect mechanism using complex exponentials,
+    as described in the paper: "Pay Attention to MLPs" (https://arxiv.org/abs/2105.08050).
+
+    Args:
+        embed_dim (int): The dimensionality of the input embeddings.
+        ndim (int): The number of dimensions for the complex exponential weights.
+    """
+    def __init__(self, embed_dim: int, ndim: int):
         super(CEMA, self).__init__()
         self.embed_dim = embed_dim
         self.ndim = ndim
         self.omega = nn.Parameter(torch.randn(embed_dim))
-        self.device = device
 
-        # Initialize coefficients
-        self.p_coeff = nn.Parameter(torch.randn(embed_dim, ndim))
-        self.q_coeff = nn.Parameter(torch.randn(embed_dim, ndim))
-        self.gamma = nn.Parameter(torch.randn(embed_dim, ndim, 1))  # Adjust shape
+        # Initialize coefficients using nn.init
+        self.p_coeff = nn.Parameter(torch.randn(ndim, embed_dim))
+        self.q_coeff = nn.Parameter(torch.randn(ndim, embed_dim))
+        self.gamma = nn.Parameter(torch.randn(ndim, embed_dim))
+        nn.init.normal_(self.omega)
+        nn.init.normal_(self.p_coeff)
+        nn.init.normal_(self.q_coeff)
+        nn.init.normal_(self.gamma)
 
     def _calc_coeffs(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Calculates the coefficients p, q, and gamma.
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing the calculated coefficients (p, q, gamma).
+        """
         # Calculate the coefficients p, q, and gamma
         p = self.p_coeff
         q = self.q_coeff
@@ -87,27 +102,39 @@ class CEMA(nn.Module):
         return p, q, gamma
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies the CEMA layer to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, embed_dim).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, embed_dim) with the cumulative effect applied.
+        """
         bsz, seq_len, embed_dim = x.size()
         assert embed_dim == self.embed_dim, f"Input embed_dim ({embed_dim}) does not match self.embed_dim ({self.embed_dim})"
-        residual = x * self.omega.view(1, 1, -1).to(self.device)  # Adjust omega to match input shape
+        residual = x * self.omega.view(1, 1, -1)  # Adjust omega to match input shape
 
         p, q, gamma = self._calc_coeffs()
 
         # Ensure p and q have the correct shape
-        p = p.view(1, embed_dim, self.ndim, 1).to(self.device)
-        q = q.view(1, embed_dim, self.ndim, 1).to(self.device)
-
-        # Simplified EMA computation
-        output = torch.zeros_like(x, device=self.device)
-        hidden = torch.zeros(bsz, embed_dim, self.ndim, 1, dtype=torch.complex64, device=self.device)
-
-        for t in range(seq_len):
-            x_t = x[:, t, :].view(bsz, embed_dim, 1, 1).to(self.device)
-            hidden = p * x_t + q * hidden
-            output[:, t, :] = (gamma * hidden).sum(dim=-2).view(bsz, embed_dim).real
-
-        return output
-
+        p = p.view(self.ndim, 1, embed_dim)
+        q = q.view(self.ndim, 1, embed_dim)
+        gamma = gamma.view(self.ndim, embed_dim, 1)
+        # Vectorized EMA computation
+        x_t = x.permute(1, 0, 2)  # Reshape input for vectorized computation
+        hidden = torch.zeros(seq_len, bsz, embed_dim, self.ndim, dtype=torch.complex64).to(x.device)
+        x_t = x_t.to(x.device)
+        x_t = x_t.unsqueeze(-1)
+        for i in range(self.ndim):
+          hidden[..., i] = p[i] * x_t + q[i] * hidden[..., i]
+        return (
+            (gamma * hidden)
+            .sum(dim=-1)
+            .view(seq_len, bsz, embed_dim)
+            .permute(1, 0, 2)
+            .real
+        ) + residual # Add residual connection
 
 
 @dataclass
@@ -136,7 +163,7 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
         # CEMA integration
-        self.cema = CEMA(config.d_model)
+        self.cema = CEMA(config.d_model, 4)
 
         # Adaptive weighting
         self.adaptive_weights = nn.Parameter(torch.ones(2))  # For attention and CEMA

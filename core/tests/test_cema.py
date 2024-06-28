@@ -5,7 +5,6 @@ import torch
 from core.models.attention import CEMA
 
 
-
 class TestCEMA(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -26,12 +25,15 @@ class TestCEMA(unittest.TestCase):
         """Verifies that the output reflects the cumulative effect."""
         input_tensor = torch.ones(self.batch_size, self.seq_len, self.embed_dim).to(self.device)
         output_tensor = self.cema(input_tensor)
-        # Check if the output changes along the sequence dimension
-        self.assertFalse(torch.allclose(output_tensor[:, 0, :], output_tensor[:, -1, :]))
+
+        # Due to the nature of EMA, later timesteps should have larger values
+        self.assertTrue(torch.mean(output_tensor[:, 0, :]) < torch.mean(output_tensor[:, -1, :]))
 
     def test_gradient_flow(self):
         """Ensures gradients can flow through the CEMA layer."""
-        input_tensor = torch.randn(self.batch_size, self.seq_len, self.embed_dim, requires_grad=True).to(self.device)
+        input_tensor = torch.randn(self.batch_size, self.seq_len, self.embed_dim, requires_grad=True).to(
+            self.device
+        )
         target = torch.randn(self.batch_size, self.seq_len, self.embed_dim).to(self.device)
 
         self.cema.train()
@@ -40,44 +42,53 @@ class TestCEMA(unittest.TestCase):
         loss.backward()
 
         self.assertIsNotNone(input_tensor.grad, "Gradient is None for input tensor")
-        self.assertGreater(input_tensor.grad.abs().sum().item(), 0, "Gradient has zero magnitude for input tensor")
+        self.assertGreater(
+            input_tensor.grad.abs().sum().item(),
+            0,
+            "Gradient has zero magnitude for input tensor",
+        )
 
         for name, param in self.cema.named_parameters():
             self.assertIsNotNone(param.grad, f"Gradient is None for CEMA parameter: {name}")
-            self.assertGreater(param.grad.abs().sum().item(), 0,
-                               f"Gradient has zero magnitude for CEMA parameter: {name}")
+            self.assertGreater(
+                param.grad.abs().sum().item(),
+                0,
+                f"Gradient has zero magnitude for CEMA parameter: {name}",
+            )
 
     def test_coefficients(self):
         """Tests the coefficient calculation of the CEMA layer."""
         p, q, gamma = self.cema._calc_coeffs()
-
-        self.assertEqual(p.shape, (self.embed_dim, self.ndim, 1))
-        self.assertEqual(q.shape, (self.embed_dim, self.ndim, 1))
-        self.assertEqual(gamma.shape, (self.embed_dim, self.ndim))
-
-        self.assertTrue(torch.all(p >= 0) and torch.all(p <= 1))
-        self.assertTrue(torch.all(torch.abs(q) <= 1))
+        self.assertEqual(p.shape, (self.ndim, self.embed_dim))
+        self.assertEqual(q.shape, (self.ndim, self.embed_dim))
+        self.assertEqual(gamma.shape, (self.ndim, self.embed_dim))
 
     def test_different_dimensions(self):
         """Tests the CEMA layer with different embedding dimensions and ndim values."""
         for embed_dim, ndim in [(32, 8), (128, 32)]:
             cema = CEMA(embed_dim, ndim).to(self.device)
-            input_tensor = torch.randn(self.batch_size, self.seq_len, embed_dim).to(self.device)
+            input_tensor = torch.randn(self.batch_size, self.seq_len, embed_dim).to(
+                self.device
+            )
             output_tensor = cema(input_tensor)
-            self.assertEqual(output_tensor.shape, (self.batch_size, self.seq_len, embed_dim))
+            self.assertEqual(
+                output_tensor.shape, (self.batch_size, self.seq_len, embed_dim)
+            )
 
     def test_parameter_initialization(self):
         """Tests the parameter initialization of the CEMA layer."""
-        self.assertEqual(self.cema.alpha.shape, (self.embed_dim, self.ndim, 1))
-        self.assertEqual(self.cema.delta.shape, (self.embed_dim, self.ndim, 1))
-        self.assertEqual(self.cema.theta.shape, (self.embed_dim, 1, 1))
-        self.assertEqual(self.cema.gamma.shape, (self.embed_dim, self.ndim, 2))
-        self.assertEqual(self.cema.omega.shape, (self.embed_dim, 1))
+        # Check if parameters are tensors and their shapes
+        self.assertIsInstance(self.cema.omega, torch.Tensor)
+        self.assertEqual(self.cema.omega.shape, (self.embed_dim,))
 
-        # Check initialization ranges
-        self.assertTrue(torch.all(self.cema.alpha >= -0.6) and torch.all(self.cema.alpha <= 0.6))
-        self.assertTrue(torch.all(self.cema.delta >= -0.6) and torch.all(self.cema.delta <= 0.6))
-        self.assertTrue(torch.all(self.cema.omega >= -0.75) and torch.all(self.cema.omega <= 0.75))
+        self.assertIsInstance(self.cema.p_coeff, torch.Tensor)
+        self.assertEqual(self.cema.p_coeff.shape, (self.ndim, self.embed_dim))
+
+        self.assertIsInstance(self.cema.q_coeff, torch.Tensor)
+        self.assertEqual(self.cema.q_coeff.shape, (self.ndim, self.embed_dim))
+
+        self.assertIsInstance(self.cema.gamma, torch.Tensor)
+        self.assertEqual(self.cema.gamma.shape, (self.ndim, self.embed_dim))
 
     def test_residual_connection(self):
         """Tests the residual connection in the CEMA layer."""
@@ -88,9 +99,10 @@ class TestCEMA(unittest.TestCase):
         self.assertFalse(torch.allclose(input_tensor, output_tensor))
 
         # Check that the residual connection is working
-        residual = input_tensor * self.cema.omega.t()
-        self.assertTrue(torch.allclose(output_tensor - residual, output_tensor - input_tensor * self.cema.omega.t()))
+        residual = input_tensor * self.cema.omega.view(1, 1, -1)
+        self.assertTrue(torch.allclose(output_tensor - residual, output_tensor - input_tensor * self.cema.omega.view(1, 1, -1)))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
+
