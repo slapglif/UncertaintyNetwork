@@ -32,6 +32,7 @@ class TestRotaryPositionEncoding(unittest.TestCase):
 
     def test_different_sequence_lengths(self):
         """Ensures correct handling of different sequence lengths."""
+        # sourcery skip: no-loop-in-tests
         for seq_len in [10, 30, 50]:
             input_tensor = torch.randn(self.batch_size, seq_len, self.d_model).to(self.device)
             cos, sin = self.rotary_pe(input_tensor)

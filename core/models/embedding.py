@@ -17,39 +17,32 @@ class RotaryPositionEncoding(nn.Module):
         self.dim = dim
         self.n_heads = n_heads
         self.max_seq_len_cached = max_position_embeddings
+        self.base = base
 
         # Calculate the rotary embeddings for each head
         head_dim = dim // n_heads
         inv_freq = 1.0 / (
                 base
-                ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim).to("cpu")
+                ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
         )
-        self.register_buffer("inv_freq", inv_freq)
+        self.register_buffer("inv_freq", inv_freq)  # Register inv_freq as a buffer
         self.inv_freq.requires_grad = True  # Enable gradient calculation for inv_freq
-
-        t = torch.arange(max_position_embeddings, dtype=torch.float32).to("cpu")
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-
-        # Stack the embeddings for each head
-        cos_cached = emb.cos().view(1, max_position_embeddings, 1, head_dim)
-        sin_cached = emb.sin().view(1, max_position_embeddings, 1, head_dim)
-
-        self.register_buffer("cos_cached", cos_cached, persistent=False)
-        self.register_buffer("sin_cached", sin_cached, persistent=False)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_len = x.shape[1]  # Extract the sequence length from the input tensor
+        device = x.device  # Get the device of the input tensor
 
-        if seq_len > self.max_seq_len_cached:
-            self.max_seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device, dtype=torch.float32)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1).unsqueeze(0).unsqueeze(2)
-            self.cos_cached = emb.cos()
-            self.sin_cached = emb.sin()
+        # Move inv_freq to the correct device only once
+        if self.inv_freq.device != device:
+            self.inv_freq = self.inv_freq.to(device)
 
-        return self.cos_cached[:, :seq_len, :, :], self.sin_cached[:, :seq_len, :, :]
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1).unsqueeze(0).unsqueeze(2)
+        cos = emb.cos()
+        sin = emb.sin()
+
+        return cos[:, :seq_len, :, :], sin[:, :seq_len, :, :]
 
 
 def apply_rotary_pos_emb(
