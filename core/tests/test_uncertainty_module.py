@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from core.models.uncertainty.layers import UncertaintyModule
+from core.models.uncertainty.uncertainty_layers import UncertaintyModule
 from core.models.uncertainty.uncertainty import UncertainTransformerConfig
 
 
@@ -44,11 +44,25 @@ class TestUncertaintyModule(unittest.TestCase):
 
     def test_gradient_flow(self):
         """Ensures gradients propagate correctly through the module."""
-        input_tensor = torch.randn(self.batch_size, self.seq_len, self.config.d_model, requires_grad=True).to(
-            self.device)
+        # --- Create linearly related test data ---
+        num_samples = 100
+        input_dim = self.config.d_model
+        x = torch.linspace(-5, 5, num_samples).unsqueeze(-1)
+        input_tensor = x.repeat(self.batch_size, self.seq_len, 1)
+        input_tensor = input_tensor + torch.randn_like(input_tensor) * 0.5  # Add some noise
+        input_tensor = input_tensor.to(self.device)
+        input_tensor.requires_grad = True
+        # ------------------------------------------
+
         mean, uncertainty = self.uncertainty_module(input_tensor)
         loss = mean.sum() + uncertainty.sum()
+
+        noise_param = self.uncertainty_module.gp_layers[0].noise
+        noise_grad = torch.autograd.grad(loss, noise_param, retain_graph=True)[0]
+
+        self.assertIsNotNone(noise_grad, "Gradient is None for noise parameter")
+        self.assertGreater(noise_grad.abs().sum().item(), 0, "Gradient has zero magnitude for noise parameter")
+
         loss.backward()
-        # sourcery skip: no-loop-in-tests
         for name, param in self.uncertainty_module.named_parameters():
             self.assertIsNotNone(param.grad, f"Gradient is None for parameter {name}")

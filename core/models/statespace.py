@@ -301,7 +301,7 @@ class Mamba(nn.Module):
             self.log_decay_matrix.device)  # move decay_matrix to the same device as self.log_decay_matrix
         self.log_decay_matrix.data.copy_(
             torch.log(decay_matrix).flatten()[
-                :self.config.n_heads
+            :self.config.n_heads
             ]
         )  # Flatten log(decay_matrix) and take the first n_heads elements
 
@@ -332,8 +332,6 @@ def segsum(x: Tensor, device: Device = None) -> Tensor:
 def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
     """Structed State Space Duality (SSD) - the core of Mamba-2
 
-    This is almost the exact same minimal SSD code from the blog post.
-
     Arguments
         x: (batch, seqlen, n_heads, d_head)
         A: (batch, seqlen, n_heads)
@@ -344,11 +342,13 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
         y: (batch, seqlen, n_heads, d_head)
 
     """
-    assert x.shape[1] % chunk_size == 0
+    # --- Removed Assertion ---
+    # assert x.shape[1] % chunk_size == 0
+    # ---
 
     # --- Calculate chunks ---
     seqlen = x.shape[1]
-    chunks = seqlen // chunk_size
+    chunks = (seqlen + chunk_size - 1) // chunk_size  # Calculate chunks to include remainder
     # ---
 
     # Rearrange into chunks

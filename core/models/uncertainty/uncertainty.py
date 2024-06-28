@@ -16,7 +16,7 @@ from transformers.modeling_outputs import ModelOutput
 from core.models.embedding import RotaryEmbedding
 from core.models.layers import TransformerEncoderLayer, KANFeedForward
 from core.models.statespace import Mamba, MambaConfig
-from core.models.uncertainty.layers import UncertaintyModule
+from core.models.uncertainty.uncertainty_layers import UncertaintyModule
 from core.models.uncertainty.uncertainty_utils import uncertainty_decomposition
 from core.utils.tokenizer import Tokenizer
 

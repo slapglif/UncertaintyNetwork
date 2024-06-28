@@ -8,8 +8,7 @@ import torch
 import torch.nn.functional as F
 from gpytorch.constraints import Positive
 from gpytorch.distributions import MultivariateNormal
-from gpytorch.kernels import Kernel, ScaleKernel
-from gpytorch.likelihoods import GaussianLikelihood
+from gpytorch.kernels import Kernel, ScaleKernel, RBFKernel, MaternKernel
 from gpytorch.means import ConstantMean
 from gpytorch.models import ApproximateGP
 from gpytorch.priors import GammaPrior
@@ -48,8 +47,11 @@ class UncertaintyModule(nn.Module):
         for _ in range(self.mc_samples):
             x_dropout = self.mc_dropout(x)
             for gp_layer in self.gp_layers:
+                # --- Modification: Get the full distribution and then compute mean and variance ---
                 gp_output = gp_layer(x_dropout)
-                mean, variance = gp_output.mean, gp_output.variance
+                mean = gp_output.mean
+                variance = gp_output.variance
+                # ---------------------------------------------------------------------------------
                 total_mean += mean
                 total_variance += variance + mean.pow(2)
 
@@ -176,22 +178,16 @@ class GaussianProcessLayer(ApproximateGP):
         self.mean_module = ConstantMean(batch_shape=torch.Size([output_dim])).to(
             self.device
         )
-        self.covar_module = (
-            kernel
-            if kernel is not None
-            else ScaleKernel(
-                RandomWalkKernel(
-                    input_dim,
-                    lengthscale_prior=GammaPrior(3.0, 6.0),
-                    batch_shape=torch.Size([output_dim]),
-                ).to(self.device),
-            ).to(self.device)
-        )
+        base_kernel = RBFKernel(
+            input_dim,
+            lengthscale_prior=GammaPrior(3.0, 6.0),
+            batch_shape=torch.Size([output_dim]),
+        ).to(self.device)
+        self.covar_module = ScaleKernel(base_kernel).to(self.device)
 
-        self.likelihood = GaussianLikelihood(batch_shape=torch.Size([output_dim])).to(
-            self.device
-        )
-        self.likelihood.noise_covar.raw_noise.data.fill_(-3)
+        # --- Modification: Make noise a parameter ---
+        self.noise = nn.Parameter(torch.tensor([-5.0], device=self.device))
+        # -------------------------------------------
 
     def forward(self, x: torch.Tensor) -> MultivariateNormal:
         """
@@ -224,11 +220,15 @@ class GaussianProcessLayer(ApproximateGP):
         mean_x = self.mean_module(x)
         logger.info(f"Mean tensor shape: {mean_x.shape}")
 
-        covar_x = self.covar_module(x).evaluate()
-        logger.info(f"Covariance matrix shape: {covar_x.shape}")
+        # --- Modification: Apply noise after scaling ---
+        covar_x = self.covar_module(x)  # Apply scale kernel first
+        noise_variance = self.noise
+        expanded_noise_variance = noise_variance.unsqueeze(0).unsqueeze(-1).expand(-1, covar_x.size(-2),
+                                                                                   covar_x.size(-1))
+        covar_x = covar_x + expanded_noise_variance  # Add noise to the scaled covariance matrix
+        # ---------------------------------------------
 
-        # View the mean to match the expected shape
-        # mean_x = mean_x.view(self.output_dim, -1) # Remove this line
+        logger.info(f"Covariance matrix shape: {covar_x.shape}")
 
         return MultivariateNormal(mean_x, covar_x)
 
@@ -424,16 +424,11 @@ class TSPKernel(gpytorch.kernels.Kernel):
             raise ValueError(
                 f"Energy function returned None for inputs: x1 shape {x1.shape}, x2 shape {x2.shape}"
             )
+
         output = torch.exp(-energy)
         logger.info(f"TSPKernel output shape: {output.shape}")
 
-        if diag:
-            return torch.diagonal(output, dim1=-2, dim2=-1)
-
-        # Remove the extra dimension from the output
-        output = output.squeeze(0)
-
-        return output
+        return torch.diagonal(output, dim1=-2, dim2=-1) if diag else output
 
 
 class MutualInformationEstimator(nn.Module):
