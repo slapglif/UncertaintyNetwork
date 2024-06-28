@@ -1,4 +1,4 @@
-from typing import List, Any
+from typing import List
 
 import torch
 from transformers import GPT2Tokenizer, BatchEncoding, GemmaTokenizer
@@ -21,7 +21,7 @@ class Tokenizer:
     """
 
     def __init__(
-        self, pretrained_tokenizer: str = "google/gemma-2b", vocab_size: int = 256128
+            self, pretrained_tokenizer: str = "gemma-2b", vocab_size: int = 256128
     ):
         """
         Initialize the Tokenizer class.
@@ -41,9 +41,9 @@ class Tokenizer:
             )  # Ensure the vocab_size matches the GPT-2 tokenizer
         else:
             # Initialize Gemma tokenizer from the specified preset
-            self.tokenizer = GemmaTokenizer.from_pretrained(
-                pretrained_tokenizer, vocab_size=vocab_size
-            )
+            model_name = "google/gemma-7b"
+            token = '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'
+            self.tokenizer = GemmaTokenizer.from_pretrained(model_name, token=token)
 
         self.tokenizer.pad_token = (
             self.tokenizer.eos_token
@@ -54,7 +54,7 @@ class Tokenizer:
         self.bos_token_id = self.tokenizer.bos_token_id
 
     def encode(
-        self, text: str, add_special_tokens: bool = True, **kwargs
+            self, text: str, add_special_tokens: bool = True, **kwargs
     ) -> List[int] | BatchEncoding:
         """
         Encode the given text into a list of token IDs.
@@ -85,7 +85,7 @@ class Tokenizer:
         return self.tokenizer.decode(token_ids.tolist(), **kwargs)
 
     def batch_decode(
-        self, token_ids_batch: List[torch.Tensor] | torch.Tensor, **kwargs
+            self, token_ids_batch: List[torch.Tensor] | torch.Tensor, **kwargs
     ):
         """
         Decode a batch of token IDs back into text.
@@ -97,9 +97,16 @@ class Tokenizer:
         Returns:
             List[str]: The list of decoded texts.
         """
-        return self.tokenizer.batch_decode(
-            [ids.tolist() for ids in token_ids_batch], **kwargs
-        )
+        if isinstance(token_ids_batch, torch.Tensor):
+            token_ids_batch = [token_ids_batch]
+
+        decoded_texts = []
+        for ids_list in token_ids_batch:
+            if isinstance(ids_list, torch.Tensor):
+                ids_list = ids_list.tolist()
+            flattened_ids = [id for sublist in ids_list for id in sublist]
+            decoded_texts.append(self.tokenizer.decode(flattened_ids, **kwargs))
+        return decoded_texts
 
     @property
     def pad_token(self):

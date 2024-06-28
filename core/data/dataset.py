@@ -21,7 +21,7 @@ class SlimPajamaDataset(IterableDataset):
     ):
         super().__init__()
         self.split = split
-        self.tokenizer = tokenizer or Tokenizer.from_pretrained("gpt2")
+        self.tokenizer = tokenizer or Tokenizer()
         self.max_length = max_length
         self.num_examples = num_examples
         self.cache_dir = cache_dir

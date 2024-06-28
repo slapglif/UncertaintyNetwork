@@ -45,19 +45,19 @@ def softplus(x: torch.Tensor) -> torch.Tensor:
 
 @torch.inference_mode()
 def generate_text(
-    model: PreTrainedModel,
-    tokenizer: Tokenizer,
-    prompt: Union[str, List[str]],
-    max_length: int = 100,
-    temperature: float = 1.13,
-    top_k: int = 49,
-    top_p: float = 0.18,
-    repetition_penalty: float = 1.8,
-    num_return_sequences: int = 1,
-    device: Optional[torch.device] = None,
-    generation_config: Optional[GenerationConfig] = None,
-    seed: Optional[int] = None,
-    **kwargs,
+        model: PreTrainedModel,
+        tokenizer: Tokenizer,
+        prompt: Union[str, List[str]],
+        max_length: int = 100,
+        temperature: float = 1.13,
+        top_k: int = 49,
+        top_p: float = 0.18,
+        repetition_penalty: float = 1.8,
+        num_return_sequences: int = 1,
+        device: Optional[torch.device] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        seed: Optional[int] = None,
+        **kwargs
 ) -> List[str]:
     """
     Generates text using the specified model and tokenizer with given parameters.
@@ -87,13 +87,6 @@ def generate_text(
     Raises:
         ValueError: If the input prompt is empty or if the model or tokenizer are not properly initialized.
         RuntimeError: If there's an error during the text generation process.
-
-    Example:
-        >>> model = YourPreTrainedModel.from_pretrained("model_name")
-        >>> tokenizer = Tokenizer.from_pretrained("tokenizer_name")
-        >>> prompt = "Once upon a time"
-        >>> generated_texts = generate_text(model, tokenizer, prompt, max_length=200)
-        >>> print(generated_texts[0])
     """
     if not prompt:
         raise ValueError("Input prompt cannot be empty.")
@@ -136,9 +129,7 @@ def generate_text(
                 do_sample=True,
             )
 
-        logger.info(
-            f"Starting text generation with generation config: {generation_config}"
-        )
+        logger.info(f"Starting text generation with generation config: {generation_config}")
 
         if seed is not None:
             torch.manual_seed(seed)
@@ -169,7 +160,7 @@ def generate_text(
 
 
 def calculate_perplexity(
-    model: PreTrainedModel, tokenizer: Tokenizer, text: str, device: torch.device
+        model: PreTrainedModel, tokenizer: Tokenizer, text: str, device: torch.device
 ) -> float:
     """
     Calculate the perplexity of the given text using the specified model and tokenizer.
@@ -200,15 +191,15 @@ def calculate_perplexity(
 def check_shapes(tensors, expected_shapes, names):
     for tensor, expected_shape, name in zip(tensors, expected_shapes, names):
         assert (
-            tensor.shape == expected_shape
+                tensor.shape == expected_shape
         ), f"{name} shape mismatch: expected {expected_shape}, got {tensor.shape}"
 
 
 def check_layer(
-    layer: nn.Module,
-    input_shape: Tuple[int, ...],
-    expected_output_shape: Tuple[int, ...],
-    device: torch.device = torch.device("cuda" if torch.cpu.is_available() else "cpu"),
+        layer: nn.Module,
+        input_shape: Tuple[int, ...],
+        expected_output_shape: Tuple[int, ...],
+        device: torch.device = torch.device("cuda" if torch.cpu.is_available() else "cpu"),
 ):
     """
     Check the forward and backward pass of a single layer.
@@ -250,7 +241,7 @@ def check_layer(
         output = output[0]
 
     assert (
-        output.shape == expected_output_shape
+            output.shape == expected_output_shape
     ), f"Output shape mismatch for {layer.__class__.__name__}: expected {expected_output_shape}, got {output.shape}"
 
     # Backward pass
@@ -260,15 +251,15 @@ def check_layer(
 
         for name, param in layer.named_parameters():
             assert (
-                param.grad is not None
+                    param.grad is not None
             ), f"Gradient is None for parameter {name} in {layer.__class__.__name__}"
             assert (
-                torch.sum(param.grad**2) > 0
+                    torch.sum(param.grad ** 2) > 0
             ), f"Gradient is zero for parameter {name} in {layer.__class__.__name__}"
     except RuntimeError as e:
         if (
-            "one of the variables needed for gradient computation has been modified by an inplace operation"
-            in str(e)
+                "one of the variables needed for gradient computation has been modified by an inplace operation"
+                in str(e)
         ):
             logger.warning(
                 f"In-place operation detected in {layer.__class__.__name__}. Skipping gradient check."

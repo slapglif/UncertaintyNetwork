@@ -24,7 +24,7 @@ logger.add(
 )
 
 config = UncertainTransformerConfig(
-    vocab_size=50257,
+    vocab_size=256128,
     d_model=512,
     n_heads=8,
     d_ff=2048,
@@ -176,7 +176,7 @@ def boolq_dataset():
 
 
 # Test Function
-tokenizer = Tokenizer.from_pretrained("gpt2")
+tokenizer = Tokenizer()
 
 if __name__ == "__main__":
     evaluate_qa(model, tokenizer, boolq_dataset(), torch.device("cpu"))

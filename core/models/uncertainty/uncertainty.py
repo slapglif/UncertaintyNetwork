@@ -19,47 +19,48 @@ from core.models.layers import TransformerEncoderLayer, CEMA, KANFeedForward
 from core.models.statespace import Mamba, MambaConfig
 from core.models.uncertainty.layers import UncertaintyModule, UncertaintyAwareLoss
 from core.models.uncertainty.uncertainty_utils import uncertainty_decomposition
+from core.utils.tokenizer import Tokenizer
 from core.utils.utils import TimestepNorm
 
 
 class UncertainTransformerConfig(PretrainedConfig):
     def __init__(
-        self,
-        vocab_size: int = 50257,
-        d_model: int = 2048,
-        n_heads: int = 12,
-        d_ff: int = 3072,
-        n_layers: int = 12,
-        dropout: float = 0.1,
-        max_position_embeddings: int = 1024,
-        layer_norm_epsilon: float = 1e-5,
-        initializer_range: float = 0.02,
-        use_cache: bool = False,
-        pad_token_id: int = 50256,
-        bos_token_id: int = 50256,
-        eos_token_id: int = 50256,
-        use_mamba: bool = True,
-        d_state: int = 16,
-        d_conv: int = 4,
-        expand_factor: float = 2,
-        dt_rank: Optional[int] = None,
-        dt_min: float = 0.001,
-        dt_max: float = 0.1,
-        dt_init: str = "random",
-        dt_scale: float = 1.0,
-        dt_init_floor: float = 1e-4,
-        use_flash_attention: bool = False,
-        n_inducing: int = 10,
-        use_gelu_approximation: bool = False,
-        sliding_window_size: int = 512,
-        use_gradient_checkpointing: bool = False,
-        matryoshka_dim: int = 768,  # Added this parameter
-        uncertainty_weight: float = 0.1,
-        uncertainty_scale: float = 1.0,
-        device: torch.device = torch.device(
-            "cuda" if torch.cpu.is_available() else "cpu"
-        ),
-        **kwargs,
+            self,
+            vocab_size: int = 50257,
+            d_model: int = 2048,
+            n_heads: int = 12,
+            d_ff: int = 3072,
+            n_layers: int = 12,
+            dropout: float = 0.1,
+            max_position_embeddings: int = 1024,
+            layer_norm_epsilon: float = 1e-5,
+            initializer_range: float = 0.02,
+            use_cache: bool = False,
+            pad_token_id: int = 50256,
+            bos_token_id: int = 50256,
+            eos_token_id: int = 50256,
+            use_mamba: bool = True,
+            d_state: int = 16,
+            d_conv: int = 4,
+            expand_factor: float = 2,
+            dt_rank: Optional[int] = None,
+            dt_min: float = 0.001,
+            dt_max: float = 0.1,
+            dt_init: str = "random",
+            dt_scale: float = 1.0,
+            dt_init_floor: float = 1e-4,
+            use_flash_attention: bool = False,
+            n_inducing: int = 10,
+            use_gelu_approximation: bool = False,
+            sliding_window_size: int = 512,
+            use_gradient_checkpointing: bool = False,
+            matryoshka_dim: int = 768,  # Added this parameter
+            uncertainty_weight: float = 0.1,
+            uncertainty_scale: float = 1.0,
+            device: torch.device = torch.device(
+                "cuda" if torch.cpu.is_available() else "cpu"
+            ),
+            **kwargs,
     ):
         super().__init__(
             pad_token_id=pad_token_id,
@@ -126,9 +127,9 @@ class UncertainNetwork(nn.Module):
                                 dt_scale=config.dt_scale,
                                 dt_init_floor=config.dt_init_floor,
                             )
-                        ),
-                        TransformerEncoderLayer(config),
-                        KANFeedForward(config),
+                        ).to(config.device),
+                        TransformerEncoderLayer(config).to(config.device),
+                        KANFeedForward(config).to(config.device),
                         nn.Linear(config.d_model, config.d_model).to(config.device),
                     ]
                 )
@@ -137,6 +138,14 @@ class UncertainNetwork(nn.Module):
         ).to(config.device)
         self.final_layer_norm = nn.LayerNorm(config.d_model).to(config.device)
         self.dropout = nn.Dropout(config.dropout).to(config.device)
+        self.uncertainty_module = UncertaintyModule(
+            input_dim=config.d_model,
+            output_dim=config.vocab_size,
+            n_gp_layers=1,
+            n_inducing=5,
+            dropout_rate=0.1,
+            mc_samples=3,
+        ).to(config.device)
 
     def forward(self, inputs_embeds, attention_mask=None, use_cache=False):
         print(f"UncertainNetwork input shape: {inputs_embeds.shape}")
@@ -173,6 +182,9 @@ class UncertainNetwork(nn.Module):
             if use_cache:
                 cache += (mamba_outputs[1],)
 
+            # Apply Uncertainty Module here
+            hidden_states, uncertainties = self.uncertainty_module(hidden_states)
+
             hidden_states = projection(hidden_states)
             print(f"After projection {i} shape: {hidden_states.shape}")
             print(
@@ -208,8 +220,8 @@ class UncertainNetwork(nn.Module):
         return (
             hidden_states,
             cache,
-            torch.zeros_like(hidden_states),
-        )  # placeholder for uncertainty
+            uncertainties,
+        )
 
 
 @dataclass
@@ -237,12 +249,13 @@ class TemperatureScaling(autograd.Function):
             grad_input = grad_output / (temperature.clamp(min=1e-6) + 1e-6)
         if ctx.needs_input_grad[1]:
             grad_temp = (
-                -(grad_output * input).sum() / (temperature.clamp(min=1e-6) + 1e-6) ** 2
+                    -(grad_output * input).sum() / (temperature.clamp(min=1e-6) + 1e-6) ** 2
             )
         return grad_input, grad_temp
 
 
 class UncertainTransformerLMHeadModel(PreTrainedModel):
+
     def __init__(self, config: UncertainTransformerConfig):
         super().__init__(config)
         self.config = config
@@ -256,6 +269,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             dropout_rate=0.1,
             mc_samples=3,
         )
+        self.tokenizer = Tokenizer()  # make sure you import core.utils.tokenizer.Tokenizer !
         self.uncertainty_loss = UncertaintyAwareLoss(
             uncertainty_weight=config.uncertainty_weight
         )
@@ -276,11 +290,11 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         self.apply(self._init_weights)
 
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass of the UncertainTransformerLMHeadModel.
@@ -300,9 +314,12 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             )
 
         if input_ids is not None:
+            # Decode the input_ids into sentences
+            sentences = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+
             # Generate Matryoshka embeddings
             matryoshka_embeddings = self.matryoshka_model.encode(
-                input_ids, convert_to_tensor=True, show_progress_bar=False
+                sentences, convert_to_tensor=True, show_progress_bar=False
             )
 
             # Project Matryoshka embeddings to model dimension
@@ -334,15 +351,15 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         return outputs
 
     def generate_with_uncertainty(
-        self,
-        input_ids: torch.LongTensor,
-        max_length: int,
-        num_return_sequences: int = 1,
-        temperature: float = 1.0,
-        top_k: int = 50,
-        top_p: float = 0.95,
-        do_sample: bool = True,
-        **kwargs,
+            self,
+            input_ids: torch.LongTensor,
+            max_length: int,
+            num_return_sequences: int = 1,
+            temperature: float = 1.0,
+            top_k: int = 50,
+            top_p: float = 0.95,
+            do_sample: bool = True,
+            **kwargs,
     ) -> tuple[Tensor, Tensor]:
         """
         Generate sequences with associated uncertainties.
@@ -368,7 +385,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
 
         # Generate Matryoshka embeddings for the input
         matryoshka_embeddings = self.matryoshka_model.encode(
-            input_ids, convert_to_tensor=True, show_progress_bar=False
+            input_ids, convert_to_tensor=True, show_progress_bar=True
         )
         projected_matryoshka_embeddings = self.matryoshka_projection(
             matryoshka_embeddings
@@ -382,7 +399,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
                 # Combine token embeddings with Matryoshka embeddings
                 inputs_embeds = self.transformer.embedding(curr_input_ids)
                 inputs_embeds = (
-                    inputs_embeds + projected_matryoshka_embeddings.unsqueeze(1)
+                        inputs_embeds + projected_matryoshka_embeddings.unsqueeze(1)
                 )
 
                 outputs = self(inputs_embeds=inputs_embeds)
@@ -391,8 +408,8 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
 
                 # Apply temperature and uncertainty-aware sampling
                 next_token_scores = (
-                    next_token_logits / temperature
-                    - self.config.uncertainty_scale * next_token_uncertainty
+                        next_token_logits / temperature
+                        - self.config.uncertainty_scale * next_token_uncertainty
                 )
 
                 # Apply top-k and top-p filtering
@@ -431,10 +448,10 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
 
     @staticmethod
     def _top_k_top_p_filtering(
-        logits: torch.Tensor,
-        top_k: int = 0,
-        top_p: float = 1.0,
-        filter_value: float = -float("Inf"),
+            logits: torch.Tensor,
+            top_k: int = 0,
+            top_p: float = 1.0,
+            filter_value: float = -float("Inf"),
     ) -> torch.Tensor:
         """
         Filter a distribution of logits using top-k and/or nucleus (top-p) filtering.
@@ -464,8 +481,8 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             sorted_indices_to_remove = cumulative_probs > top_p
             # Shift the indices to the right to keep also the first token above the threshold
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                ..., :-1
-            ].clone()
+                                                ..., :-1
+                                                ].clone()
             sorted_indices_to_remove[..., 0] = 0
 
             indices_to_remove = sorted_indices[sorted_indices_to_remove]
@@ -499,7 +516,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         return embeddings
 
     def calibrate(
-        self, val_dataloader: DataLoader, method: str = "temperature_scaling"
+            self, val_dataloader: DataLoader, method: str = "temperature_scaling"
     ) -> float:
         """
         Calibrate the model's uncertainty estimates.
@@ -579,10 +596,10 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
                 # Brier Score
                 brier = torch.mean(
                     (
-                        probs
-                        - torch.nn.functional.one_hot(
-                            labels, num_classes=self.config.vocab_size
-                        )
+                            probs
+                            - torch.nn.functional.one_hot(
+                        labels, num_classes=self.config.vocab_size
+                    )
                     )
                     ** 2
                 )
@@ -619,7 +636,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
 
     @staticmethod
     def _expected_calibration_error(
-        confidences: np.ndarray, accuracies: np.ndarray, n_bins: int = 10
+            confidences: np.ndarray, accuracies: np.ndarray, n_bins: int = 10
     ) -> float:
         """
         Compute the Expected Calibration Error.
@@ -679,7 +696,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         return float(average_precision_score(1 - np.array(accuracies), uncertainties))
 
     def uncertainty_decomposition(
-        self, uncertainties: torch.Tensor
+            self, uncertainties: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Decompose total uncertainty into aleatoric and epistemic components.
@@ -695,7 +712,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         )
 
     def active_learning_acquisition(
-        self, pool_dataloader: DataLoader, n_samples: int
+            self, pool_dataloader: DataLoader, n_samples: int
     ) -> List[int]:
         """
         Perform active learning acquisition using uncertainty estimates.
@@ -712,9 +729,9 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         indices = []
         with torch.no_grad():
             for i, batch in tqdm(
-                enumerate(pool_dataloader),
-                desc="Pooling Dataloader...",
-                total=len(pool_dataloader),
+                    enumerate(pool_dataloader),
+                    desc="Pooling Dataloader...",
+                    total=len(pool_dataloader),
             ):
                 input_ids, attention_mask = [b.to(self.device) for b in batch]
                 outputs = self(input_ids, attention_mask=attention_mask)

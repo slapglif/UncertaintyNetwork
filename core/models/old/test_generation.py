@@ -27,7 +27,7 @@ def device():
 @pytest.fixture(scope="module")
 def model(device):
     config = UncertainTransformerConfig(
-        vocab_size=50257,
+        vocab_size=256128,
         d_model=512,
         n_heads=8,
         d_ff=2048,
@@ -49,7 +49,7 @@ def model(device):
 
 @pytest.fixture(scope="module")
 def tokenizer():
-    return Tokenizer.from_pretrained("gpt2")
+    return Tokenizer()
 
 
 class MaxLengthCriteria(StoppingCriteria):

@@ -30,13 +30,13 @@ DEVICE = torch.device("cuda" if torch.cpu.is_available() else "cpu")
 
 @pytest.fixture
 def tokenizer():
-    return Tokenizer.from_pretrained("gpt2")
+    return Tokenizer()
 
 
 @pytest.fixture
 def config():
     return UncertainTransformerConfig(
-        vocab_size=50257,
+        vocab_size=256128,
         d_model=EMBED_DIM,
         n_heads=N_HEADS,
         d_ff=D_FF,

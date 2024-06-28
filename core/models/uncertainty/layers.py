@@ -144,9 +144,7 @@ class RandomWalkKernel(Kernel):
         # Ensure positive semi-definiteness
         output = torch.exp(-diff / 2)
 
-        if diag:
-            return output.diagonal(dim1=-2, dim2=-1)
-        return output
+        return output.diagonal(dim1=-2, dim2=-1) if diag else output
 
     def _reflect_distances(self, distances, clip_value=10.0):
         return torch.where(
@@ -182,7 +180,7 @@ class GaussianProcessLayer(ApproximateGP):
         self.num_inducing = num_inducing
         self.device = device
 
-        inducing_points = torch.randn(output_dim, num_inducing, input_dim, device=self.device)
+        inducing_points = torch.randn(num_inducing, input_dim, device=self.device)
         logger.info(f"Inducing points shape: {inducing_points.shape}")
 
         variational_distribution = CholeskyVariationalDistribution(
@@ -221,21 +219,19 @@ class GaussianProcessLayer(ApproximateGP):
         Forward pass of the Gaussian Process Layer.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size * seq_len, output_dim, embedding_dim).
+            x (torch.Tensor): Input tensor of shape (batch_size * seq_len, embedding_dim).
 
         Returns:
             gpytorch.distributions.MultivariateNormal: The output distribution.
         """
         logger.info(f"Input tensor shape: {x.shape}")
-        if x.dim() == 3:
-            batch_size_seq_len, _, _ = x.shape
-        elif x.dim() == 2:
-            batch_size_seq_len = x.size(0)
-        else:
-            raise ValueError(f"Expected 2D or 3D input, got {x.dim()}D")
+        if x.dim() != 2:
+            raise ValueError(f"Expected 2D input, got {x.dim()}D")
+
+        batch_size_seq_len, _ = x.shape
 
         # Normalize the input data
-        x = (x - x.mean(dim=2, keepdim=True)) / (x.std(dim=2, keepdim=True) + 1e-8)
+        x = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-8)
         logger.info(f"Normalized input tensor shape: {x.shape}")
 
         # Apply eigenvalue thresholding to the inducing points covariance matrix
@@ -249,15 +245,11 @@ class GaussianProcessLayer(ApproximateGP):
         mean_x = self.mean_module(x)
         logger.info(f"Mean tensor shape: {mean_x.shape}")
 
-        if isinstance(self.covar_module.base_kernel, TSPKernel):
-            covar_x = self.covar_module(x).evaluate_kernel()
-            covar_x = covar_x.to_dense()  # Convert lazy tensor to dense tensor
-        else:
-            covar_x = self.covar_module(x).evaluate()
+        covar_x = self.covar_module(x).evaluate()
         logger.info(f"Covariance matrix shape: {covar_x.shape}")
 
-        # Reshape the mean to have the same batch shape as the covariance
-        mean_x = mean_x.view(batch_size_seq_len, self.output_dim)
+        # View the mean to match the expected shape
+        # mean_x = mean_x.view(self.output_dim, -1) # Remove this line
 
         return MultivariateNormal(mean_x, covar_x)
 
@@ -439,27 +431,14 @@ class TSPEnergyFunction(nn.Module):
 
         return distances
 
+
 class TSPKernel(gpytorch.kernels.Kernel):
-    def __init__(self, energy_function: TSPEnergyFunction, covar_module: ScaleKernel, **kwargs):
+    def __init__(self, energy_function: TSPEnergyFunction, **kwargs):
         super().__init__(**kwargs)
         self.energy_function = energy_function
-        self.covar_module = covar_module
 
-    def forward(
-        self,
-        x1: Tensor,
-        x2: Tensor,
-        diag: bool = False,
-        last_dim_is_batch: bool = False,
-        **params,
-    ) -> Tensor:
-        logger.debug(f"TSPKernel input shapes: x1 {x1.shape}, x2 {x2.shape}")
-
-        # Reshape inputs to 3D tensors if necessary
-        if x1.dim() == 2:
-            x1 = x1.unsqueeze(1)
-        if x2.dim() == 2:
-            x2 = x2.unsqueeze(1)
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor, diag=False, last_dim_is_batch=False, **params):
+        logger.info(f"TSPKernel input shapes: x1 {x1.shape}, x2 {x2.shape}")
 
         energy = self.energy_function(x1, x2)
         if energy is None:
@@ -467,18 +446,13 @@ class TSPKernel(gpytorch.kernels.Kernel):
                 f"Energy function returned None for inputs: x1 shape {x1.shape}, x2 shape {x2.shape}"
             )
         output = torch.exp(-energy)
-        logger.debug(f"TSPKernel output shape: {output.shape}")
+        logger.info(f"TSPKernel output shape: {output.shape}")
 
         if diag:
             return torch.diagonal(output, dim1=-2, dim2=-1)
 
-        # Reshape the output to match the expected shape
-        batch_size1, seq_len1, _ = x1.shape
-        batch_size2, seq_len2, _ = x2.shape
-        # Directly evaluate the kernel matrix
-        output = self.covar_module(x1, x2).evaluate()
-        logger.debug(f"TSPKernel output shape after evaluation: {output.shape}")
-        output = output.permute(0, 2, 1, 3).reshape(batch_size1 * seq_len1, batch_size2 * seq_len2)
+        # Remove the extra dimension from the output
+        output = output.squeeze(0)
 
         return output
 

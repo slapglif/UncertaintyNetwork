@@ -29,7 +29,7 @@ class TestUncertainTransformerModel(unittest.TestCase):
     def setUpClass(cls):
         cls.device = torch.device("cuda" if torch.cpu.is_available() else "cpu")
         cls.config = UncertainTransformerConfig(
-            vocab_size=50257,
+            vocab_size=256128,
             d_model=64,  # Reduced from 128
             n_heads=2,  # Reduced from 4
             d_ff=256,  # Reduced from 512

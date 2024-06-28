@@ -2,7 +2,7 @@
 
 import os
 import sys
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import pytorch_lightning as pl
 import torch
@@ -18,10 +18,6 @@ from core.data.datamodule import SlimPajamaDataModule
 from core.models.uncertainty.uncertainty import (
     UncertainTransformerLMHeadModel,
     UncertainTransformerConfig,
-)
-from core.models.uncertainty.uncertainty_utils import (
-    uncertainty_weighted_loss,
-    total_uncertainty,
 )
 from core.utils.tokenizer import Tokenizer
 
@@ -69,24 +65,32 @@ class UncertainTransformerLightningModule(pl.LightningModule):
         return self.model(input_ids, attention_mask=attention_mask, labels=labels)
 
     def training_step(
-        self, batch: Dict[str, torch.Tensor], batch_idx: int
-    ) -> torch.Tensor:
-        outputs, uncertainty = self(**batch)
+            self, batch: Dict[str, torch.Tensor], batch_idx: int
+    ) -> Optional[torch.Tensor]:
+        outputs = self(**batch)
         loss = outputs.loss
 
-        # Apply uncertainty-weighted loss
-        weighted_loss = uncertainty_weighted_loss(loss, total_uncertainty(uncertainty))
+        if torch.isnan(loss) or torch.isinf(loss):
+            self.log(
+                "nan_loss",
+                1.0,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=True,
+                logger=True,
+            )
+            return None
 
         self.log(
             "train_loss",
-            weighted_loss,
+            loss,
             on_step=True,
             on_epoch=True,
             prog_bar=True,
             logger=True,
             sync_dist=True,
         )
-        return weighted_loss
+        return loss.mean()  # Add .mean() to the loss
 
     def validation_step(
         self, batch: Dict[str, torch.Tensor], batch_idx: int
@@ -189,7 +193,7 @@ def main():
     model = UncertainTransformerLightningModule(hparams)
 
     logger.info("Loading tokenizer...")
-    tokenizer = Tokenizer.from_pretrained("gpt2")
+    tokenizer = Tokenizer()
     model.tokenizer = tokenizer
 
     logger.info("Initializing DataModule...")

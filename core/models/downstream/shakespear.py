@@ -389,7 +389,7 @@ def main():
     model = UncertainTransformerLightningModule(hparams)
 
     logger.info("Loading tokenizer...")
-    tokenizer = Tokenizer.from_pretrained("gpt2")
+    tokenizer = Tokenizer()
     model.tokenizer = tokenizer
 
     logger.info("Initializing DataModule...")

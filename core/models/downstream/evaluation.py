@@ -183,7 +183,7 @@ def main():
     )
 
     # Load the tokenizer
-    tokenizer = Tokenizer.from_pretrained("gpt2")
+    tokenizer = Tokenizer()
 
     # Define the model configuration
     config = UncertainTransformerConfig(

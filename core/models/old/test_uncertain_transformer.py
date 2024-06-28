@@ -28,7 +28,7 @@ def test_uncertain_transformer():
 
     # Define model configuration
     config = UncertainTransformerConfig(
-        vocab_size=50257,
+        vocab_size=256128,
         d_model=128,
         n_heads=4,
         d_ff=256,

@@ -1,5 +1,4 @@
 # .\core\models\statespace.py
-import math
 from typing import Optional, NamedTuple, Any
 
 import torch
@@ -12,23 +11,23 @@ from torch.types import Device
 
 class MambaConfig:
     def __init__(
-        self,
-        d_model: int,
-        d_state: int = 16,
-        d_conv: int = 4,
-        expand_factor: float = 2.0,
-        dt_rank: Optional[int] = None,
-        dt_min: float = 0.001,
-        dt_max: float = 0.1,
-        dt_init: str = "random",
-        dt_scale: float = 1.0,
-        dt_init_floor: float = 1e-4,
-        bias: bool = False,
-        conv_bias: bool = True,
-        pscan: bool = True,
-        chunk_size: int = 64,
-        n_heads: int = 8,
-        headdim: int = 64,
+            self,
+            d_model: int,
+            d_state: int = 16,
+            d_conv: int = 4,
+            expand_factor: float = 2.0,
+            dt_rank: Optional[int] = None,
+            dt_min: float = 0.001,
+            dt_max: float = 0.1,
+            dt_init: str = "random",
+            dt_scale: float = 1.0,
+            dt_init_floor: float = 1e-4,
+            bias: bool = False,
+            conv_bias: bool = True,
+            pscan: bool = True,
+            chunk_size: int = 64,
+            n_heads: int = 8,
+            headdim: int = None,  # Modify this line
     ):
         self.d_model = d_model
         self.d_state = d_state
@@ -46,7 +45,8 @@ class MambaConfig:
         self.pscan = pscan
         self.chunk_size = chunk_size
         self.n_heads = n_heads
-        self.headdim = headdim
+        # Calculate headdim to ensure compatibility
+        self.headdim = self.d_inner // self.n_heads if headdim is None else headdim
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -67,6 +67,24 @@ class InferenceCache(NamedTuple):
 
 
 class Mamba(nn.Module):
+    """
+    Mamba 2 Custom Implementation
+
+    Intended Data Flow:
+        Input: input_tensor (batch, seqlen, d_model)
+        Linear Projection: projected_tensor (batch, seqlen, 2 * d_inner + 2 * d_state + n_heads)
+        Split: z_tensor (batch, seqlen, d_inner), conv_input_tensor (batch, seqlen, d_inner + 2 * d_state), delta_timestep_tensor (batch, seqlen, n_heads)
+        Convolution: conv_input_tensor (batch, seqlen, d_inner + 2 * d_state), conv_state (for caching)
+        Split: x_tensor (batch, seqlen, d_inner), B_tensor (batch, seqlen, d_state), C_tensor (batch, seqlen, d_state)
+        Permute delta_timestep: delta_timestep_tensor (batch, n_heads, seqlen)
+        Padding: Pad x_tensor, B_tensor, C_tensor, delta_timestep_tensor, and decay_matrix along seqlen to be multiples of chunk_size.
+        Rearrange x_tensor: x_tensor (batch, seqlen, n_heads, headdim)
+        SSD: y_tensor (batch, seqlen, n_heads, headdim)
+        Combine and Reshape: y_tensor (batch, seqlen, d_inner)
+        Normalize and Project: output_tensor (batch, seqlen, d_model)
+        Output: output_tensor, new_state
+    """
+
     def __init__(self, config: "MambaConfig"):
         super().__init__()
         self.config = config
@@ -87,26 +105,43 @@ class Mamba(nn.Module):
             padding=config.d_conv - 1,
         )
 
-        self.dt_bias = nn.Parameter(torch.empty(config.n_heads))
-        self.A_log = nn.Parameter(torch.empty(config.n_heads))
-        self.D = nn.Parameter(torch.empty(config.n_heads))
+        self.delta_timestep_bias = nn.Parameter(torch.empty(config.n_heads))
+        self.log_decay_matrix = nn.Parameter(torch.empty(config.n_heads))
+        self.additive_skip_connection_scale = nn.Parameter(torch.empty(config.n_heads))
         self.norm = RMSNorm(config.d_inner)
         self.out_proj = nn.Linear(config.d_inner, config.d_model, bias=False)
 
         self._initialize_weights()
 
     def forward(
-        self,
-        u: Tensor,
-        state: Optional[torch.Tensor] | InferenceCache = None,
-        use_cache: bool = False,
+            self,
+            input_tensor: Tensor,
+            state: Optional[torch.Tensor] | InferenceCache = None,
+            use_cache: bool = False,
     ) -> tuple[Tensor, InferenceCache] | tuple[Any, InferenceCache | Any]:
+        """
+        Forward pass of the Mamba layer.
+
+        Args:
+            input_tensor (Tensor): Input tensor of shape (batch, seqlen, d_model).
+            state (Optional[torch.Tensor] | InferenceCache): Optional state tensor or InferenceCache for caching.
+            use_cache (bool): Whether to use caching during inference. Defaults to False.
+
+        Returns:
+            tuple[Tensor, InferenceCache] | tuple[Any, InferenceCache | Any]: Output tensor and InferenceCache if use_cache is True, else output tensor only.
+        """
         if state:
-            return self.step(u, state)
-        A = -torch.exp(self.A_log)  # (nheads,)
-        zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
-        z, xBC, dt = torch.split(
-            zxbcdt,
+            return self.step(input_tensor, state)
+
+        # Compute negative exponential of log_decay_matrix parameter
+        decay_matrix_neg_exp = -torch.exp(self.log_decay_matrix)  # (n_heads,)
+
+        # Project input tensor to obtain projected_tensor
+        projected_tensor = self.in_proj(input_tensor)  # (batch, seqlen, 2 * d_inner + 2 * d_state + n_heads)
+
+        # Split projected_tensor into z_tensor, conv_input_tensor, and delta_timestep_tensor
+        z_tensor, conv_input_tensor, delta_timestep_tensor = torch.split(
+            projected_tensor,
             [
                 self.config.d_inner,
                 self.config.d_inner + 2 * self.config.d_state,
@@ -114,61 +149,110 @@ class Mamba(nn.Module):
             ],
             dim=-1,
         )
-        dt = F.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
 
-        # Pad or truncate xBC seqlen to d_conv
+        # Apply softplus activation to delta_timestep_tensor with bias
+        delta_timestep_tensor = F.softplus(delta_timestep_tensor + self.delta_timestep_bias)  # (batch, seqlen, n_heads)
+
+        # Pad or truncate conv_input_tensor seqlen to match d_conv
         conv_state = F.pad(
-            rearrange(xBC, "b l d -> b d l"), (self.config.d_conv - u.shape[1], 0)
+            rearrange(conv_input_tensor, "b l d -> b d l"), (self.config.d_conv - input_tensor.shape[1], 0)
         )
 
-        xBC = silu(
-            self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, : u.shape[1], :]
+        # Apply 1D convolution to conv_input_tensor and apply silu activation
+        conv_input_tensor = silu(
+            self.conv1d(conv_input_tensor.transpose(1, 2)).transpose(1, 2)[:, : input_tensor.shape[1], :]
         )  # (batch, seqlen, d_inner + 2 * d_state))
-        x, B, C = torch.split(
-            xBC, [self.config.d_inner, self.config.d_state, self.config.d_state], dim=-1
+
+        # Split conv_input_tensor into x_tensor, B_tensor, and C_tensor
+        x_tensor, B_tensor, C_tensor = torch.split(
+            conv_input_tensor, [self.config.d_inner, self.config.d_state, self.config.d_state], dim=-1
         )
-        x = rearrange(x, "b l (h p) -> b l h p", p=self.config.headdim)
-        y, ssm_state = ssd(
-            x * dt.unsqueeze(-1),
-            A * dt,
-            rearrange(B, "b l n -> b l 1 n"),
-            rearrange(C, "b l n -> b l 1 n"),
+
+        # --- Permute delta_timestep_tensor dimensions ---
+        batch_size, seq_len, _ = x_tensor.shape
+
+        # Expand and permute decay_matrix_neg_exp to match the shape of x_tensor and delta_timestep_tensor
+        decay_matrix_expanded = decay_matrix_neg_exp.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, seq_len).permute(
+            0, 2, 1)  # (batch, seqlen, n_heads)
+
+        # Permute delta_timestep_tensor and add a singleton dimension at the end
+        delta_timestep_permuted = delta_timestep_tensor.permute(0, 1, 2).unsqueeze(-1)  # (batch, seqlen, n_heads, 1)
+        # ---
+
+        # --- Ensure d_inner = n_heads * headdim ---
+        assert self.config.d_inner == self.config.n_heads * self.config.headdim, \
+            f"Dimension mismatch: d_inner ({self.config.d_inner}) != n_heads ({self.config.n_heads}) * headdim ({self.config.headdim})"
+        # ---
+
+        # Rearrange x_tensor into (batch, seqlen, n_heads, headdim)
+        x_rearranged = rearrange(x_tensor, "b l (h p) -> b l h p", p=self.config.headdim)
+
+        # --- Multiply Before Padding ---
+        x_delta_timestep_multiplied = x_rearranged * delta_timestep_permuted  # (batch, seqlen, n_heads, headdim)
+        # ---
+
+        # --- Consistent Padding Logic ---
+        seqlen = x_rearranged.shape[1]
+        padding_needed = self.config.chunk_size - (seqlen % self.config.chunk_size)
+        if padding_needed != self.config.chunk_size:  # Pad if not already a multiple
+            _ = (0, padding_needed)  # Padding for last dimension
+            x_delta_timestep_multiplied = F.pad(x_delta_timestep_multiplied, (
+                0, 0, 0, padding_needed, 0, 0))  # Pad x_delta_timestep_multiplied along seqlen
+            decay_matrix_expanded = F.pad(decay_matrix_expanded,
+                                          (0, padding_needed, 0, 0))  # Pad decay_matrix_expanded along seqlen
+            B_tensor = F.pad(B_tensor, (0, 0, 0, padding_needed, 0, 0))  # Pad B_tensor along seqlen
+            C_tensor = F.pad(C_tensor, (0, 0, 0, padding_needed, 0, 0))  # Pad C_tensor along seqlen
+        # --- End Padding Logic ---
+
+        # Apply Structured State Space (SSD) operation
+        y_tensor, ssm_state = ssd(
+            x_delta_timestep_multiplied,  # Pass the already multiplied x_tensor
+            decay_matrix_expanded,  # Pass decay_matrix_expanded without modification
+            rearrange(B_tensor, "b l n -> b l 1 n"),
+            rearrange(C_tensor, "b l n -> b l 1 n"),
             self.config.chunk_size,
             device=self.config.device,
         )
-        y = y + x * self.D.unsqueeze(-1)
-        y = rearrange(y, "b l h p -> b l (h p)")
-        y = self.norm(y, z)
-        y = self.out_proj(y)
 
+        # Add skip connection and multiply with additive_skip_connection_scale parameter
+        y_tensor = y_tensor + x_delta_timestep_multiplied * self.additive_skip_connection_scale.unsqueeze(-1)
+
+        output_tensor = self.rearrange_and_project(y_tensor, "b l h p -> b l (h p)", z_tensor)
+        # --- Remove Padding from Output ---
+        if padding_needed != self.config.chunk_size:
+            output_tensor = output_tensor[:, :seqlen, :]  # Slice to original sequence length
+        # ---
+
+        # Create the new state using conv_state and ssm_state
         new_state = InferenceCache(conv_state, ssm_state)
-        return y, new_state if use_cache else y
+
+        return output_tensor, new_state if use_cache else output_tensor
 
     def step(
-        self, u: Tensor, state: "InferenceCache"
+            self, input_tensor: Tensor, state: "InferenceCache"
     ) -> tuple[Tensor, "InferenceCache"]:
         """Take a single inference step for the current input and hidden state
 
         Unlike attention-based models, RNN-based models (eg Mamba) does not need
-        to look back at all the past tokens to generate a new token. Instead a
+        to look back at all the past tokens to generate a new token. Instead, a
         hidden state (initialized to 0s initially) is updated for each input and
         passed to the next inference step. This means that the total inference
         time is linear with respect to the sequence length instead of quadratic
         in attention's case.
 
         Arguments
-            u: (batch, 1, d_model)
-            h: initial/running hidden state
+            input_tensor: (batch, 1, d_model)
+            state: initial/running hidden state
 
-        Return (y, h)
-            y: (batch, 1, d_model)
-            h: updated hidden state
+        Return (output_tensor, state)
+            output_tensor: (batch, 1, d_model)
+            state: updated hidden state
         """
-        assert u.shape[1] == 1, "Only one token can be decoded per inference step"
+        assert input_tensor.shape[1] == 1, "Only one token can be decoded per inference step"
 
-        zxbcdt = self.in_proj(u.squeeze(1))  # (batch, d_in_proj)
-        z, xBC, dt = torch.split(
-            zxbcdt,
+        projected_tensor = self.in_proj(input_tensor.squeeze(1))  # (batch, d_in_proj)
+        z_tensor, conv_input_tensor, delta_timestep_tensor = torch.split(
+            projected_tensor,
             [
                 self.config.d_inner,
                 self.config.d_inner + 2 * self.config.d_state,
@@ -179,61 +263,55 @@ class Mamba(nn.Module):
 
         # Advance convolution input
         state.conv_state.copy_(torch.roll(state.conv_state, shifts=-1, dims=-1))
-        state.conv_state[:, :, -1] = xBC
+        state.conv_state[:, :, -1] = conv_input_tensor
         # Convolution step
-        xBC = torch.sum(
+        conv_input_tensor = torch.sum(
             state.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
         )
-        xBC += self.conv1d.bias
-        xBC = silu(xBC)
+        conv_input_tensor += self.conv1d.bias
+        conv_input_tensor = silu(conv_input_tensor)
 
-        x, B, C = torch.split(
-            xBC, [self.config.d_inner, self.config.d_state, self.config.d_state], dim=-1
+        x_tensor, B_tensor, C_tensor = torch.split(
+            conv_input_tensor, [self.config.d_inner, self.config.d_state, self.config.d_state], dim=-1
         )
-        A = -torch.exp(self.A_log)  # (nheads,)
+        decay_matrix = -torch.exp(self.log_decay_matrix)  # (nheads,)
 
         # SSM step
-        dt = F.softplus(dt + self.dt_bias)  # (batch, nheads)
-        dA = torch.exp(dt * A)  # (batch, nheads)
-        x = rearrange(x, "b (h p) -> b h p", p=self.config.headdim)
-        dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
-        state.ssm_state.copy_(state.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-        y = torch.einsum("bhpn, bn -> bhp", state.ssm_state, C)
-        y = y + rearrange(self.D, "h -> h 1") * x
-        y = rearrange(y, "b h p -> b (h p)")
-        y = self.norm(y, z)
-        y = self.out_proj(y)
+        delta_timestep_tensor = F.softplus(delta_timestep_tensor + self.delta_timestep_bias)  # (batch, nheads)
+        delta_decay_matrix = torch.exp(delta_timestep_tensor * decay_matrix)  # (batch, nheads)
+        x_tensor = rearrange(x_tensor, "b (h p) -> b h p", p=self.config.headdim)
+        delta_B_x = torch.einsum("bh, bn, bhp -> bhpn", delta_timestep_tensor, B_tensor, x_tensor)
+        state.ssm_state.copy_(state.ssm_state * rearrange(delta_decay_matrix, "b h -> b h 1 1") + delta_B_x)
+        y_tensor = torch.einsum("bhpn, bn -> bhp", state.ssm_state, C_tensor)
+        y_tensor = y_tensor + rearrange(self.additive_skip_connection_scale, "h -> h 1") * x_tensor
+        output_tensor = self.rearrange_and_project(y_tensor, "b h p -> b (h p)", z_tensor)
+        return output_tensor.unsqueeze(1), state
 
-        return y.unsqueeze(1), state
+    def rearrange_and_project(self, y_tensor, rearrange_pattern, z_tensor):
+        y_tensor = rearrange(y_tensor, rearrange_pattern)
+        y_tensor = self.norm(y_tensor, z_tensor)
+        return self.out_proj(y_tensor)
 
     def _initialize_weights(self):
-        # Initialize A_log
-        A = torch.arange(1, self.config.d_state + 1, dtype=torch.float32).repeat(
+        # Initialize log_decay_matrix
+        decay_matrix = torch.arange(1, self.config.d_state + 1, dtype=torch.float32).repeat(
             self.config.d_inner, 1
         )
-        self.A_log.data.copy_(torch.log(A))
-        self.A_log._no_weight_decay = True
+        decay_matrix = decay_matrix.to(
+            self.log_decay_matrix.device)  # move decay_matrix to the same device as self.log_decay_matrix
+        self.log_decay_matrix.data.copy_(
+            torch.log(decay_matrix).flatten()[
+                :self.config.n_heads
+            ]
+        )  # Flatten log(decay_matrix) and take the first n_heads elements
 
-        # Initialize D
-        self.D._no_weight_decay = True
+        self.log_decay_matrix._no_weight_decay = True
 
-        # Initialize dt_proj
-        dt_init_std = self.config.d_inner**-0.5 * self.config.dt_scale
-        if self.config.dt_init == "constant":
-            nn.init.constant_(self.dt_proj.weight, dt_init_std)
-        elif self.config.dt_init == "random":
-            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
-        else:
-            raise NotImplementedError(f"Invalid dt_init method: {self.config.dt_init}")
+        # Initialize additive_skip_connection_scale
+        self.additive_skip_connection_scale._no_weight_decay = True
 
-        dt = torch.exp(
-            torch.rand(self.config.d_inner)
-            * (math.log(self.config.dt_max) - math.log(self.config.dt_min))
-            + math.log(self.config.dt_min)
-        ).clamp(min=self.config.dt_init_floor)
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        with torch.no_grad():
-            self.dt_proj.bias.copy_(inv_dt)
+        # Initialize delta_timestep_bias
+        nn.init.uniform_(self.delta_timestep_bias, -1., 1.)
 
 
 def segsum(x: Tensor, device: Device = None) -> Tensor:
@@ -268,6 +346,11 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
     """
     assert x.shape[1] % chunk_size == 0
 
+    # --- Calculate chunks ---
+    seqlen = x.shape[1]
+    chunks = seqlen // chunk_size
+    # ---
+
     # Rearrange into chunks
     # Step 1, 2 and 4 of SSD can be computed in parallel for each chunk across devices (sequence parallel)
     # This is not implemented and left as an exercise for the reader 😜
@@ -280,6 +363,8 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
 
     # 1. Compute the output for each intra-chunk (diagonal blocks)
     L = torch.exp(segsum(A, device=device))
+    L = rearrange(L, 'b h (c l1) (c l2) -> b h c l1 c l2', c=chunks, l1=chunk_size, l2=chunk_size)  # Reshape L
+
     Y_diag = torch.einsum("bclhn, bcshn, bhcls, bcshp -> bclhp", C, B, L, x)
 
     # 2. Compute the state for each intra-chunk
