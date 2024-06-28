@@ -7,11 +7,11 @@ from torch import Tensor
 
 class RotaryPositionEncoding(nn.Module):
     def __init__(
-        self,
-        dim: int,
-        n_heads: int,
-        max_position_embeddings: int = 2048,
-        base: int = 10000,
+            self,
+            dim: int,
+            n_heads: int,
+            max_position_embeddings: int = 2048,
+            base: int = 10000,
     ):
         super().__init__()
         self.dim = dim
@@ -21,10 +21,11 @@ class RotaryPositionEncoding(nn.Module):
         # Calculate the rotary embeddings for each head
         head_dim = dim // n_heads
         inv_freq = 1.0 / (
-            base
-            ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim).to("cpu")
+                base
+                ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim).to("cpu")
         )
         self.register_buffer("inv_freq", inv_freq)
+        self.inv_freq.requires_grad = True  # Enable gradient calculation for inv_freq
 
         t = torch.arange(max_position_embeddings, dtype=torch.float32).to("cpu")
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
@@ -52,7 +53,7 @@ class RotaryPositionEncoding(nn.Module):
 
 
 def apply_rotary_pos_emb(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
     """
     Applies rotary positional embeddings to the input tensor using the SUPERHOT approach.
@@ -96,7 +97,7 @@ def apply_rotary_pos_emb(
 
 
 def rotate_half(x):
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -159,7 +160,7 @@ kan_config = {
 
 class SentenceGP(nn.Module):
     def __init__(
-        self, input_dim: int, output_dim: int, n_inducing: int, embedding_dim: int
+            self, input_dim: int, output_dim: int, n_inducing: int, embedding_dim: int
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -182,7 +183,7 @@ class SentenceGP(nn.Module):
         return torch.exp(-0.5 * dist / torch.exp(self.log_lengthscale).pow(2))
 
     def forward(
-        self, x: torch.Tensor, num_sentences: Optional[int] = None
+            self, x: torch.Tensor, num_sentences: Optional[int] = None
     ) -> tuple[Tensor, Tensor]:
         batch_size, num_sentences_input, input_dim = x.shape
 

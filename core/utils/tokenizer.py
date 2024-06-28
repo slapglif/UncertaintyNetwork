@@ -71,18 +71,23 @@ class Tokenizer:
             text, add_special_tokens=add_special_tokens, **kwargs
         )
 
-    def decode(self, token_ids: torch.Tensor, **kwargs):
-        """
-        Decode the given token IDs back into text.
-
-        Args:
-            token_ids (torch.Tensor): The token IDs to decode.
-            **kwargs: Additional arguments to pass to the tokenizer's decode method.
-
-        Returns:
-            str: The decoded text.
-        """
-        return self.tokenizer.decode(token_ids.tolist(), **kwargs)
+    def _decode(
+            self,
+            token_ids: List[int],
+            skip_special_tokens: bool = False,
+            spaces_between_special_tokens: bool = False,
+            **kwargs,
+    ) -> str:
+        current_sub_text = []
+        for id in token_ids:
+            if skip_special_tokens and id in self.all_special_ids:
+                continue
+            if id in self._added_tokens_decoder:
+                current_sub_text.append(self.sp_model.decode([id]))
+            elif 0 <= id < self.vocab_size:  # Check if token ID is within valid range
+                current_sub_text.append(id)
+        sub_texts = [self.sp_model.decode(current_sub_text)]
+        return "".join(sub_texts)
 
     def batch_decode(
             self, token_ids_batch: List[torch.Tensor] | torch.Tensor, **kwargs

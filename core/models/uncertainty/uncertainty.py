@@ -377,22 +377,22 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         Returns:
             Tuple[torch.LongTensor, torch.FloatTensor]: Generated sequences and their uncertainties.
         """
-        batch_size = input_ids.size(0)
-        device = input_ids.device
+        batch_size = input_ids.input_ids.size(0)  # Extract tensor from BatchEncoding
+        device = input_ids.input_ids.device
 
         generated_sequences = []
         sequence_uncertainties = []
 
         # Generate Matryoshka embeddings for the input
         matryoshka_embeddings = self.matryoshka_model.encode(
-            input_ids, convert_to_tensor=True, show_progress_bar=True
+            input_ids.input_ids, convert_to_tensor=True, show_progress_bar=True  # Extract tensor from BatchEncoding
         )
         projected_matryoshka_embeddings = self.matryoshka_projection(
             matryoshka_embeddings
         )
 
         for _ in range(num_return_sequences):
-            curr_input_ids = input_ids.clone()
+            curr_input_ids = input_ids.input_ids.clone()  # Extract tensor from BatchEncoding
             curr_uncertainties = []
 
             for _ in range(max_length - curr_input_ids.shape[1]):
@@ -733,7 +733,7 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
                     desc="Pooling Dataloader...",
                     total=len(pool_dataloader),
             ):
-                input_ids, attention_mask = [b.to(self.device) for b in batch]
+                input_ids, attention_mask, _ = [b.to(self.device) for b in batch] # Unpack three values, discard the third
                 outputs = self(input_ids, attention_mask=attention_mask)
                 batch_uncertainties = outputs["uncertainties"].mean(
                     dim=1

@@ -40,7 +40,8 @@ class TestRotaryPositionEncoding(unittest.TestCase):
 
     def test_gradient_flow(self):
         """Verifies that gradients flow correctly through the module."""
-        input_tensor = torch.randn(self.batch_size, self.seq_len, self.d_model, requires_grad=False).to(self.device)
+        input_tensor = torch.randn(self.batch_size, self.seq_len, self.d_model, requires_grad=True).to(
+            self.device) # Enable gradient calculation
         cos, sin = self.rotary_pe(input_tensor)
         loss = (cos.sum() + sin.sum())
         loss.backward()
