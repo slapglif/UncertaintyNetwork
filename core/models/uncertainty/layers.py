@@ -22,64 +22,43 @@ from core.models.kan.spline_layers import SplineNetLayer
 
 
 class UncertaintyModule(nn.Module):
-    def __init__(
-            self,
-            input_dim: int,
-            output_dim: int,
-            n_gp_layers: int = 1,
-            n_inducing: int = 5,
-            dropout_rate: float = 0.1,
-            mc_samples: int = 3,
-    ):
+    def __init__(self, input_dim: int, output_dim: int, n_gp_layers: int = 1, n_inducing: int = 5,
+                 dropout_rate: float = 0.1, mc_samples: int = 3):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.mc_samples = mc_samples
 
-        self.gp_layers = nn.ModuleList(
-            [
-                GaussianProcessLayer(input_dim, output_dim, n_inducing)
-                for _ in range(n_gp_layers)
-            ]
-        )
+        self.gp_layers = nn.ModuleList([
+            GaussianProcessLayer(input_dim, output_dim, n_inducing) for _ in range(n_gp_layers)
+        ])
         self.mc_dropout = nn.Dropout(p=dropout_rate)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         original_shape = x.shape
         if x.dim() == 2:
-            batch_size, seq_len = 1, x.shape[0]
             x = x.unsqueeze(0)
-        elif x.dim() == 3:
-            batch_size, seq_len, _ = x.shape
-        else:
-            raise ValueError(f"Expected 2D or 3D input, got shape {x.shape}")
 
+        batch_size, seq_len, _ = x.shape
         x = x.view(-1, self.input_dim)
 
-        total_mean = None
-        total_variance = None
+        total_mean = 0
+        total_variance = 0
 
         for _ in range(self.mc_samples):
             x_dropout = self.mc_dropout(x)
-
             for gp_layer in self.gp_layers:
                 gp_output = gp_layer(x_dropout)
                 mean, variance = gp_output.mean, gp_output.variance
-
-                if total_mean is None:
-                    total_mean = mean
-                    total_variance = variance
-                else:
-                    total_mean += mean
-                    total_variance += variance
+                total_mean += mean
+                total_variance += variance + mean.pow(2)
 
         mean_output = total_mean / (len(self.gp_layers) * self.mc_samples)
-        uncertainty = total_variance / (len(self.gp_layers) * self.mc_samples)
+        uncertainty = (total_variance / (len(self.gp_layers) * self.mc_samples)) - mean_output.pow(2)
 
         mean_output = mean_output.view(batch_size, seq_len, -1)
         uncertainty = uncertainty.view(batch_size, seq_len, -1)
 
-        # Restore original shape if input was 2D
         if original_shape == mean_output.shape[1:]:
             mean_output = mean_output.squeeze(0)
             uncertainty = uncertainty.squeeze(0)

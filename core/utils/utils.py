@@ -10,7 +10,7 @@ from torch import Tensor
 from transformers import PreTrainedModel, GenerationConfig
 
 from core import Mamba
-from core.models.embedding import RotaryPositionEncoding
+from core.models.embedding import RotaryEmbedding
 from core.models.layers import MultiHeadAttention
 from core.utils.tokenizer import Tokenizer
 
@@ -227,7 +227,7 @@ def check_layer(
         attention_mask = None
 
     # Forward pass
-    if isinstance(layer, RotaryPositionEncoding):
+    if isinstance(layer, RotaryEmbedding):
         output = layer(input_tensor)[0]
     elif isinstance(layer, Mamba):
         # For Mamba, we need to handle the case where it returns a tuple
@@ -278,25 +278,3 @@ def check_shape(tensor: torch.Tensor, expected_shape: Tuple[int], name: str):
             f"Shape mismatch for {name}: expected {expected_shape}, got {tensor.shape}"
         )
 
-
-class TimestepNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Applies Timestep Normalization to the input tensor.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
-
-        Returns:
-            torch.Tensor: Normalized output tensor of shape (batch_size, seq_len, dim).
-        """
-        # Calculate the mean and standard deviation across the sequence (axis=1)
-        mean = x.mean(dim=1, keepdim=True)
-        std = x.std(dim=1, keepdim=True)
-
-        return (x - mean) / (std + self.eps)

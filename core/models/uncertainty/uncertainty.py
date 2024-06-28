@@ -6,7 +6,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from scipy.optimize import minimize_scalar
-from sentence_transformers import SentenceTransformer
 from torch import Tensor, autograd
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -14,13 +13,12 @@ from transformers import PreTrainedModel
 from transformers import PretrainedConfig
 from transformers.modeling_outputs import ModelOutput
 
-from core.models.embedding import RotaryPositionEncoding, apply_rotary_pos_emb
-from core.models.layers import TransformerEncoderLayer, CEMA, KANFeedForward
+from core.models.embedding import RotaryEmbedding
+from core.models.layers import TransformerEncoderLayer, KANFeedForward
 from core.models.statespace import Mamba, MambaConfig
-from core.models.uncertainty.layers import UncertaintyModule, UncertaintyAwareLoss
+from core.models.uncertainty.layers import UncertaintyModule
 from core.models.uncertainty.uncertainty_utils import uncertainty_decomposition
 from core.utils.tokenizer import Tokenizer
-from core.utils.utils import TimestepNorm
 
 
 class UncertainTransformerConfig(PretrainedConfig):
@@ -107,10 +105,10 @@ class UncertainNetwork(nn.Module):
         self.embedding = nn.Embedding(config.vocab_size, config.d_model).to(
             config.device
         )
-        self.rotary_pos_emb = RotaryPositionEncoding(
+        self.rotary_pos_emb = RotaryEmbedding(
             config.d_model, config.n_heads, config.max_position_embeddings
         ).to(config.device)
-        self.cema = CEMA(config.d_model).to(config.device)
+        # Remove CEMA instance here, it's now handled in MultiHeadAttention
         self.layers = nn.ModuleList(
             [
                 nn.ModuleList(
@@ -148,27 +146,13 @@ class UncertainNetwork(nn.Module):
         ).to(config.device)
 
     def forward(self, inputs_embeds, attention_mask=None, use_cache=False):
-        print(f"UncertainNetwork input shape: {inputs_embeds.shape}")
-        print(
-            f"UncertainNetwork input contains NaN: {torch.isnan(inputs_embeds).any()}"
-        )
-
         batch_size, seq_len, _ = inputs_embeds.shape
-        cos, sin = self.rotary_pos_emb(inputs_embeds)
-        inputs_embeds = apply_rotary_pos_emb(inputs_embeds, cos, sin)
-        print(f"After rotary_pos_emb shape: {inputs_embeds.shape}")
-        print(f"After rotary_pos_emb contains NaN: {torch.isnan(inputs_embeds).any()}")
+        # Apply Rotary Position Embeddings
+        cos, sin = self.rotary_pos_emb(inputs_embeds, seq_len=seq_len)
+        inputs_embeds = self.rotary_pos_emb.apply_rotary_pos_emb(inputs_embeds, cos, sin)
 
-        inputs_embeds = self.cema(inputs_embeds)
-        print(f"After CEMA shape: {inputs_embeds.shape}")
-        print(f"After CEMA contains NaN: {torch.isnan(inputs_embeds).any()}")
-
+        # Apply dropout
         inputs_embeds = self.dropout(inputs_embeds)
-        inputs_embeds = TimestepNorm(self.config.d_model).to(self.config.device)(
-            inputs_embeds
-        )
-        print(f"After TimestepNorm shape: {inputs_embeds.shape}")
-        print(f"After TimestepNorm contains NaN: {torch.isnan(inputs_embeds).any()}")
 
         hidden_states = inputs_embeds
         cache = () if use_cache else None
@@ -176,8 +160,6 @@ class UncertainNetwork(nn.Module):
         for i, (mamba, transformer, kan_ff, projection) in enumerate(self.layers):
             mamba_outputs = mamba(hidden_states, use_cache=use_cache)
             hidden_states = mamba_outputs[0]
-            print(f"After Mamba {i} shape: {hidden_states.shape}")
-            print(f"After Mamba {i} contains NaN: {torch.isnan(hidden_states).any()}")
 
             if use_cache:
                 cache += (mamba_outputs[1],)
@@ -186,19 +168,12 @@ class UncertainNetwork(nn.Module):
             hidden_states, uncertainties = self.uncertainty_module(hidden_states)
 
             hidden_states = projection(hidden_states)
-            print(f"After projection {i} shape: {hidden_states.shape}")
-            print(
-                f"After projection {i} contains NaN: {torch.isnan(hidden_states).any()}"
-            )
 
+            # Apply Transformer Layer
             transformer_outputs = transformer(
                 hidden_states, attention_mask=attention_mask
             )
             hidden_states = transformer_outputs[0]
-            print(f"After transformer {i} shape: {hidden_states.shape}")
-            print(
-                f"After transformer {i} contains NaN: {torch.isnan(hidden_states).any()}"
-            )
 
             if use_cache:
                 cache += transformer_outputs[1:]
@@ -206,16 +181,11 @@ class UncertainNetwork(nn.Module):
             if isinstance(hidden_states, tuple):
                 hidden_states = hidden_states[0]
 
+            # Apply KAN Feedforward
             hidden_states = kan_ff(hidden_states)
-            print(f"After KAN {i} shape: {hidden_states.shape}")
-            print(f"After KAN {i} contains NaN: {torch.isnan(hidden_states).any()}")
 
+        # Apply final layer normalization
         hidden_states = self.final_layer_norm(hidden_states)
-
-        print(f"UncertainNetwork output shape: {hidden_states.shape}")
-        print(
-            f"UncertainNetwork output contains NaN: {torch.isnan(hidden_states).any()}"
-        )
 
         return (
             hidden_states,
@@ -255,12 +225,37 @@ class TemperatureScaling(autograd.Function):
 
 
 class UncertainTransformerLMHeadModel(PreTrainedModel):
-
-    def __init__(self, config: UncertainTransformerConfig):
+    def __init__(self, config):
         super().__init__(config)
         self.config = config
-        self.transformer = UncertainNetwork(config)
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.rotary_pos_emb = RotaryEmbedding(config.d_model, config.n_heads, config.max_position_embeddings)
+        # Remove CEMA instance here, it's now handled in MultiHeadAttention
+        self.layers = nn.ModuleList(
+            [
+                nn.ModuleList(
+                    [
+                        Mamba(MambaConfig(
+                            d_model=config.d_model,
+                            d_state=config.d_state,
+                            expand_factor=config.expand_factor,
+                            d_conv=config.d_conv,
+                            dt_min=config.dt_min,
+                            dt_max=config.dt_max,
+                            dt_init=config.dt_init,
+                            dt_scale=config.dt_scale,
+                            dt_init_floor=config.dt_init_floor,
+                        )),
+                        TransformerEncoderLayer(config),
+                        KANFeedForward(config),
+                        nn.Linear(config.d_model, config.d_model),
+                    ]
+                )
+                for _ in range(config.n_layers)
+            ]
+        )
+        self.final_layer_norm = nn.LayerNorm(config.d_model)
+        self.dropout = nn.Dropout(config.dropout)
         self.uncertainty_module = UncertaintyModule(
             input_dim=config.d_model,
             output_dim=config.vocab_size,
@@ -269,171 +264,17 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
             dropout_rate=0.1,
             mc_samples=3,
         )
-        self.tokenizer = Tokenizer()  # make sure you import core.utils.tokenizer.Tokenizer !
-        self.uncertainty_loss = UncertaintyAwareLoss(
-            uncertainty_weight=config.uncertainty_weight
-        )
+        # Ensure LM head is properly defined
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False).to(config.device)
+        self.tokenizer = Tokenizer()
+
+        # initialize temperature as a param
         self.temperature = nn.Parameter(torch.ones(1))
-        self.epsilon = 1e-6  # Small constant to prevent division by zero
-
-        # Initialize the Matryoshka embedding model
-        self.matryoshka_model = SentenceTransformer(
-            "tomaarsen/mpnet-base-nli-matryoshka"
-        )
-        self.matryoshka_dim = config.matryoshka_dim  # This should be set in the config
-        self.matryoshka_model.truncate_dim = self.matryoshka_dim
-
-        # Add a linear layer to project Matryoshka embeddings to model dimension
-        self.matryoshka_projection = nn.Linear(self.matryoshka_dim, config.d_model)
 
         # Initialize weights
         self.apply(self._init_weights)
 
-    def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            attention_mask: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass of the UncertainTransformerLMHeadModel.
-
-        Args:
-            input_ids (Optional[torch.LongTensor]): The input token IDs.
-            attention_mask (Optional[torch.FloatTensor]): The attention mask.
-            labels (Optional[torch.LongTensor]): The labels for computing the loss.
-            inputs_embeds (Optional[torch.FloatTensor]): Pre-computed input embeddings.
-
-        Returns:
-            Dict[str, torch.Tensor]: A dictionary containing the model outputs.
-        """
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time"
-            )
-
-        if input_ids is not None:
-            # Decode the input_ids into sentences
-            sentences = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-
-            # Generate Matryoshka embeddings
-            matryoshka_embeddings = self.matryoshka_model.encode(
-                sentences, convert_to_tensor=True, show_progress_bar=False
-            )
-
-            # Project Matryoshka embeddings to model dimension
-            projected_matryoshka_embeddings = self.matryoshka_projection(
-                matryoshka_embeddings
-            )
-
-            # Combine token embeddings with Matryoshka embeddings
-            inputs_embeds = self.transformer.embedding(input_ids)
-            inputs_embeds = inputs_embeds + projected_matryoshka_embeddings.unsqueeze(1)
-        elif inputs_embeds is None:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
-
-        hidden_states, _, _ = self.transformer(
-            inputs_embeds, attention_mask=attention_mask
-        )
-
-        logits = self.lm_head(hidden_states)
-        logits = TemperatureScaling.apply(logits, self.temperature)
-
-        mean_output, uncertainties = self.uncertainty_module(hidden_states)
-
-        outputs = {"logits": logits, "uncertainties": uncertainties}
-
-        if labels is not None:
-            loss = self.uncertainty_loss(logits, labels, uncertainties)
-            outputs["loss"] = loss
-
-        return outputs
-
-    def generate_with_uncertainty(
-            self,
-            input_ids: torch.LongTensor,
-            max_length: int,
-            num_return_sequences: int = 1,
-            temperature: float = 1.0,
-            top_k: int = 50,
-            top_p: float = 0.95,
-            do_sample: bool = True,
-            **kwargs,
-    ) -> tuple[Tensor, Tensor]:
-        """
-        Generate sequences with associated uncertainties.
-
-        Args:
-            input_ids (torch.LongTensor): Input token IDs.
-            max_length (int): Maximum length of generated sequences.
-            num_return_sequences (int): Number of sequences to generate for each input.
-            temperature (float): Sampling temperature.
-            top_k (int): Top-k sampling parameter.
-            top_p (float): Top-p sampling parameter.
-            do_sample (bool): Whether to use sampling or greedy decoding.
-            **kwargs: Additional arguments for generation.
-
-        Returns:
-            Tuple[torch.LongTensor, torch.FloatTensor]: Generated sequences and their uncertainties.
-        """
-        batch_size = input_ids.input_ids.size(0)  # Extract tensor from BatchEncoding
-        device = input_ids.input_ids.device
-
-        generated_sequences = []
-        sequence_uncertainties = []
-
-        # Generate Matryoshka embeddings for the input
-        matryoshka_embeddings = self.matryoshka_model.encode(
-            input_ids.input_ids, convert_to_tensor=True, show_progress_bar=True  # Extract tensor from BatchEncoding
-        )
-        projected_matryoshka_embeddings = self.matryoshka_projection(
-            matryoshka_embeddings
-        )
-
-        for _ in range(num_return_sequences):
-            curr_input_ids = input_ids.input_ids.clone()  # Extract tensor from BatchEncoding
-            curr_uncertainties = []
-
-            for _ in range(max_length - curr_input_ids.shape[1]):
-                # Combine token embeddings with Matryoshka embeddings
-                inputs_embeds = self.transformer.embedding(curr_input_ids)
-                inputs_embeds = (
-                        inputs_embeds + projected_matryoshka_embeddings.unsqueeze(1)
-                )
-
-                outputs = self(inputs_embeds=inputs_embeds)
-                next_token_logits = outputs["logits"][:, -1, :]
-                next_token_uncertainty = outputs["uncertainties"][:, -1, :]
-
-                # Apply temperature and uncertainty-aware sampling
-                next_token_scores = (
-                        next_token_logits / temperature
-                        - self.config.uncertainty_scale * next_token_uncertainty
-                )
-
-                # Apply top-k and top-p filtering
-                if do_sample:
-                    next_token_scores = self._top_k_top_p_filtering(
-                        next_token_scores, top_k=top_k, top_p=top_p
-                    )
-                    probs = torch.softmax(next_token_scores, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
-                else:
-                    next_token = torch.argmax(next_token_scores, dim=-1)
-
-                curr_input_ids = torch.cat(
-                    [curr_input_ids, next_token.unsqueeze(-1)], dim=-1
-                )
-                curr_uncertainties.append(next_token_uncertainty)
-
-            generated_sequences.append(curr_input_ids)
-            sequence_uncertainties.append(torch.stack(curr_uncertainties, dim=1))
-
-        return (torch.stack(generated_sequences), torch.stack(sequence_uncertainties))
-
     def _init_weights(self, module):
-        """Initialize the weights of the model."""
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
@@ -445,6 +286,81 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, inputs_embeds=None):
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+
+        if input_ids is not None:
+            input_shape = input_ids.size()
+            input_ids = input_ids.view(-1, input_shape[-1])
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embedding(input_ids)
+
+        inputs_embeds = self.rotary_pos_emb(inputs_embeds)
+        inputs_embeds = self.cema(inputs_embeds)
+        inputs_embeds = self.dropout(inputs_embeds)
+
+        hidden_states = inputs_embeds
+        for mamba, transformer, kan_ff, projection in self.layers:
+            mamba_outputs = mamba(hidden_states)
+            hidden_states = mamba_outputs[0]
+            hidden_states = projection(hidden_states)
+            hidden_states = transformer(hidden_states, attention_mask=attention_mask)
+            hidden_states = kan_ff(hidden_states)
+
+        hidden_states = self.final_layer_norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+
+        mean_output, uncertainties = self.uncertainty_module(hidden_states)
+
+        outputs = {"logits": logits, "uncertainties": uncertainties}
+
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+            outputs["loss"] = loss
+
+        return outputs
+
+    def generate(self, input_ids, max_length, num_return_sequences=1, **kwargs):
+        return self.generate_with_uncertainty(input_ids, max_length, num_return_sequences, **kwargs)
+
+    def generate_with_uncertainty(self, input_ids, max_length, num_return_sequences=1, **kwargs):
+        generated_ids = []
+        uncertainties = []
+
+        for _ in range(num_return_sequences):
+            current_input_ids = input_ids.clone()
+            current_uncertainties = []
+
+            for _ in range(max_length - input_ids.size(1)):
+                outputs = self(current_input_ids)
+                next_token_logits = outputs["logits"][:, -1, :]
+                next_token_uncertainty = outputs["uncertainties"][:, -1, :]
+
+                # Apply temperature scaling and top-k sampling
+                next_token_logits /= self.temperature
+                top_k = kwargs.get("top_k", 50)
+                top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
+
+                # Sample from the top-k tokens
+                probs = torch.nn.functional.softmax(top_k_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+
+                # Get the sampled token's uncertainty
+                next_token_uncertainty = next_token_uncertainty[
+                    torch.arange(next_token_uncertainty.size(0)), top_k_indices[
+                        torch.arange(top_k_indices.size(0)), next_token.squeeze()]]
+
+                current_input_ids = torch.cat([current_input_ids, next_token], dim=-1)
+                current_uncertainties.append(next_token_uncertainty)
+
+            generated_ids.append(current_input_ids)
+            uncertainties.append(torch.stack(current_uncertainties, dim=1))
+
+        return torch.stack(generated_ids), torch.stack(uncertainties)
 
     @staticmethod
     def _top_k_top_p_filtering(
@@ -733,7 +649,8 @@ class UncertainTransformerLMHeadModel(PreTrainedModel):
                     desc="Pooling Dataloader...",
                     total=len(pool_dataloader),
             ):
-                input_ids, attention_mask, _ = [b.to(self.device) for b in batch] # Unpack three values, discard the third
+                input_ids, attention_mask, _ = [b.to(self.device) for b in
+                                                batch]  # Unpack three values, discard the third
                 outputs = self(input_ids, attention_mask=attention_mask)
                 batch_uncertainties = outputs["uncertainties"].mean(
                     dim=1
