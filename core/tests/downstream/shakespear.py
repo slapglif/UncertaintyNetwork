@@ -411,14 +411,14 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
     logger.info("Setting up TensorBoard logger...")
-    tb_logger = TensorBoardLogger("../logs", name="uncertain-transformer")
+    tb_logger = TensorBoardLogger("../../models/logs", name="uncertain-transformer")
 
     logger.info("Setting up trainer...")
     trainer = pl.Trainer(
         max_epochs=hparams["max_epochs"],
         callbacks=[checkpoint_callback, early_stop_callback, lr_monitor],
         logger=tb_logger,
-        precision="16-mixed" if torch.cpu.is_available() else 32,
+        precision=32, #"16-mixed" if torch.cpu.is_available() else 32,
         accumulate_grad_batches=hparams["accumulate_grad_batches"],
         gradient_clip_val=1.0,
         log_every_n_steps=1,
