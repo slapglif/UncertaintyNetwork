@@ -42,7 +42,9 @@ class Tokenizer:
         else:
             # Initialize Gemma tokenizer from the specified preset
             model_name = "google/gemma-7b"
-            token = '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'
+            # woops, whelp better kill that token
+            #  token = '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'
+            token = None
             self.tokenizer = GemmaTokenizer.from_pretrained(model_name, token=token)
 
         self.tokenizer.pad_token = (
